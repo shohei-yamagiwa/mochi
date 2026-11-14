@@ -25,11 +25,14 @@ const (
 
 // Message represents a single normalized conversation message across LLM providers.
 type Message struct {
-	Role       Role       `json:"role"`
-	Content    string     `json:"content,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	ToolName   string     `json:"tool_name,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	Role              Role              `json:"role"`
+	Content           string            `json:"content,omitempty"`
+	Thinking          string            `json:"thinking,omitempty"`
+	ThinkingSignature string            `json:"thinking_signature,omitempty"`
+	ToolCallID        string            `json:"tool_call_id,omitempty"`
+	ToolName          string            `json:"tool_name,omitempty"`
+	ToolCalls         []ToolCall        `json:"tool_calls,omitempty"`
+	ProviderItems     []json.RawMessage `json:"provider_items,omitempty"`
 }
 
 // ToolDefinition declares a function tool and its JSON Schema parameters.
@@ -41,9 +44,30 @@ type ToolDefinition struct {
 
 // ToolCall represents a tool invocation emitted by an LLM.
 type ToolCall struct {
-	ID        string          `json:"id"`
-	Name      string          `json:"name"`
-	Arguments json.RawMessage `json:"arguments"`
+	ID               string          `json:"id"`
+	Name             string          `json:"name"`
+	Arguments        json.RawMessage `json:"arguments"`
+	ThoughtSignature []byte          `json:"thought_signature,omitempty"`
+}
+
+// SchemaToMap converts a *jsonschema.Schema into a generic JSON map for provider SDKs.
+// If s is nil, it returns a minimal empty object schema.
+func SchemaToMap(s *jsonschema.Schema) (map[string]any, error) {
+	if s == nil {
+		return map[string]any{
+			"type":       "object",
+			"properties": map[string]any{},
+		}, nil
+	}
+	raw, err := json.Marshal(s)
+	if err != nil {
+		return nil, fmt.Errorf("marshal json schema: %w", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("unmarshal json schema map: %w", err)
+	}
+	return out, nil
 }
 
 // TokenUsage records token consumption for a model turn.
