@@ -39,6 +39,7 @@ type ReviewReport struct {
 	TestExecution  *TestSummary           `json:"test_execution,omitempty" jsonschema:"Summary of build and test execution inside Daytona"`
 	Coverage       *domain.CoverageReport `json:"coverage,omitempty" jsonschema:"Deterministic verification of PR diff files vs files inspected by agents"`
 	AgentSummaries map[string]string      `json:"agent_summaries,omitempty" jsonschema:"Per-role summary from each specialist agent"`
+	FailedAgents   []string               `json:"failed_agents,omitempty" jsonschema:"Specialist agent roles that failed during the run, indicating a partial review"`
 }
 
 // Finding represents a single deduplicated code review issue or observation.
@@ -82,11 +83,12 @@ func NewReviewReportValidator() (*schema.Validator[ReviewReport], error) {
 }
 
 // NewSynthesizerResponseSchema builds the JSON Schema sent to the Synthesizer LLM, omitting the
-// deterministic coverage field (which Mochi computes and injects automatically).
+// deterministic coverage and failed_agents fields (which Mochi computes and injects automatically).
 func NewSynthesizerResponseSchema() (*jsonschema.Schema, error) {
 	v, err := schema.NewValidator[ReviewReport](func(s *jsonschema.Schema) {
 		applyReviewReportSchemaConstraints(s)
 		delete(s.Properties, "coverage")
+		delete(s.Properties, "failed_agents")
 	})
 	if err != nil {
 		return nil, err

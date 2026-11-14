@@ -463,6 +463,7 @@ func (r *Runner) runSynthesizer(
 
 	agentSummaries := make(map[string]string, len(specialists))
 	specialistFindings := make(map[string]*tools.AgentFindings, len(specialists))
+	var failedAgents []string
 	var testExec *output.TestSummary
 
 	for _, sr := range specialists {
@@ -470,7 +471,8 @@ func (r *Runner) runSynthesizer(
 			continue
 		}
 		if sr.Error != nil {
-			agentSummaries[sr.Role] = fmt.Sprintf("Specialist agent %q failed: %v", sr.Role, sr.Error)
+			agentSummaries[sr.Role] = sanitizeSpecialistFailureSummary(sr)
+			failedAgents = append(failedAgents, sr.Role)
 			continue
 		}
 		if sr.Findings == nil {
@@ -688,7 +690,7 @@ func (r *Runner) runSynthesizer(
 			continue
 		}
 
-		enrichReviewReport(report, coverage, agentSummaries, testExec)
+		enrichReviewReport(report, coverage, agentSummaries, testExec, failedAgents)
 		if err := validator.ValidateValue(report); err != nil {
 			runErr := fmt.Errorf("validate enriched review report: %w", err)
 			ar, _ := finalizeSynth(domain.AgentRunStatusFailed, nil, runErr)
@@ -710,11 +712,31 @@ func (r *Runner) runSynthesizer(
 	}
 }
 
+func sanitizeSpecialistFailureSummary(sr *SpecialistResult) string {
+	if sr == nil || sr.Error == nil {
+		return "failed"
+	}
+	if errors.Is(sr.Error, context.DeadlineExceeded) || (sr.AgentRun != nil && sr.AgentRun.Status == domain.AgentRunStatusTimedOut) {
+		return "failed (timed_out)"
+	}
+	if errors.Is(sr.Error, context.Canceled) || (sr.AgentRun != nil && sr.AgentRun.Status == domain.AgentRunStatusCancelled) {
+		return "failed (cancelled)"
+	}
+	if errors.Is(sr.Error, ErrMaxTurnsExceeded) {
+		return "failed (max_turns_exceeded)"
+	}
+	if errors.Is(sr.Error, ErrMaxTokensExceeded) {
+		return "failed (max_tokens_exceeded)"
+	}
+	return "failed (provider error)"
+}
+
 func enrichReviewReport(
 	report *output.ReviewReport,
 	coverage *domain.CoverageReport,
 	agentSummaries map[string]string,
 	testExec *output.TestSummary,
+	failedAgents []string,
 ) {
 	if report == nil {
 		return
@@ -739,6 +761,20 @@ func enrichReviewReport(
 			if strings.TrimSpace(report.AgentSummaries[role]) == "" && strings.TrimSpace(summary) != "" {
 				report.AgentSummaries[role] = summary
 			}
+		}
+	}
+	if len(failedAgents) > 0 {
+		report.FailedAgents = append([]string(nil), failedAgents...)
+		if report.AgentSummaries == nil {
+			report.AgentSummaries = make(map[string]string, len(failedAgents))
+		}
+		for _, role := range failedAgents {
+			if summary := strings.TrimSpace(agentSummaries[role]); summary != "" {
+				report.AgentSummaries[role] = summary
+			}
+		}
+		if report.Verdict == output.VerdictApprove {
+			report.Verdict = output.VerdictComment
 		}
 	}
 	if report.TestExecution == nil && testExec != nil {
@@ -876,7 +912,7 @@ func BuildSynthesizerUserPrompt(
 		if sr.Error != nil {
 			errPayload, _ := json.MarshalIndent(map[string]string{
 				"status": "failed",
-				"error":  sr.Error.Error(),
+				"reason": sanitizeSpecialistFailureSummary(sr),
 			}, "", "  ")
 			b.Write(errPayload)
 		} else if sr.Findings != nil {

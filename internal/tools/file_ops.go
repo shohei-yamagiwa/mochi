@@ -113,7 +113,7 @@ func (t *readFileTool) Execute(ctx context.Context, execCtx ExecutionContext, ra
 				},
 			})
 		}
-		tailLines := strings.Count(tail, "\n")
+		tailLines := strings.Count(strings.TrimSuffix(tail, "\n"), "\n")
 		if tailLines == 0 && len(tail) > 0 {
 			tailLines = 1
 		}

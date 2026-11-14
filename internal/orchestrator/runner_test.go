@@ -138,13 +138,13 @@ func (s *trackingSandbox) Destroy(ctx context.Context) error {
 }
 
 type recordingSink struct {
-	mu          sync.Mutex
-	name        string
-	started     int
-	published   []json.RawMessage
-	failedErrs  []error
-	publishErr  error
-	startErr    error
+	mu         sync.Mutex
+	name       string
+	started    int
+	published  []json.RawMessage
+	failedErrs []error
+	publishErr error
+	startErr   error
 }
 
 func (s *recordingSink) Name() string { return s.name }
@@ -176,11 +176,11 @@ func (s *recordingSink) OnRunFailed(_ context.Context, _ *domain.TaskContext, er
 }
 
 type routingLLMProvider struct {
-	mu          sync.Mutex
-	name        string
-	turnByRole  map[string]int
-	sysByRole   map[string]string
-	handleFn    func(ctx context.Context, role string, turn int, req llm.ChatRequest) (*llm.ChatResponse, error)
+	mu         sync.Mutex
+	name       string
+	turnByRole map[string]int
+	sysByRole  map[string]string
+	handleFn   func(ctx context.Context, role string, turn int, req llm.ChatRequest) (*llm.ChatResponse, error)
 }
 
 func newRoutingLLMProvider(name string, fn func(ctx context.Context, role string, turn int, req llm.ChatRequest) (*llm.ChatResponse, error)) *routingLLMProvider {
@@ -652,16 +652,24 @@ func TestRunner_PartialSpecialistFailureContinuesWithSurvivingSpecialists(t *tes
 			return nil, errors.New("gemini rate limit exceeded")
 		}
 		if role == "synthesizer" {
-			// Verify Synthesizer ResponseSchema omits "coverage".
+			// Verify Synthesizer ResponseSchema omits "coverage" and "failed_agents".
 			if req.ResponseSchema != nil {
 				if _, hasCov := req.ResponseSchema.Properties["coverage"]; hasCov {
 					t.Errorf("expected synthesizer ResponseSchema to omit coverage property")
 				}
+				if _, hasFailed := req.ResponseSchema.Properties["failed_agents"]; hasFailed {
+					t.Errorf("expected synthesizer ResponseSchema to omit failed_agents property")
+				}
 			}
+			// Verify raw internal provider error text is not leaked into Synthesizer prompt.
+			if strings.Contains(req.SystemPrompt, "gemini rate limit exceeded") || (len(req.Messages) > 0 && strings.Contains(req.Messages[0].Content, "gemini rate limit exceeded")) {
+				t.Errorf("expected synthesizer prompts to sanitize raw provider error text")
+			}
+			// Even if the Synthesizer emits APPROVE, Mochi must deterministically downgrade to COMMENT when a specialist failed.
 			return &llm.ChatResponse{
 				Message: llm.Message{
 					Role:    llm.RoleAssistant,
-					Content: `{"summary":"Completed with 3 of 4 specialists","verdict":"COMMENT","findings":[]}`,
+					Content: `{"summary":"Completed with 3 of 4 specialists","verdict":"APPROVE","findings":[]}`,
 				},
 			}, nil
 		}
@@ -704,8 +712,14 @@ func TestRunner_PartialSpecialistFailureContinuesWithSurvivingSpecialists(t *tes
 	if res.Run.Status != domain.RunStatusCompleted {
 		t.Fatalf("res.Run.Status = %q, want %q", res.Run.Status, domain.RunStatusCompleted)
 	}
-	if !strings.Contains(res.Report.AgentSummaries["security"], "failed") {
-		t.Fatalf("Report.AgentSummaries[security] = %q, want failure note", res.Report.AgentSummaries["security"])
+	if res.Report.Verdict != output.VerdictComment {
+		t.Fatalf("Report.Verdict = %q, want %q when a specialist failed", res.Report.Verdict, output.VerdictComment)
+	}
+	if len(res.Report.FailedAgents) != 1 || res.Report.FailedAgents[0] != "security" {
+		t.Fatalf("Report.FailedAgents = %v, want [security]", res.Report.FailedAgents)
+	}
+	if res.Report.AgentSummaries["security"] != "failed (provider error)" {
+		t.Fatalf("Report.AgentSummaries[security] = %q, want %q", res.Report.AgentSummaries["security"], "failed (provider error)")
 	}
 }
 

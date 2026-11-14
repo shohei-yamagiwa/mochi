@@ -285,8 +285,8 @@ func extractSurvivingDiffAccess(head, tail, fallbackPath, agentRole string) []do
 		completeHunks := sec.hunks
 		if len(completeHunks) > 1 {
 			completeHunks = completeHunks[:len(completeHunks)-1]
-		} else if len(completeHunks) == 1 && !strings.HasSuffix(strings.TrimSpace(head), "\n") {
-			// Single hunk that may have been cut mid-hunk; still record its header range if it's a single-line hunk, otherwise omit.
+		} else {
+			// A single hunk in the last head section was cut by truncation and is conservatively omitted.
 			completeHunks = nil
 		}
 		for _, h := range completeHunks {
@@ -304,7 +304,7 @@ func extractSurvivingDiffAccess(head, tail, fallbackPath, agentRole string) []do
 	for i, sec := range tailSections {
 		// If a file's `diff --git` header starts inside tail (and is not a mid-file continuation at index 0 without diff --git),
 		// its entire diff through the end of output survived intact.
-		if i > 0 || strings.HasPrefix( strings.TrimLeft(tail, "\r\n"), "diff --git ") {
+		if i > 0 || strings.HasPrefix(strings.TrimLeft(tail, "\r\n"), "diff --git ") {
 			records = append(records, domain.FileAccessRecord{
 				AgentRole: agentRole,
 				Path:      sec.path,

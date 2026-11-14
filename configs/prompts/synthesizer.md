@@ -41,13 +41,13 @@ Merge and deduplicate the specialist agent outputs{{ if .Task.Changeset }} for `
    - Discard speculative or unverified claims that are contradicted by the actual diff or by passing test execution evidence.
    - Verify that every finding's `file_path`, `start_line`, and `end_line` (1-indexed in the new file) align with the PR diff.
    - Sort `findings` from highest severity/confidence to lowest (`critical` -> `high` -> `medium` -> `low` -> `nit`).
-3. **Surface Diff Coverage Gaps**:
-   - Inspect the deterministic `CoverageReport` provided in the input.
-   - If any changed files (`unreviewed_files`) or modified hunks (`uncovered_hunks`) were not inspected by specialist agents, explicitly call out the coverage gap in the executive `summary`.
+3. **Surface Diff Coverage Gaps & Failed Specialists**:
+   - Inspect the deterministic `CoverageReport` and specialist agent statuses provided in the input.
+   - If any changed files (`unreviewed_files`) or modified hunks (`uncovered_hunks`) were not inspected by specialist agents, or if any specialist agent failed, explicitly call out the coverage gap or missing review dimension in the executive `summary`.
 4. **Select the Overall Verdict**:
    - `"REQUEST_CHANGES"`: One or more `critical` or high-confidence `high` severity findings exist, or the build/test suite fails due to the changeset.
-   - `"COMMENT"`: Only `medium`, `low`, or `nit` findings exist, or unreviewed diff hunks prevent complete verification.
-   - `"APPROVE"`: No blocking findings exist, tests pass (when applicable), and diff coverage is complete.
+   - `"COMMENT"`: Only `medium`, `low`, or `nit` findings exist, unreviewed diff hunks prevent complete verification, or one or more specialist agents failed (partial review).
+   - `"APPROVE"`: No blocking findings exist, all specialist agents succeeded, tests pass (when applicable), and diff coverage is complete.
 
 ## Output Format
 
