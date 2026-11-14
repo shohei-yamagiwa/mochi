@@ -82,10 +82,10 @@ func (t *readFileTool) Execute(ctx context.Context, execCtx ExecutionContext, ra
 		}
 	}
 
-	return &ExecutionResult{
-		Output:   truncateHeadTail(content, t.maxBytes),
-		ExitCode: 0,
-		AccessedFiles: []domain.FileAccessRecord{
+	out, head, tail, truncated := truncateHeadTailWithParts(content, t.maxBytes)
+	var accessed []domain.FileAccessRecord
+	if !truncated {
+		accessed = []domain.FileAccessRecord{
 			{
 				AgentRole: execCtx.AgentRole,
 				Path:      cleanPath,
@@ -95,7 +95,46 @@ func (t *readFileTool) Execute(ctx context.Context, execCtx ExecutionContext, ra
 					EndLine:   endLine,
 				},
 			},
-		},
+		}
+	} else {
+		headLines := strings.Count(head, "\n")
+		if headLines == 0 && len(head) > 0 {
+			headLines = 1
+		}
+		if headLines > 0 {
+			headEnd := min(endLine, startLine+headLines-1)
+			accessed = append(accessed, domain.FileAccessRecord{
+				AgentRole: execCtx.AgentRole,
+				Path:      cleanPath,
+				Kind:      domain.FileAccessRead,
+				LineRange: &domain.LineRange{
+					StartLine: startLine,
+					EndLine:   headEnd,
+				},
+			})
+		}
+		tailLines := strings.Count(strings.TrimSuffix(tail, "\n"), "\n")
+		if tailLines == 0 && len(tail) > 0 {
+			tailLines = 1
+		}
+		if tailLines > 0 {
+			tailStart := max(startLine, endLine-tailLines+1)
+			accessed = append(accessed, domain.FileAccessRecord{
+				AgentRole: execCtx.AgentRole,
+				Path:      cleanPath,
+				Kind:      domain.FileAccessRead,
+				LineRange: &domain.LineRange{
+					StartLine: tailStart,
+					EndLine:   endLine,
+				},
+			})
+		}
+	}
+
+	return &ExecutionResult{
+		Output:        out,
+		ExitCode:      0,
+		AccessedFiles: accessed,
 	}, nil
 }
 

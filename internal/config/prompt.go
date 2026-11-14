@@ -162,6 +162,15 @@ func NewPromptEngineWithRoots(serverDir, repoDir string) *PromptEngine {
 	}
 }
 
+// WithRepoDir returns a shallow copy of the PromptEngine configured to read repository-owned
+// prompts (under .mochi/) from repoDir.
+func (e *PromptEngine) WithRepoDir(repoDir string) *PromptEngine {
+	if e == nil {
+		return NewPromptEngineWithRoots(".", repoDir)
+	}
+	return NewPromptEngineWithRoots(e.serverDir, repoDir)
+}
+
 // RenderRole selects the server or repository root based on role.PromptFromRepo and renders its prompt.
 func (e *PromptEngine) RenderRole(role domain.RoleConfig, data PromptData) (string, error) {
 	return e.RenderPrompt(role.PromptFile, role.PromptFromRepo, data)

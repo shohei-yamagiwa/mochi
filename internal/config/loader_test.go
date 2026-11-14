@@ -316,6 +316,22 @@ func TestPromptEngineSecurityAndRendering(t *testing.T) {
 		t.Fatalf("rendered synthesizer prompt missing shortSHA:\n%s", synthRendered)
 	}
 
+	// Verify all default templates also render cleanly when TaskContext.Changeset is nil.
+	nilChangesetTask := &domain.TaskContext{
+		RunID:        "run-no-changeset",
+		WorkflowName: wf.Name,
+		TriggerType:  "cli",
+	}
+	for i := range wf.Agents {
+		role := wf.Agents[i]
+		if _, err := engine.RenderRole(role, config.NewPromptData(nilChangesetTask, wf, &role)); err != nil {
+			t.Fatalf("RenderRole(%s) with nil Changeset failed: %v", role.Role, err)
+		}
+	}
+	if _, err := engine.RenderSynthesizer(wf.Synthesizer, config.NewPromptData(nilChangesetTask, wf, nil)); err != nil {
+		t.Fatalf("RenderSynthesizer with nil Changeset failed: %v", err)
+	}
+
 	// RenderRole with PromptFromRepo=true automatically selects repoDir and strips RepoURL userinfo.
 	repoRole := wf.Agents[0]
 	repoRole.PromptFile = ".mochi/prompts/custom.md"

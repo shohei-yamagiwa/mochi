@@ -39,6 +39,7 @@ type ReviewReport struct {
 	TestExecution  *TestSummary           `json:"test_execution,omitempty" jsonschema:"Summary of build and test execution inside Daytona"`
 	Coverage       *domain.CoverageReport `json:"coverage,omitempty" jsonschema:"Deterministic verification of PR diff files vs files inspected by agents"`
 	AgentSummaries map[string]string      `json:"agent_summaries,omitempty" jsonschema:"Per-role summary from each specialist agent"`
+	FailedAgents   []string               `json:"failed_agents,omitempty" jsonschema:"Specialist agent roles that failed during the run, indicating a partial review"`
 }
 
 // Finding represents a single deduplicated code review issue or observation.
@@ -78,26 +79,42 @@ type OutputSink interface {
 
 // NewReviewReportValidator builds a JSON Schema validator for ReviewReport with enum and range constraints.
 func NewReviewReportValidator() (*schema.Validator[ReviewReport], error) {
-	return schema.NewValidator[ReviewReport](func(s *jsonschema.Schema) {
-		if verdictProp, ok := s.Properties["verdict"]; ok {
-			verdictProp.Enum = []any{string(VerdictApprove), string(VerdictRequestChanges), string(VerdictComment)}
-		}
-		if findingsProp, ok := s.Properties["findings"]; ok && findingsProp.Items != nil {
-			if sevProp, ok := findingsProp.Items.Properties["severity"]; ok {
-				sevProp.Enum = []any{
-					string(SeverityCritical),
-					string(SeverityHigh),
-					string(SeverityMedium),
-					string(SeverityLow),
-					string(SeverityNit),
-				}
-			}
-			if confProp, ok := findingsProp.Items.Properties["confidence"]; ok {
-				confProp.Minimum = jsonschema.Ptr(0.0)
-				confProp.Maximum = jsonschema.Ptr(1.0)
-			}
-		}
+	return schema.NewValidator[ReviewReport](applyReviewReportSchemaConstraints)
+}
+
+// NewSynthesizerResponseSchema builds the JSON Schema sent to the Synthesizer LLM, omitting the
+// deterministic coverage and failed_agents fields (which Mochi computes and injects automatically).
+func NewSynthesizerResponseSchema() (*jsonschema.Schema, error) {
+	v, err := schema.NewValidator[ReviewReport](func(s *jsonschema.Schema) {
+		applyReviewReportSchemaConstraints(s)
+		delete(s.Properties, "coverage")
+		delete(s.Properties, "failed_agents")
 	})
+	if err != nil {
+		return nil, err
+	}
+	return v.Schema(), nil
+}
+
+func applyReviewReportSchemaConstraints(s *jsonschema.Schema) {
+	if verdictProp, ok := s.Properties["verdict"]; ok {
+		verdictProp.Enum = []any{string(VerdictApprove), string(VerdictRequestChanges), string(VerdictComment)}
+	}
+	if findingsProp, ok := s.Properties["findings"]; ok && findingsProp.Items != nil {
+		if sevProp, ok := findingsProp.Items.Properties["severity"]; ok {
+			sevProp.Enum = []any{
+				string(SeverityCritical),
+				string(SeverityHigh),
+				string(SeverityMedium),
+				string(SeverityLow),
+				string(SeverityNit),
+			}
+		}
+		if confProp, ok := findingsProp.Items.Properties["confidence"]; ok {
+			confProp.Minimum = jsonschema.Ptr(0.0)
+			confProp.Maximum = jsonschema.Ptr(1.0)
+		}
+	}
 }
 
 // Registry stores named OutputSink factories or instances.
