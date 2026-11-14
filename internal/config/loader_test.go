@@ -159,7 +159,7 @@ agents:
 		}
 	})
 
-	t.Run("clamps unset budgets and reasoning_effort and persists prompt_from_repo", func(t *testing.T) {
+	t.Run("clamps unset budgets and persists prompt_from_repo", func(t *testing.T) {
 		override := []byte(`
 input:
   triggers:
@@ -217,8 +217,8 @@ output:
 		if merged.Agents[2].LLM.MaxOutputTokens != 16384 {
 			t.Fatalf("expected unset max_output_tokens clamped to ceiling 16384, got %d", merged.Agents[2].LLM.MaxOutputTokens)
 		}
-		if merged.Agents[2].LLM.ReasoningEffort != "medium" {
-			t.Fatalf("expected test-runner reasoning_effort capped at base medium, got %q", merged.Agents[2].LLM.ReasoningEffort)
+		if merged.Agents[2].LLM.ReasoningEffort != "high" {
+			t.Fatalf("expected test-runner reasoning_effort raised to high, got %q", merged.Agents[2].LLM.ReasoningEffort)
 		}
 		if merged.Synthesizer.Budgets.MaxTokens != 200000 {
 			t.Fatalf("expected unset synthesizer max_tokens clamped to ceiling 200000, got %d", merged.Synthesizer.Budgets.MaxTokens)

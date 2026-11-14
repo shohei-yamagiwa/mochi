@@ -476,20 +476,10 @@ func mergeModelOverride(dst *domain.ModelConfig, src *ModelOverride) error {
 		dst.MaxOutputTokens = clampInt(src.MaxOutputTokens, dst.MaxOutputTokens, defaultMaxOutputTokensCeiling)
 	}
 	if src.ReasoningEffort != "" {
-		reqRank, ok := reasoningEffortRank(src.ReasoningEffort)
-		if !ok {
+		if _, ok := reasoningEffortRank(src.ReasoningEffort); !ok {
 			return fmt.Errorf("unsupported reasoning_effort %q", src.ReasoningEffort)
 		}
-		capEffort := dst.ReasoningEffort
-		if capEffort == "" {
-			capEffort = "medium"
-		}
-		baseRank, ok := reasoningEffortRank(capEffort)
-		if !ok || reqRank <= baseRank {
-			dst.ReasoningEffort = src.ReasoningEffort
-		} else {
-			dst.ReasoningEffort = capEffort
-		}
+		dst.ReasoningEffort = src.ReasoningEffort
 	}
 	return nil
 }
