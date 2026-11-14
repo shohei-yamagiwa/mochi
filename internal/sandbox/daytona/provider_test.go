@@ -24,12 +24,13 @@ type recordedReq struct {
 
 func TestDaytonaProvider_CreatePrepareForkExecFilesAndDestroy(t *testing.T) {
 	var (
-		mu             sync.Mutex
-		reqs           []recordedReq
-		uploadedBytes  []byte
-		uploadedPath   string
-		cloneFailToken bool
-		execTimeout    bool
+		mu                      sync.Mutex
+		reqs                    []recordedReq
+		uploadedBytes           []byte
+		uploadedPath            string
+		cloneFailToken          bool
+		execTimeout             bool
+		execFailWithTimeoutText bool
 	)
 
 	var srvURL string
@@ -44,6 +45,7 @@ func TestDaytonaProvider_CreatePrepareForkExecFilesAndDestroy(t *testing.T) {
 		})
 		failClone := cloneFailToken
 		timeoutExec := execTimeout
+		failExecMsg := execFailWithTimeoutText
 		mu.Unlock()
 
 		writeJSON := func(status int, v any) {
@@ -112,6 +114,10 @@ func TestDaytonaProvider_CreatePrepareForkExecFilesAndDestroy(t *testing.T) {
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/process/execute"):
 			if timeoutExec {
 				writeJSON(http.StatusGatewayTimeout, map[string]any{"message": "command execution timeout"})
+				return
+			}
+			if failExecMsg {
+				writeJSON(http.StatusInternalServerError, map[string]any{"message": "invalid toolbox timeout config"})
 				return
 			}
 			writeJSON(http.StatusOK, map[string]any{
@@ -254,9 +260,10 @@ func TestDaytonaProvider_CreatePrepareForkExecFilesAndDestroy(t *testing.T) {
 			var body map[string]any
 			_ = json.Unmarshal([]byte(rq.Body), &body)
 			cmd, _ := body["command"].(string)
-			if strings.Contains(cmd, "git remote set-url origin 'https://github.com/org/repo.git'") &&
-				strings.Contains(cmd, "credential.helper") &&
-				strings.Contains(cmd, "http.extraheader") {
+			if strings.Contains(cmd, "git remote set-url origin 'https://github.com/org/repo.git' && ") &&
+				strings.Contains(cmd, "{ git config --local --unset-all credential.helper || true; } && ") &&
+				strings.Contains(cmd, "{ git config --local --unset-all http.extraheader || true; } && ") &&
+				strings.Contains(cmd, `test "$(git config --local --get remote.origin.url)" = 'https://github.com/org/repo.git'`) {
 				sawStrip = true
 			}
 		}
@@ -291,7 +298,7 @@ func TestDaytonaProvider_CreatePrepareForkExecFilesAndDestroy(t *testing.T) {
 		t.Fatalf("expected fork and autodelete/0 calls: fork=%v autodel=%v", sawFork, sawAutoDel)
 	}
 
-	// 3. Exec normal + relative WorkDir + timeout
+	// 3. Exec normal + relative WorkDir + timeout + non-timeout 500 mentioning "timeout"
 	res, err := forkedSB.Exec(ctx, sandbox.ExecRequest{
 		Command: "go test ./...",
 		WorkDir: "internal",
@@ -323,6 +330,14 @@ func TestDaytonaProvider_CreatePrepareForkExecFilesAndDestroy(t *testing.T) {
 	}
 	mu.Lock()
 	execTimeout = false
+	execFailWithTimeoutText = true
+	mu.Unlock()
+
+	if nonTimeoutRes, err := forkedSB.Exec(ctx, sandbox.ExecRequest{Command: "echo hi"}); err == nil {
+		t.Fatalf("expected HTTP 500 error mentioning timeout to return an error, got %+v", nonTimeoutRes)
+	}
+	mu.Lock()
+	execFailWithTimeoutText = false
 	mu.Unlock()
 
 	// 4. ReadFile full, line-sliced, and path-traversal rejection

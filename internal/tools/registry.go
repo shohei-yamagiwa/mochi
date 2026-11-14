@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/shohei-yamagiwa/mochi/internal/domain"
 	"github.com/shohei-yamagiwa/mochi/internal/llm"
@@ -224,17 +225,47 @@ func normalizeRepoPath(raw string, allowDot bool) (string, error) {
 	return cleaned, nil
 }
 
-// truncateHeadTail caps s to maxBytes using balanced head+tail slices to protect LLM context windows.
+// truncateHeadTail caps s to maxBytes using balanced head+tail slices aligned to UTF-8 rune boundaries.
 func truncateHeadTail(s string, maxBytes int) string {
 	if maxBytes <= 0 || len(s) <= maxBytes {
 		return s
 	}
 	marker := fmt.Sprintf("\n... [truncated %d bytes] ...\n", len(s)-maxBytes)
 	if maxBytes <= len(marker)+16 {
-		return s[:maxBytes]
+		return s[:trimUTF8End(s, maxBytes)]
 	}
 	budget := maxBytes - len(marker)
 	headLen := budget / 2
 	tailLen := budget - headLen
-	return s[:headLen] + marker + s[len(s)-tailLen:]
+	headEnd := trimUTF8End(s, headLen)
+	tailStart := trimUTF8Start(s, len(s)-tailLen)
+	return s[:headEnd] + marker + s[tailStart:]
+}
+
+func trimUTF8End(s string, maxBytes int) int {
+	if maxBytes >= len(s) {
+		return len(s)
+	}
+	if maxBytes <= 0 {
+		return 0
+	}
+	i := maxBytes
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	return i
+}
+
+func trimUTF8Start(s string, minStart int) int {
+	if minStart <= 0 {
+		return 0
+	}
+	if minStart >= len(s) {
+		return len(s)
+	}
+	i := minStart
+	for i < len(s) && !utf8.RuneStart(s[i]) {
+		i++
+	}
+	return i
 }

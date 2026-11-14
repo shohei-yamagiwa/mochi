@@ -150,7 +150,9 @@ func (p *Provider) Generate(ctx context.Context, req llm.ChatRequest) (*llm.Chat
 		params.System = systemBlocks
 	}
 
+	thinkingEnabled := false
 	if effort := mapEffort(req.Config.ReasoningEffort); effort != "" {
+		thinkingEnabled = true
 		params.Thinking = anthropicsdk.ThinkingConfigParamUnion{
 			OfAdaptive: &anthropicsdk.ThinkingConfigAdaptiveParam{
 				Display: anthropicsdk.ThinkingConfigAdaptiveDisplaySummarized,
@@ -183,7 +185,12 @@ func (p *Provider) Generate(ctx context.Context, req llm.ChatRequest) (*llm.Chat
 	}
 
 	if req.ToolChoice != "" {
-		params.ToolChoice = mapToolChoice(req.ToolChoice)
+		toolChoice := req.ToolChoice
+		if thinkingEnabled && toolChoice != "auto" && toolChoice != "none" {
+			// Anthropic Messages API only permits "auto" or "none" tool_choice while thinking is enabled.
+			toolChoice = "auto"
+		}
+		params.ToolChoice = mapToolChoice(toolChoice)
 	}
 
 	if req.ResponseSchema != nil {
@@ -234,7 +241,14 @@ func buildMessages(messages []llm.Message) ([]anthropicsdk.MessageParam, []strin
 			out = append(out, anthropicsdk.NewUserMessage(anthropicsdk.NewTextBlock(msg.Content)))
 		case llm.RoleAssistant:
 			var blocks []anthropicsdk.ContentBlockParamUnion
-			if msg.Thinking != "" && msg.ThinkingSignature != "" {
+			if len(msg.ProviderItems) > 0 {
+				for _, raw := range msg.ProviderItems {
+					var b anthropicsdk.ContentBlockParamUnion
+					if err := json.Unmarshal(raw, &b); err == nil {
+						blocks = append(blocks, b)
+					}
+				}
+			} else if msg.Thinking != "" && msg.ThinkingSignature != "" {
 				blocks = append(blocks, anthropicsdk.NewThinkingBlock(msg.ThinkingSignature, msg.Thinking))
 			}
 			if msg.Content != "" {
@@ -324,6 +338,7 @@ func parseMessageResponse(resp *anthropicsdk.Message) *llm.ChatResponse {
 	var thinkingParts []string
 	var thinkingSig string
 	var toolCalls []llm.ToolCall
+	var providerItems []json.RawMessage
 
 	for _, block := range resp.Content {
 		switch block.Type {
@@ -339,6 +354,18 @@ func parseMessageResponse(resp *anthropicsdk.Message) *llm.ChatResponse {
 			}
 			if tb.Signature != "" {
 				thinkingSig = tb.Signature
+			}
+			if raw := strings.TrimSpace(block.RawJSON()); raw != "" {
+				providerItems = append(providerItems, json.RawMessage(raw))
+			} else if b, err := json.Marshal(anthropicsdk.NewThinkingBlock(tb.Signature, tb.Thinking)); err == nil {
+				providerItems = append(providerItems, b)
+			}
+		case "redacted_thinking":
+			rb := block.AsRedactedThinking()
+			if raw := strings.TrimSpace(block.RawJSON()); raw != "" {
+				providerItems = append(providerItems, json.RawMessage(raw))
+			} else if b, err := json.Marshal(anthropicsdk.NewRedactedThinkingBlock(rb.Data)); err == nil {
+				providerItems = append(providerItems, b)
 			}
 		case "tool_use":
 			tu := block.AsToolUse()
@@ -376,6 +403,7 @@ func parseMessageResponse(resp *anthropicsdk.Message) *llm.ChatResponse {
 			Thinking:          thinking,
 			ThinkingSignature: thinkingSig,
 			ToolCalls:         toolCalls,
+			ProviderItems:     providerItems,
 		},
 		Thinking:  thinking,
 		ToolCalls: toolCalls,

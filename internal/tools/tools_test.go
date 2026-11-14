@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/shohei-yamagiwa/mochi/internal/domain"
 	"github.com/shohei-yamagiwa/mochi/internal/llm"
@@ -275,6 +276,20 @@ func TestExecCommand_TruncationAndTimeoutClamp(t *testing.T) {
 	}
 	if !strings.Contains(res.Output, "[truncated") || !strings.Contains(res.Output, "AAAA") || !strings.Contains(res.Output, "ZZZZ") {
 		t.Fatalf("expected head+tail truncation markers & both ends preserved")
+	}
+}
+
+func TestTruncateHeadTail_PreservesUTF8Boundaries(t *testing.T) {
+	// Mix 3-byte Japanese runes and 4-byte emoji so byte offsets land mid-rune.
+	text := strings.Repeat("日本語テスト🚀", 40)
+	for _, limit := range []int{20, 48, 99, 100, 101, 200} {
+		out := truncateHeadTail(text, limit)
+		if len(out) > limit {
+			t.Fatalf("limit=%d exceeded: len=%d", limit, len(out))
+		}
+		if !utf8.ValidString(out) {
+			t.Fatalf("limit=%d produced invalid UTF-8: %q", limit, out)
+		}
 	}
 }
 

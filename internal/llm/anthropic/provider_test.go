@@ -44,6 +44,8 @@ func TestAnthropicProvider_AdaptiveThinkingAndMultiToolBatch(t *testing.T) {
 				"stop_details": null,
 				"content": [
 					{"type": "thinking", "thinking": "Inspecting auth.go and db.go", "signature": "sig_123"},
+					{"type": "redacted_thinking", "data": "encrypted_blob_abc"},
+					{"type": "thinking", "thinking": "Checking DB queries", "signature": "sig_456"},
 					{"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "auth.go"}},
 					{"type": "tool_use", "id": "toolu_2", "name": "read_file", "input": {"path": "db.go"}}
 				],
@@ -114,8 +116,9 @@ func TestAnthropicProvider_AdaptiveThinkingAndMultiToolBatch(t *testing.T) {
 		Messages:     []llm.Message{{Role: llm.RoleUser, Content: "Start review"}},
 		Tools: []llm.ToolDefinition{
 			{Name: "read_file", Description: "Read file", Parameters: readSchema},
+			{Name: "submit_output", Description: "Submit", Parameters: readSchema},
 		},
-		ToolChoice: "auto",
+		ToolChoice: "submit_output",
 	})
 	if err != nil {
 		t.Fatalf("Generate turn 1: %v", err)
@@ -123,8 +126,8 @@ func TestAnthropicProvider_AdaptiveThinkingAndMultiToolBatch(t *testing.T) {
 	if resp1.FinishReason != "tool_calls" {
 		t.Fatalf("expected tool_calls, got %q", resp1.FinishReason)
 	}
-	if resp1.Thinking != "Inspecting auth.go and db.go" || resp1.Message.ThinkingSignature != "sig_123" {
-		t.Fatalf("unexpected thinking / signature: %q / %q", resp1.Thinking, resp1.Message.ThinkingSignature)
+	if resp1.Thinking != "Inspecting auth.go and db.go\nChecking DB queries" || len(resp1.Message.ProviderItems) != 3 {
+		t.Fatalf("unexpected thinking / provider items: %q / %d", resp1.Thinking, len(resp1.Message.ProviderItems))
 	}
 	if len(resp1.ToolCalls) != 2 {
 		t.Fatalf("expected 2 tool calls, got %d", len(resp1.ToolCalls))
@@ -133,9 +136,13 @@ func TestAnthropicProvider_AdaptiveThinkingAndMultiToolBatch(t *testing.T) {
 		t.Fatalf("unexpected usage: %+v", resp1.Usage)
 	}
 
-	// Verify adaptive thinking & omitted temperature when thinking enabled
+	// Verify adaptive thinking, omitted temperature, and forced tool_choice clamped to auto when thinking is enabled
 	if _, hasTemp := requests[0]["temperature"]; hasTemp {
 		t.Fatalf("temperature should be omitted when adaptive thinking is enabled")
+	}
+	toolChoiceCfg, _ := requests[0]["tool_choice"].(map[string]any)
+	if toolChoiceCfg["type"] != "auto" {
+		t.Fatalf("expected tool_choice.type=auto when thinking is enabled, got %v", toolChoiceCfg)
 	}
 	thinkingCfg, _ := requests[0]["thinking"].(map[string]any)
 	if thinkingCfg["type"] != "adaptive" {
@@ -146,7 +153,7 @@ func TestAnthropicProvider_AdaptiveThinkingAndMultiToolBatch(t *testing.T) {
 		t.Fatalf("expected output_config.effort=high, got %v", outputCfg)
 	}
 
-	// Turn 2: ensure consecutive RoleTool messages merge into one user message & thinking block is echoed
+	// Turn 2: ensure consecutive RoleTool messages merge into one user message & thinking + redacted_thinking blocks echo verbatim
 	outSchema, _ := jsonschema.For[struct {
 		OK bool `json:"ok"`
 	}](nil)
@@ -176,9 +183,16 @@ func TestAnthropicProvider_AdaptiveThinkingAndMultiToolBatch(t *testing.T) {
 	}
 	assistantMsg := msgs[1].(map[string]any)
 	assistantBlocks := assistantMsg["content"].([]any)
+	if len(assistantBlocks) != 5 {
+		t.Fatalf("expected 5 assistant blocks (2 thinking + 1 redacted_thinking + 2 tool_use), got %d", len(assistantBlocks))
+	}
 	firstBlock := assistantBlocks[0].(map[string]any)
-	if firstBlock["type"] != "thinking" || firstBlock["signature"] != "sig_123" {
-		t.Fatalf("expected thinking block first in assistant message, got %v", firstBlock)
+	secondBlock := assistantBlocks[1].(map[string]any)
+	thirdBlock := assistantBlocks[2].(map[string]any)
+	if firstBlock["type"] != "thinking" || firstBlock["signature"] != "sig_123" ||
+		secondBlock["type"] != "redacted_thinking" || secondBlock["data"] != "encrypted_blob_abc" ||
+		thirdBlock["type"] != "thinking" || thirdBlock["signature"] != "sig_456" {
+		t.Fatalf("unexpected echoed thinking blocks: %v, %v, %v", firstBlock, secondBlock, thirdBlock)
 	}
 	toolUserMsg := msgs[2].(map[string]any)
 	toolBlocks := toolUserMsg["content"].([]any)

@@ -186,7 +186,12 @@ func (p *Provider) cloneAndSanitizeRepo(ctx context.Context, rawSB *daytonasdk.S
 	// from .git/config and sandbox home before Fork() is ever called.
 	sanitizedURL := sanitizeRepoURL(ws.RepoURL)
 	stripCmd := fmt.Sprintf(
-		"git remote set-url origin %s && git config --local --unset-all credential.helper || true; git config --local --unset-all http.extraheader || true; rm -f ~/.git-credentials",
+		"git remote set-url origin %s && "+
+			"{ git config --local --unset-all credential.helper || true; } && "+
+			"{ git config --local --unset-all http.extraheader || true; } && "+
+			"rm -f ~/.git-credentials && "+
+			`test "$(git config --local --get remote.origin.url)" = %s`,
+		shellQuote(sanitizedURL),
 		shellQuote(sanitizedURL),
 	)
 	res, err := rawSB.Process.ExecuteCommand(ctx, stripCmd, options.WithCwd(repoDir))
@@ -491,12 +496,17 @@ func isTimeoutErr(ctx context.Context, err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return true
 	}
+	if errors.Is(err, sdkerrors.ErrProcessExecutionTimeout) ||
+		errors.Is(err, sdkerrors.ErrTimeout) ||
+		errors.Is(err, sdkerrors.ErrGatewayTimeout) {
+		return true
+	}
 	var daytonaErr *sdkerrors.DaytonaError
 	if errors.As(err, &daytonaErr) && (daytonaErr.StatusCode == http.StatusRequestTimeout || daytonaErr.StatusCode == http.StatusGatewayTimeout) {
 		return true
 	}
-	lower := strings.ToLower(err.Error())
-	return strings.Contains(lower, "timeout") || strings.Contains(lower, "timed out") || strings.Contains(lower, "deadline exceeded")
+	var timeoutErr *sdkerrors.DaytonaTimeoutError
+	return errors.As(err, &timeoutErr)
 }
 
 func toInt(v any) int {
