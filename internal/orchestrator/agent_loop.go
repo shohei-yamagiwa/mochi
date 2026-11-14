@@ -50,8 +50,9 @@ type AgentLoopRequest struct {
 
 // AgentLoopResult captures the completed execution state and final structured output.
 type AgentLoopResult struct {
-	AgentRun        *domain.AgentRunRecord `json:"agent_run"`
-	SubmittedOutput json.RawMessage        `json:"submitted_output,omitempty"`
+	AgentRun        *domain.AgentRunRecord   `json:"agent_run"`
+	SubmittedOutput json.RawMessage          `json:"submitted_output,omitempty"`
+	ToolExecutions  []*domain.ToolExecRecord `json:"tool_executions,omitempty"`
 }
 
 // Run executes the multi-turn agent loop, enforcing budgets and persisting turns and tool executions.
@@ -122,6 +123,8 @@ func (l *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 		defer cancel()
 	}
 
+	var toolExecs []*domain.ToolExecRecord
+
 	finalize := func(status domain.AgentRunStatus, submitted json.RawMessage, runErr error) (*AgentLoopResult, error) {
 		now := time.Now().UTC()
 		agentRun.Status = status
@@ -140,9 +143,9 @@ func (l *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 			}
 		}
 		if runErr != nil {
-			return &AgentLoopResult{AgentRun: agentRun, SubmittedOutput: submitted}, runErr
+			return &AgentLoopResult{AgentRun: agentRun, SubmittedOutput: submitted, ToolExecutions: toolExecs}, runErr
 		}
-		return &AgentLoopResult{AgentRun: agentRun, SubmittedOutput: submitted}, nil
+		return &AgentLoopResult{AgentRun: agentRun, SubmittedOutput: submitted, ToolExecutions: toolExecs}, nil
 	}
 
 	messages := []llm.Message{
@@ -314,24 +317,26 @@ func (l *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 				}
 			}
 
+			argsJSON := tc.Arguments
+			if len(argsJSON) == 0 {
+				argsJSON = json.RawMessage("{}")
+			}
+			toolRec := &domain.ToolExecRecord{
+				ToolExecID:    newID(),
+				AgentRunID:    agentRunID,
+				TurnID:        turnID,
+				ToolCallID:    tc.ID,
+				ToolName:      tc.Name,
+				ArgumentsJSON: argsJSON,
+				OutputText:    outputText,
+				ExitCode:      exitCode,
+				AccessedFiles: accessed,
+				DurationMS:    durationMS,
+				CreatedAt:     time.Now().UTC(),
+			}
+			toolExecs = append(toolExecs, toolRec)
+
 			if l.Store != nil {
-				argsJSON := tc.Arguments
-				if len(argsJSON) == 0 {
-					argsJSON = json.RawMessage("{}")
-				}
-				toolRec := &domain.ToolExecRecord{
-					ToolExecID:    newID(),
-					AgentRunID:    agentRunID,
-					TurnID:        turnID,
-					ToolCallID:    tc.ID,
-					ToolName:      tc.Name,
-					ArgumentsJSON: argsJSON,
-					OutputText:    outputText,
-					ExitCode:      exitCode,
-					AccessedFiles: accessed,
-					DurationMS:    durationMS,
-					CreatedAt:     time.Now().UTC(),
-				}
 				if saveErr := l.Store.SaveToolExecution(runCtx, toolRec); saveErr != nil {
 					if ctxErr := runCtx.Err(); ctxErr != nil {
 						return finalize(statusFromContextErr(ctxErr), nil, ctxErr)
