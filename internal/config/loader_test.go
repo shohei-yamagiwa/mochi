@@ -83,14 +83,12 @@ agents:
 		}
 	})
 
-	t.Run("rejects custom prompt outside .mochi directory", func(t *testing.T) {
-		override := []byte(`
-agents:
-  - role: correctness
-    prompt_file: "configs/prompts/security.md"
-`)
-		if _, err := config.MergeRepoOverrides(wf, override); err == nil {
-			t.Fatal("expected error for repo prompt outside .mochi/, got nil")
+	t.Run("rejects custom prompt outside .mochi directory or .mochi directory itself", func(t *testing.T) {
+		for _, p := range []string{"configs/prompts/security.md", ".mochi", ".mochi/", "./.mochi"} {
+			override := []byte("agents:\n  - role: correctness\n    prompt_file: \"" + p + "\"\n")
+			if _, err := config.MergeRepoOverrides(wf, override); err == nil {
+				t.Fatalf("expected error for repo prompt %q, got nil", p)
+			}
 		}
 	})
 
@@ -161,7 +159,7 @@ agents:
 		}
 	})
 
-	t.Run("clamps budgets subsets tools preserves ignore_drafts and does not mutate base", func(t *testing.T) {
+	t.Run("clamps unset budgets and reasoning_effort and persists prompt_from_repo", func(t *testing.T) {
 		override := []byte(`
 input:
   triggers:
@@ -169,12 +167,22 @@ input:
 agents:
   - role: correctness
     prompt_file: ".mochi/prompts/correctness.md"
+    llm:
+      reasoning_effort: low
     tools: ["read_file", "submit_output"]
     budgets:
       max_turns: 999
       run_timeout: 2m
+  - role: test-runner
+    llm:
+      max_output_tokens: 999999
+      reasoning_effort: high
   - role: performance-architecture
     enabled: false
+synthesizer:
+  prompt_file: ".mochi/prompts/synth.md"
+  budgets:
+    max_tokens: 99999999
 output:
   sinks:
     - type: github_pr_review
@@ -196,8 +204,24 @@ output:
 		if merged.Agents[0].Budgets.RunTimeout.Std() != 2*time.Minute {
 			t.Fatalf("expected run_timeout lowered to 2m, got %v", merged.Agents[0].Budgets.RunTimeout.Std())
 		}
+		if merged.Agents[0].LLM.ReasoningEffort != "low" {
+			t.Fatalf("expected correctness reasoning_effort lowered to low, got %q", merged.Agents[0].LLM.ReasoningEffort)
+		}
 		if !merged.Agents[0].PromptFromRepo || merged.Agents[0].PromptFile != ".mochi/prompts/correctness.md" {
 			t.Fatalf("unexpected custom prompt metadata: %+v", merged.Agents[0])
+		}
+		if !merged.Synthesizer.PromptFromRepo || merged.Synthesizer.PromptFile != ".mochi/prompts/synth.md" {
+			t.Fatalf("unexpected synthesizer custom prompt metadata: %+v", merged.Synthesizer)
+		}
+		// test-runner is at index 2 after performance-architecture is disabled.
+		if merged.Agents[2].LLM.MaxOutputTokens != 16384 {
+			t.Fatalf("expected unset max_output_tokens clamped to ceiling 16384, got %d", merged.Agents[2].LLM.MaxOutputTokens)
+		}
+		if merged.Agents[2].LLM.ReasoningEffort != "medium" {
+			t.Fatalf("expected test-runner reasoning_effort capped at base medium, got %q", merged.Agents[2].LLM.ReasoningEffort)
+		}
+		if merged.Synthesizer.Budgets.MaxTokens != 200000 {
+			t.Fatalf("expected unset synthesizer max_tokens clamped to ceiling 200000, got %d", merged.Synthesizer.Budgets.MaxTokens)
 		}
 		if len(merged.Agents[0].Tools) != 2 {
 			t.Fatalf("expected subset tools, got %v", merged.Agents[0].Tools)
@@ -205,6 +229,26 @@ output:
 		if merged.Output.Sinks[0].MinSeverity != "medium" {
 			t.Fatalf("expected min_severity=medium, got %q", merged.Output.Sinks[0].MinSeverity)
 		}
+
+		// Verify PromptFromRepo survives MarshalWorkflowYAML -> ParseResolvedWorkflow, while ParseWorkflow rejects it.
+		resolvedYAML, err := config.MarshalWorkflowYAML(merged)
+		if err != nil {
+			t.Fatalf("MarshalWorkflowYAML failed: %v", err)
+		}
+		if !strings.Contains(resolvedYAML, "prompt_from_repo: true") {
+			t.Fatalf("expected prompt_from_repo in resolved YAML:\n%s", resolvedYAML)
+		}
+		reloaded, err := config.ParseResolvedWorkflow([]byte(resolvedYAML))
+		if err != nil {
+			t.Fatalf("ParseResolvedWorkflow failed: %v", err)
+		}
+		if !reloaded.Agents[0].PromptFromRepo || !reloaded.Synthesizer.PromptFromRepo {
+			t.Fatalf("PromptFromRepo lost across resolved YAML round-trip: agent=%v synth=%v", reloaded.Agents[0].PromptFromRepo, reloaded.Synthesizer.PromptFromRepo)
+		}
+		if _, err := config.ParseWorkflow([]byte(resolvedYAML)); err == nil {
+			t.Fatal("expected ParseWorkflow to reject prompt_from_repo=true in server workflow YAML")
+		}
+
 		if wf.Agents[0].Budgets.MaxTurns != 15 || len(wf.Agents) != 4 || wf.Agents[0].PromptFromRepo {
 			t.Fatal("base workflow was mutated by MergeRepoOverrides")
 		}
@@ -223,7 +267,7 @@ func TestPromptEngineSecurityAndRendering(t *testing.T) {
 	if err := os.MkdirAll(mochiDir, 0o755); err != nil {
 		t.Fatalf("mkdir repo .mochi: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(mochiDir, "custom.md"), []byte("Custom prompt for {{ .Task.Changeset.RepoName }}"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(mochiDir, "custom.md"), []byte("Custom prompt for {{ .Task.Changeset.RepoName }} ({{ .Task.Workspace.RepoURL }})"), 0o644); err != nil {
 		t.Fatalf("write repo prompt: %v", err)
 	}
 
@@ -242,7 +286,7 @@ func TestPromptEngineSecurityAndRendering(t *testing.T) {
 		WorkflowName: wf.Name,
 		TriggerType:  "github_pr",
 		Workspace: domain.WorkspaceSpec{
-			RepoURL:    "https://github.com/shohei-yamagiwa/mochi.git",
+			RepoURL:    "https://x-access-token:ghs_URL_SECRET@github.com/shohei-yamagiwa/mochi.git",
 			CloneToken: "ghs_SECRET_DO_NOT_LEAK",
 		},
 		Changeset: &domain.ChangesetSpec{
@@ -255,27 +299,36 @@ func TestPromptEngineSecurityAndRendering(t *testing.T) {
 	for i := range wf.Agents {
 		role := wf.Agents[i]
 		data := config.NewPromptData(task, wf, &role)
-		rendered, err := engine.RenderPrompt(role.PromptFile, role.PromptFromRepo, data)
+		rendered, err := engine.RenderRole(role, data)
 		if err != nil {
-			t.Fatalf("RenderPrompt(%s) failed: %v", role.PromptFile, err)
+			t.Fatalf("RenderRole(%s) failed: %v", role.Role, err)
 		}
 		if !strings.Contains(rendered, "shohei-yamagiwa/mochi") || !strings.Contains(rendered, "1234567") {
 			t.Fatalf("rendered prompt for %s missing expected context:\n%s", role.Role, rendered)
 		}
 	}
 
-	synthRendered, err := engine.RenderPrompt(wf.Synthesizer.PromptFile, wf.Synthesizer.PromptFromRepo, config.NewPromptData(task, wf, nil))
+	synthRendered, err := engine.RenderSynthesizer(wf.Synthesizer, config.NewPromptData(task, wf, nil))
 	if err != nil {
-		t.Fatalf("RenderPrompt(synthesizer) failed: %v", err)
+		t.Fatalf("RenderSynthesizer failed: %v", err)
 	}
 	if !strings.Contains(synthRendered, "1234567") {
 		t.Fatalf("rendered synthesizer prompt missing shortSHA:\n%s", synthRendered)
 	}
 
-	// Repo prompt within root renders cleanly.
-	customOut, err := engine.RenderRepoFile(".mochi/prompts/custom.md", config.NewPromptData(task, wf, nil))
-	if err != nil || customOut != "Custom prompt for mochi" {
-		t.Fatalf("RenderRepoFile failed: out=%q err=%v", customOut, err)
+	// RenderRole with PromptFromRepo=true automatically selects repoDir and strips RepoURL userinfo.
+	repoRole := wf.Agents[0]
+	repoRole.PromptFile = ".mochi/prompts/custom.md"
+	repoRole.PromptFromRepo = true
+	customOut, err := engine.RenderRole(repoRole, config.NewPromptData(task, wf, &repoRole))
+	if err != nil {
+		t.Fatalf("RenderRole(repo) failed: %v", err)
+	}
+	if strings.Contains(customOut, "ghs_URL_SECRET") || strings.Contains(customOut, "x-access-token") {
+		t.Fatalf("RepoURL userinfo leaked into rendered prompt: %q", customOut)
+	}
+	if customOut != "Custom prompt for mochi (https://github.com/shohei-yamagiwa/mochi.git)" {
+		t.Fatalf("unexpected custom prompt output: %q", customOut)
 	}
 
 	// Escaping symlink under .mochi/ is blocked by os.Root.

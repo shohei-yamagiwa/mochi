@@ -312,3 +312,38 @@ func TestSQLiteStoreSubSecondTimestampOrdering(t *testing.T) {
 		t.Fatalf("ListToolExecutions sub-second ordering wrong: got [%s, %s], want [exec-1, exec-2]", execs[0].ToolExecID, execs[1].ToolExecID)
 	}
 }
+
+func TestSQLiteStoreRelativePaths(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	t.Chdir(tmp)
+
+	for _, relPath := range []string{"rel/x.db", "mochi.db"} {
+		t.Run(relPath, func(t *testing.T) {
+			st, err := sqlite.Open(ctx, relPath)
+			if err != nil {
+				t.Fatalf("sqlite.Open(%q) failed: %v", relPath, err)
+			}
+			defer st.Close()
+
+			run := &domain.RunRecord{
+				RunID:        "run-rel-" + filepath.Base(relPath),
+				WorkflowName: "pr-review",
+				TriggerType:  "cli",
+				DedupKey:     "rel",
+				Status:       domain.RunStatusRunning,
+				StartedAt:    time.Now().UTC(),
+			}
+			if err := st.CreateRun(ctx, run); err != nil {
+				t.Fatalf("CreateRun failed: %v", err)
+			}
+			got, err := st.GetRun(ctx, run.RunID)
+			if err != nil {
+				t.Fatalf("GetRun failed: %v", err)
+			}
+			if got.RunID != run.RunID {
+				t.Fatalf("got %q, want %q", got.RunID, run.RunID)
+			}
+		})
+	}
+}

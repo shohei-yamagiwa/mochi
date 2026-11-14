@@ -119,8 +119,26 @@ func LoadWorkflowFile(path string, baseDir string) (*domain.Workflow, error) {
 	return wf, nil
 }
 
-// ParseWorkflow decodes YAML bytes into a domain.Workflow using goccy/go-yaml.
+// ParseWorkflow decodes server workflow YAML bytes into a domain.Workflow using goccy/go-yaml.
+// It rejects prompt_from_repo=true since server configs must not mark prompts as repo-owned.
 func ParseWorkflow(data []byte) (*domain.Workflow, error) {
+	wf, err := ParseResolvedWorkflow(data)
+	if err != nil {
+		return nil, err
+	}
+	for _, a := range wf.Agents {
+		if a.PromptFromRepo {
+			return nil, fmt.Errorf("agent %q: prompt_from_repo cannot be set in server workflow YAML", a.Role)
+		}
+	}
+	if wf.Synthesizer.PromptFromRepo {
+		return nil, fmt.Errorf("synthesizer: prompt_from_repo cannot be set in server workflow YAML")
+	}
+	return wf, nil
+}
+
+// ParseResolvedWorkflow decodes a persisted resolved_config_yaml snapshot (which may contain prompt_from_repo).
+func ParseResolvedWorkflow(data []byte) (*domain.Workflow, error) {
 	var wf domain.Workflow
 	if err := yaml.UnmarshalWithOptions(data, &wf, yaml.Strict()); err != nil {
 		return nil, fmt.Errorf("unmarshal workflow yaml: %w", err)
@@ -417,6 +435,29 @@ func cloneWorkflow(wf *domain.Workflow) *domain.Workflow {
 	return &out
 }
 
+const (
+	defaultMaxOutputTokensCeiling = 16384
+	defaultMaxTurnsCeiling        = 20
+	defaultMaxTokensCeiling       = 200000
+	defaultCommandTimeoutCeiling  = domain.Duration(5 * 60 * 1e9)  // 5m
+	defaultRunTimeoutCeiling      = domain.Duration(10 * 60 * 1e9) // 10m
+)
+
+func reasoningEffortRank(effort string) (int, bool) {
+	switch effort {
+	case "minimal":
+		return 1, true
+	case "low":
+		return 2, true
+	case "medium":
+		return 3, true
+	case "high":
+		return 4, true
+	default:
+		return 0, false
+	}
+}
+
 func mergeModelOverride(dst *domain.ModelConfig, src *ModelOverride) error {
 	if src.BaseURL != "" {
 		return fmt.Errorf("base_url: %w", ErrDisallowedOverrideField)
@@ -432,10 +473,23 @@ func mergeModelOverride(dst *domain.ModelConfig, src *ModelOverride) error {
 		dst.Temperature = &t
 	}
 	if src.MaxOutputTokens > 0 {
-		dst.MaxOutputTokens = clampInt(src.MaxOutputTokens, dst.MaxOutputTokens)
+		dst.MaxOutputTokens = clampInt(src.MaxOutputTokens, dst.MaxOutputTokens, defaultMaxOutputTokensCeiling)
 	}
 	if src.ReasoningEffort != "" {
-		dst.ReasoningEffort = src.ReasoningEffort
+		reqRank, ok := reasoningEffortRank(src.ReasoningEffort)
+		if !ok {
+			return fmt.Errorf("unsupported reasoning_effort %q", src.ReasoningEffort)
+		}
+		capEffort := dst.ReasoningEffort
+		if capEffort == "" {
+			capEffort = "medium"
+		}
+		baseRank, ok := reasoningEffortRank(capEffort)
+		if !ok || reqRank <= baseRank {
+			dst.ReasoningEffort = src.ReasoningEffort
+		} else {
+			dst.ReasoningEffort = capEffort
+		}
 	}
 	return nil
 }
@@ -445,30 +499,38 @@ func mergeClampedBudgetConfig(dst, src *domain.BudgetConfig) error {
 		return err
 	}
 	if src.MaxTurns > 0 {
-		dst.MaxTurns = clampInt(src.MaxTurns, dst.MaxTurns)
+		dst.MaxTurns = clampInt(src.MaxTurns, dst.MaxTurns, defaultMaxTurnsCeiling)
 	}
 	if src.MaxTokens > 0 {
-		dst.MaxTokens = clampInt(src.MaxTokens, dst.MaxTokens)
+		dst.MaxTokens = clampInt(src.MaxTokens, dst.MaxTokens, defaultMaxTokensCeiling)
 	}
 	if src.CommandTimeout > 0 {
-		dst.CommandTimeout = clampDuration(src.CommandTimeout, dst.CommandTimeout)
+		dst.CommandTimeout = clampDuration(src.CommandTimeout, dst.CommandTimeout, defaultCommandTimeoutCeiling)
 	}
 	if src.RunTimeout > 0 {
-		dst.RunTimeout = clampDuration(src.RunTimeout, dst.RunTimeout)
+		dst.RunTimeout = clampDuration(src.RunTimeout, dst.RunTimeout, defaultRunTimeoutCeiling)
 	}
 	return nil
 }
 
-func clampInt(requested, base int) int {
-	if base > 0 && requested > base {
-		return base
+func clampInt(requested, base, ceiling int) int {
+	limit := base
+	if limit <= 0 {
+		limit = ceiling
+	}
+	if limit > 0 && requested > limit {
+		return limit
 	}
 	return requested
 }
 
-func clampDuration(requested, base domain.Duration) domain.Duration {
-	if base > 0 && requested > base {
-		return base
+func clampDuration(requested, base, ceiling domain.Duration) domain.Duration {
+	limit := base
+	if limit <= 0 {
+		limit = ceiling
+	}
+	if limit > 0 && requested > limit {
+		return limit
 	}
 	return requested
 }
@@ -490,9 +552,7 @@ func validateModelConfig(m domain.ModelConfig) error {
 		return fmt.Errorf("max_output_tokens must not be negative")
 	}
 	if m.ReasoningEffort != "" {
-		switch m.ReasoningEffort {
-		case "minimal", "low", "medium", "high":
-		default:
+		if _, ok := reasoningEffortRank(m.ReasoningEffort); !ok {
 			return fmt.Errorf("unsupported reasoning_effort %q", m.ReasoningEffort)
 		}
 	}
@@ -543,8 +603,8 @@ func ensureSafeRepoPromptPath(p string) error {
 		return err
 	}
 	cleanSlash := filepath.ToSlash(filepath.Clean(filepath.FromSlash(p)))
-	if cleanSlash != ".mochi" && !strings.HasPrefix(cleanSlash, ".mochi/") {
-		return fmt.Errorf("repo prompt_file %q must reside under .mochi/", p)
+	if !strings.HasPrefix(cleanSlash, ".mochi/") || len(cleanSlash) <= len(".mochi/") {
+		return fmt.Errorf("repo prompt_file %q must be a file under .mochi/", p)
 	}
 	return nil
 }

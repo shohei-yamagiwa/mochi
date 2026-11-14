@@ -140,7 +140,7 @@ type SandboxConfig struct {
 type RoleConfig struct {
 	Role           string             `yaml:"role" json:"role"`
 	PromptFile     string             `yaml:"prompt_file" json:"prompt_file"`
-	PromptFromRepo bool               `yaml:"-" json:"prompt_from_repo,omitempty"`
+	PromptFromRepo bool               `yaml:"prompt_from_repo,omitempty" json:"prompt_from_repo,omitempty"`
 	LLM            ModelConfig        `yaml:"llm" json:"llm"`
 	Sandbox        AgentSandboxConfig `yaml:"sandbox,omitempty" json:"sandbox,omitempty"`
 	Tools          []string           `yaml:"tools" json:"tools"`
@@ -163,7 +163,7 @@ type BudgetConfig struct {
 // SynthesizerConfig defines the final synthesis agent step.
 type SynthesizerConfig struct {
 	PromptFile     string       `yaml:"prompt_file" json:"prompt_file"`
-	PromptFromRepo bool         `yaml:"-" json:"prompt_from_repo,omitempty"`
+	PromptFromRepo bool         `yaml:"prompt_from_repo,omitempty" json:"prompt_from_repo,omitempty"`
 	LLM            ModelConfig  `yaml:"llm" json:"llm"`
 	Budgets        BudgetConfig `yaml:"budgets,omitempty" json:"budgets,omitempty"`
 }

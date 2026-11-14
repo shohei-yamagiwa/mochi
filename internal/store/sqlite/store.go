@@ -47,7 +47,10 @@ func Open(ctx context.Context, path string) (*SQLiteStore, error) {
 		}
 	}
 
-	dsn := buildSQLiteDSN(path, isMemory)
+	dsn, err := buildSQLiteDSN(path, isMemory)
+	if err != nil {
+		return nil, err
+	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite %q: %w", path, err)
@@ -70,7 +73,7 @@ func Open(ctx context.Context, path string) (*SQLiteStore, error) {
 	return &SQLiteStore{db: db}, nil
 }
 
-func buildSQLiteDSN(path string, isMemory bool) string {
+func buildSQLiteDSN(path string, isMemory bool) (string, error) {
 	q := url.Values{}
 	q.Add("_pragma", "foreign_keys(1)")
 	q.Add("_pragma", "busy_timeout(5000)")
@@ -84,17 +87,25 @@ func buildSQLiteDSN(path string, isMemory bool) string {
 		if strings.Contains(path, "?") {
 			sep = "&"
 		}
-		return path + sep + q.Encode()
+		return path + sep + q.Encode(), nil
 	}
 	if path == ":memory:" {
-		return "file::memory:?" + q.Encode()
+		return "file::memory:?" + q.Encode(), nil
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve sqlite path %q: %w", path, err)
+	}
+	slashPath := filepath.ToSlash(absPath)
+	if !strings.HasPrefix(slashPath, "/") {
+		slashPath = "/" + slashPath
 	}
 	u := url.URL{
 		Scheme:   "file",
-		Path:     filepath.ToSlash(path),
+		Path:     slashPath,
 		RawQuery: q.Encode(),
 	}
-	return u.String()
+	return u.String(), nil
 }
 
 // Close closes the underlying database connection pool.

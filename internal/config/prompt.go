@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,7 +16,7 @@ import (
 )
 
 // PromptWorkspaceSpec is a secret-free projection of domain.WorkspaceSpec for prompt templates.
-// It intentionally omits CloneToken so credentials can never be interpolated into LLM prompts.
+// It omits CloneToken and strips any URL userinfo from RepoURL so credentials can never be interpolated into LLM prompts.
 type PromptWorkspaceSpec struct {
 	RepoURL    string `json:"repo_url"`
 	Ref        string `json:"ref"`
@@ -25,6 +27,7 @@ type PromptWorkspaceSpec struct {
 }
 
 // PromptTaskContext is a secret-free projection of domain.TaskContext exposed to prompt templates.
+// Input adapters and callers must never place credentials or tokens in TaskContext.Variables.
 type PromptTaskContext struct {
 	RunID        string                `json:"run_id"`
 	WorkflowName string                `json:"workflow_name"`
@@ -33,7 +36,6 @@ type PromptTaskContext struct {
 	Workspace    PromptWorkspaceSpec   `json:"workspace"`
 	Changeset    *domain.ChangesetSpec `json:"changeset"`
 	Variables    map[string]any        `json:"variables"`
-	SinkMetadata map[string]any        `json:"sink_metadata"`
 }
 
 // NewPromptTaskContext constructs a secret-free PromptTaskContext from a domain.TaskContext.
@@ -41,23 +43,41 @@ func NewPromptTaskContext(task *domain.TaskContext) *PromptTaskContext {
 	if task == nil {
 		return nil
 	}
+	var vars map[string]any
+	if task.Variables != nil {
+		vars = maps.Clone(task.Variables)
+	}
 	return &PromptTaskContext{
 		RunID:        task.RunID,
 		WorkflowName: task.WorkflowName,
 		TriggerType:  task.TriggerType,
 		DedupKey:     task.DedupKey,
 		Workspace: PromptWorkspaceSpec{
-			RepoURL:    task.Workspace.RepoURL,
+			RepoURL:    sanitizeRepoURL(task.Workspace.RepoURL),
 			Ref:        task.Workspace.Ref,
 			BaseRef:    task.Workspace.BaseRef,
 			Snapshot:   task.Workspace.Snapshot,
 			Image:      task.Workspace.Image,
 			Dockerfile: task.Workspace.Dockerfile,
 		},
-		Changeset:    task.Changeset,
-		Variables:    task.Variables,
-		SinkMetadata: task.SinkMetadata,
+		Changeset: task.Changeset,
+		Variables: vars,
 	}
+}
+
+func sanitizeRepoURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if u.User != nil {
+		u.User = nil
+		return u.String()
+	}
+	return raw
 }
 
 // PromptData exposes canonical, secret-free workflow and task context variables to prompt templates.
@@ -140,6 +160,16 @@ func NewPromptEngineWithRoots(serverDir, repoDir string) *PromptEngine {
 			},
 		},
 	}
+}
+
+// RenderRole selects the server or repository root based on role.PromptFromRepo and renders its prompt.
+func (e *PromptEngine) RenderRole(role domain.RoleConfig, data PromptData) (string, error) {
+	return e.RenderPrompt(role.PromptFile, role.PromptFromRepo, data)
+}
+
+// RenderSynthesizer selects the server or repository root based on synth.PromptFromRepo and renders its prompt.
+func (e *PromptEngine) RenderSynthesizer(synth domain.SynthesizerConfig, data PromptData) (string, error) {
+	return e.RenderPrompt(synth.PromptFile, synth.PromptFromRepo, data)
 }
 
 // RenderFile reads a server-owned prompt template relative to serverDir and renders it with data.
