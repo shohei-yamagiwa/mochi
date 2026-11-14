@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/shohei-yamagiwa/mochi/internal/config"
 	"github.com/shohei-yamagiwa/mochi/internal/domain"
@@ -569,25 +568,8 @@ func TestRunner_SpecialistFailureCleansUpSandboxesAndNotifiesSink(t *testing.T) 
 	}
 
 	sbProvider := newTrackingSandboxProvider(nil)
-	llmProvider := newRoutingLLMProvider("mock", func(ctx context.Context, role string, _ int, _ llm.ChatRequest) (*llm.ChatResponse, error) {
-		if role == "security" {
-			return nil, errors.New("provider rate limit exceeded")
-		}
-		// Other specialists wait briefly for sibling cancellation or return normally.
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(20 * time.Millisecond):
-			tc := llm.ToolCall{
-				ID:        "tc_ok",
-				Name:      "submit_output",
-				Arguments: json.RawMessage(`{"summary":"ok","findings":[]}`),
-			}
-			return &llm.ChatResponse{
-				Message:   llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{tc}},
-				ToolCalls: []llm.ToolCall{tc},
-			}, nil
-		}
+	llmProvider := newRoutingLLMProvider("mock", func(_ context.Context, _ string, _ int, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+		return nil, errors.New("provider rate limit exceeded")
 	})
 
 	sink := &recordingSink{name: "github_pr_review"}
@@ -647,6 +629,177 @@ func TestRunner_SpecialistFailureCleansUpSandboxesAndNotifiesSink(t *testing.T) 
 	}
 	if len(sink.failedErrs) != 1 {
 		t.Fatalf("len(sink.failedErrs) = %d, want 1", len(sink.failedErrs))
+	}
+}
+
+func TestRunner_PartialSpecialistFailureContinuesWithSurvivingSpecialists(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer st.Close()
+
+	repoRoot := filepath.Join("..", "..")
+	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, "configs", "workflows", "pr-review.yaml"), repoRoot)
+	if err != nil {
+		t.Fatalf("LoadWorkflowFile: %v", err)
+	}
+
+	sbProvider := newTrackingSandboxProvider(nil)
+	llmProvider := newRoutingLLMProvider("mock", func(_ context.Context, role string, _ int, req llm.ChatRequest) (*llm.ChatResponse, error) {
+		if role == "security" {
+			return nil, errors.New("gemini rate limit exceeded")
+		}
+		if role == "synthesizer" {
+			// Verify Synthesizer ResponseSchema omits "coverage".
+			if req.ResponseSchema != nil {
+				if _, hasCov := req.ResponseSchema.Properties["coverage"]; hasCov {
+					t.Errorf("expected synthesizer ResponseSchema to omit coverage property")
+				}
+			}
+			return &llm.ChatResponse{
+				Message: llm.Message{
+					Role:    llm.RoleAssistant,
+					Content: `{"summary":"Completed with 3 of 4 specialists","verdict":"COMMENT","findings":[]}`,
+				},
+			}, nil
+		}
+		tc := llm.ToolCall{
+			ID:        "tc_ok_" + role,
+			Name:      "submit_output",
+			Arguments: json.RawMessage(`{"summary":"ok","findings":[]}`),
+		}
+		return &llm.ChatResponse{
+			Message:   llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{tc}},
+			ToolCalls: []llm.ToolCall{tc},
+		}, nil
+	})
+
+	runner := &Runner{
+		Store:              st,
+		SandboxProvider:    sbProvider,
+		DefaultLLMProvider: llmProvider,
+		PromptEngine:       config.NewPromptEngine(repoRoot),
+	}
+
+	task := &domain.TaskContext{
+		RunID:        "run-partial-specialist",
+		WorkflowName: wf.Name,
+		TriggerType:  "cli",
+		DedupKey:     "repo:pr:20",
+		Changeset: &domain.ChangesetSpec{
+			RepoOwner: "shohei-yamagiwa",
+			RepoName:  "mochi",
+			PRNumber:  20,
+			BaseSHA:   "1111111",
+			HeadSHA:   "2222222",
+		},
+	}
+
+	res, err := runner.Execute(ctx, task, wf)
+	if err != nil {
+		t.Fatalf("Runner.Execute error = %v, want nil when 3 of 4 specialists succeed", err)
+	}
+	if res.Run.Status != domain.RunStatusCompleted {
+		t.Fatalf("res.Run.Status = %q, want %q", res.Run.Status, domain.RunStatusCompleted)
+	}
+	if !strings.Contains(res.Report.AgentSummaries["security"], "failed") {
+		t.Fatalf("Report.AgentSummaries[security] = %q, want failure note", res.Report.AgentSummaries["security"])
+	}
+}
+
+func TestRunner_PartialSinkPublishFailureOnlyNotifiesFailedSink(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer st.Close()
+
+	repoRoot := filepath.Join("..", "..")
+	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, "configs", "workflows", "pr-review.yaml"), repoRoot)
+	if err != nil {
+		t.Fatalf("LoadWorkflowFile: %v", err)
+	}
+
+	sbProvider := newTrackingSandboxProvider(nil)
+	llmProvider := newRoutingLLMProvider("mock", func(_ context.Context, role string, _ int, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+		if role == "synthesizer" {
+			return &llm.ChatResponse{
+				Message: llm.Message{
+					Role:    llm.RoleAssistant,
+					Content: `{"summary":"All clear","verdict":"APPROVE","findings":[]}`,
+				},
+			}, nil
+		}
+		tc := llm.ToolCall{
+			ID:        "tc_ok_" + role,
+			Name:      "submit_output",
+			Arguments: json.RawMessage(`{"summary":"ok","findings":[]}`),
+		}
+		return &llm.ChatResponse{
+			Message:   llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{tc}},
+			ToolCalls: []llm.ToolCall{tc},
+		}, nil
+	})
+
+	goodSink := &recordingSink{name: "github_pr_review"}
+	badSink := &recordingSink{name: "github_check_run", publishErr: errors.New("webhook 502 bad gateway")}
+
+	runner := &Runner{
+		Store:              st,
+		SandboxProvider:    sbProvider,
+		DefaultLLMProvider: llmProvider,
+		PromptEngine:       config.NewPromptEngine(repoRoot),
+		Sinks:              []output.OutputSink{goodSink, badSink},
+	}
+
+	task := &domain.TaskContext{
+		RunID:        "run-partial-sink",
+		WorkflowName: wf.Name,
+		TriggerType:  "cli",
+		DedupKey:     "repo:pr:21",
+		Changeset: &domain.ChangesetSpec{
+			RepoOwner: "shohei-yamagiwa",
+			RepoName:  "mochi",
+			PRNumber:  21,
+			BaseSHA:   "1111111",
+			HeadSHA:   "2222222",
+		},
+	}
+
+	res, err := runner.Execute(ctx, task, wf)
+	if err == nil || !strings.Contains(err.Error(), "webhook 502 bad gateway") {
+		t.Fatalf("Runner.Execute err = %v, want webhook 502 bad gateway", err)
+	}
+	if res == nil {
+		t.Fatalf("expected non-nil RunResult on partial sink publish failure")
+	}
+
+	// goodSink published once and must NOT receive OnRunFailed.
+	if len(goodSink.published) != 1 {
+		t.Fatalf("len(goodSink.published) = %d, want 1", len(goodSink.published))
+	}
+	if len(goodSink.failedErrs) != 0 {
+		t.Fatalf("len(goodSink.failedErrs) = %d, want 0", len(goodSink.failedErrs))
+	}
+
+	// badSink failed Publish and received OnRunFailed once.
+	if len(badSink.published) != 0 {
+		t.Fatalf("len(badSink.published) = %d, want 0", len(badSink.published))
+	}
+	if len(badSink.failedErrs) != 1 {
+		t.Fatalf("len(badSink.failedErrs) = %d, want 1", len(badSink.failedErrs))
+	}
+
+	// Stored run remains completed because the artifact was produced and delivered to goodSink.
+	persistedRun, err := st.GetRun(ctx, task.RunID)
+	if err != nil {
+		t.Fatalf("st.GetRun: %v", err)
+	}
+	if persistedRun.Status != domain.RunStatusCompleted {
+		t.Fatalf("persistedRun.Status = %q, want %q", persistedRun.Status, domain.RunStatusCompleted)
 	}
 }
 
@@ -742,6 +895,15 @@ agents:
 	}
 	if _, ok := res.Specialists["security"]; !ok {
 		t.Errorf("expected security specialist to run")
+	}
+
+	// Verify the merged config was persisted to workflow_runs.resolved_config_yaml in SQLite.
+	persistedRun, err := st.GetRun(ctx, task.RunID)
+	if err != nil {
+		t.Fatalf("st.GetRun: %v", err)
+	}
+	if strings.Contains(persistedRun.ResolvedConfigYAML, "performance-architecture") {
+		t.Fatalf("expected persisted resolved_config_yaml to reflect merged override (without performance-architecture), got:\n%s", persistedRun.ResolvedConfigYAML)
 	}
 	_ = tools.AgentFinding{}
 }

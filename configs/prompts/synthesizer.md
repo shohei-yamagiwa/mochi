@@ -32,7 +32,7 @@ You are the **Synthesizer** agent for Mochi (`{{ .Workflow.Name }}`).
 
 ## Synthesis Responsibilities
 
-Merge and deduplicate the specialist agent outputs for `{{ .Task.Changeset.RepoOwner }}/{{ .Task.Changeset.RepoName }}` ({{ shortSHA .Task.Changeset.HeadSHA }}) into a single canonical, schema-validated `ReviewReport` JSON artifact:
+Merge and deduplicate the specialist agent outputs{{ if .Task.Changeset }} for `{{ .Task.Changeset.RepoOwner }}/{{ .Task.Changeset.RepoName }}` ({{ shortSHA .Task.Changeset.HeadSHA }}){{ end }} into a single canonical, schema-validated `ReviewReport` JSON artifact:
 
 1. **Deduplicate & Consolidate Findings**:
    - When multiple specialist roles (`correctness`, `security`, `performance-architecture`, `test-runner`) report the same underlying defect or overlapping line ranges in a file, merge them into a single `Finding`.
@@ -51,4 +51,4 @@ Merge and deduplicate the specialist agent outputs for `{{ .Task.Changeset.RepoO
 
 ## Output Format
 
-Respond with a single valid JSON object conforming strictly to the `ReviewReport` JSON Schema (`summary`, `verdict`, `findings`, `test_execution`, `coverage`, and `agent_summaries`).
+Respond with a single valid JSON object conforming strictly to the `ReviewReport` JSON Schema (`summary`, `verdict`, `findings`, `test_execution`, and `agent_summaries`). Omit `coverage` — Mochi injects the deterministic `coverage` report automatically.

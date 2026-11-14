@@ -388,3 +388,241 @@ func TestScheduler_CancelByDedupKeyAndShutdown(t *testing.T) {
 		t.Fatalf("Enqueue after Shutdown err = %v, want ErrSchedulerClosed", err)
 	}
 }
+
+func TestScheduler_EnqueueBlockedOnFullQueueRacesWithShutdownSafely(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer st.Close()
+
+	jobAStarted := make(chan struct{})
+	releaseJobA := make(chan struct{})
+	var startOnce sync.Once
+
+	provider := &concurrentFakeProvider{
+		name: "mock",
+		fn: func(callCtx context.Context, _ int, req llm.ChatRequest) (*llm.ChatResponse, error) {
+			if req.ResponseSchema != nil {
+				return &llm.ChatResponse{
+					Message: llm.Message{
+						Role:    llm.RoleAssistant,
+						Content: `{"summary":"OK","verdict":"APPROVE","findings":[]}`,
+					},
+				}, nil
+			}
+			startOnce.Do(func() { close(jobAStarted) })
+			select {
+			case <-releaseJobA:
+			case <-callCtx.Done():
+				return nil, callCtx.Err()
+			}
+			tc := llm.ToolCall{
+				ID:        "tc_submit",
+				Name:      "submit_output",
+				Arguments: json.RawMessage(`{"summary":"OK","findings":[]}`),
+			}
+			return &llm.ChatResponse{
+				Message:   llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{tc}},
+				ToolCalls: []llm.ToolCall{tc},
+			}, nil
+		},
+	}
+
+	sched := NewScheduler(&Runner{Store: st, DefaultLLMProvider: provider}, SchedulerConfig{MaxWorkers: 1, QueueSize: 1})
+	wf := minimalSchedulerWorkflow()
+
+	// Job A occupies the single worker.
+	if _, err := sched.Enqueue(ctx, &domain.TaskContext{RunID: "job-a", DedupKey: "repo:pr:1"}, wf); err != nil {
+		t.Fatalf("Enqueue(job-a): %v", err)
+	}
+	<-jobAStarted
+
+	// Job B fills the buffer of size 1.
+	if _, err := sched.Enqueue(ctx, &domain.TaskContext{RunID: "job-b", DedupKey: "repo:pr:2"}, wf); err != nil {
+		t.Fatalf("Enqueue(job-b): %v", err)
+	}
+
+	// Job C blocks in Enqueue because the queue is full.
+	jobCErrCh := make(chan error, 1)
+	go func() {
+		_, err := sched.Enqueue(ctx, &domain.TaskContext{RunID: "job-c", DedupKey: "repo:pr:3"}, wf)
+		jobCErrCh <- err
+	}()
+
+	time.Sleep(15 * time.Millisecond)
+
+	// Calling Shutdown while Job C is blocked in Enqueue must wake Job C with ErrSchedulerClosed without panicking.
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- sched.Shutdown(ctx)
+	}()
+
+	select {
+	case cErr := <-jobCErrCh:
+		if !errors.Is(cErr, ErrSchedulerClosed) {
+			t.Fatalf("Job C Enqueue err = %v, want ErrSchedulerClosed", cErr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for blocked Enqueue(job-c) to return on Shutdown")
+	}
+
+	close(releaseJobA)
+	if err := <-shutdownDone; err != nil {
+		t.Fatalf("Shutdown err = %v", err)
+	}
+}
+
+func TestScheduler_FullQueueCancelledEnqueueDoesNotSupersedeActiveRun(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer st.Close()
+
+	jobAStarted := make(chan struct{})
+	releaseJobA := make(chan struct{})
+	var startOnce sync.Once
+
+	provider := &concurrentFakeProvider{
+		name: "mock",
+		fn: func(callCtx context.Context, _ int, req llm.ChatRequest) (*llm.ChatResponse, error) {
+			if req.ResponseSchema != nil {
+				return &llm.ChatResponse{
+					Message: llm.Message{
+						Role:    llm.RoleAssistant,
+						Content: `{"summary":"OK","verdict":"APPROVE","findings":[]}`,
+					},
+				}, nil
+			}
+			startOnce.Do(func() { close(jobAStarted) })
+			select {
+			case <-releaseJobA:
+			case <-callCtx.Done():
+				return nil, callCtx.Err()
+			}
+			tc := llm.ToolCall{
+				ID:        "tc_submit",
+				Name:      "submit_output",
+				Arguments: json.RawMessage(`{"summary":"OK","findings":[]}`),
+			}
+			return &llm.ChatResponse{
+				Message:   llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{tc}},
+				ToolCalls: []llm.ToolCall{tc},
+			}, nil
+		},
+	}
+
+	sched := NewScheduler(&Runner{Store: st, DefaultLLMProvider: provider}, SchedulerConfig{MaxWorkers: 1, QueueSize: 1})
+	defer func() { _ = sched.Shutdown(ctx) }()
+	wf := minimalSchedulerWorkflow()
+
+	// Job A runs for repo:pr:10.
+	if _, err := sched.Enqueue(ctx, &domain.TaskContext{RunID: "job-pr10-active", DedupKey: "repo:pr:10"}, wf); err != nil {
+		t.Fatalf("Enqueue(job-pr10-active): %v", err)
+	}
+	<-jobAStarted
+
+	// Job B fills the queue for repo:pr:20.
+	if _, err := sched.Enqueue(ctx, &domain.TaskContext{RunID: "job-pr20-queued", DedupKey: "repo:pr:20"}, wf); err != nil {
+		t.Fatalf("Enqueue(job-pr20-queued): %v", err)
+	}
+
+	// Attempt to enqueue a new run for repo:pr:10 with a short timeout that expires because the queue is full.
+	shortCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	_, err = sched.Enqueue(shortCtx, &domain.TaskContext{RunID: "job-pr10-aborted", DedupKey: "repo:pr:10"}, wf)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Enqueue(job-pr10-aborted) err = %v, want DeadlineExceeded", err)
+	}
+
+	// The active run for repo:pr:10 must NOT have been superseded!
+	close(releaseJobA)
+	resA, err := sched.WaitForRun(ctx, "job-pr10-active")
+	if err != nil {
+		t.Fatalf("WaitForRun(job-pr10-active) err = %v, want nil (not superseded)", err)
+	}
+	if resA.Run.Status != domain.RunStatusCompleted {
+		t.Fatalf("job-pr10-active status = %q, want completed", resA.Run.Status)
+	}
+
+	// And the aborted run's SQLite record must be marked cancelled (not stuck in pending).
+	abortedRec, err := st.GetRun(ctx, "job-pr10-aborted")
+	if err != nil {
+		t.Fatalf("st.GetRun(job-pr10-aborted): %v", err)
+	}
+	if abortedRec.Status != domain.RunStatusCancelled {
+		t.Fatalf("abortedRec.Status = %q, want %q", abortedRec.Status, domain.RunStatusCancelled)
+	}
+}
+
+func TestScheduler_BoundedCompletedJobsEvictionAndStoreFallback(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer st.Close()
+
+	provider := &concurrentFakeProvider{
+		name: "mock",
+		fn: func(_ context.Context, _ int, req llm.ChatRequest) (*llm.ChatResponse, error) {
+			if req.ResponseSchema != nil {
+				return &llm.ChatResponse{
+					Message: llm.Message{
+						Role:    llm.RoleAssistant,
+						Content: `{"summary":"OK","verdict":"APPROVE","findings":[]}`,
+					},
+				}, nil
+			}
+			tc := llm.ToolCall{
+				ID:        "tc_submit",
+				Name:      "submit_output",
+				Arguments: json.RawMessage(`{"summary":"OK","findings":[]}`),
+			}
+			return &llm.ChatResponse{
+				Message:   llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{tc}},
+				ToolCalls: []llm.ToolCall{tc},
+			}, nil
+		},
+	}
+
+	sched := NewScheduler(&Runner{Store: st, DefaultLLMProvider: provider}, SchedulerConfig{
+		MaxWorkers:       1,
+		QueueSize:        8,
+		MaxCompletedJobs: 2,
+	})
+	defer func() { _ = sched.Shutdown(ctx) }()
+	wf := minimalSchedulerWorkflow()
+
+	for _, id := range []string{"run-1", "run-2", "run-3"} {
+		if _, err := sched.Enqueue(ctx, &domain.TaskContext{RunID: id, DedupKey: "repo:pr:" + id}, wf); err != nil {
+			t.Fatalf("Enqueue(%s): %v", id, err)
+		}
+		if _, err := sched.WaitForRun(ctx, id); err != nil {
+			t.Fatalf("WaitForRun(%s): %v", id, err)
+		}
+	}
+
+	// run-1 should have been evicted from in-memory jobsByRunID, yet WaitForRun("run-1") still succeeds via Store fallback.
+	sched.mu.Lock()
+	_, inMem := sched.jobsByRunID["run-1"]
+	jobsLen := len(sched.jobsByRunID)
+	sched.mu.Unlock()
+	if inMem {
+		t.Fatalf("expected run-1 to be evicted from in-memory jobsByRunID")
+	}
+	if jobsLen > 2 {
+		t.Fatalf("len(jobsByRunID) = %d, want <= 2", jobsLen)
+	}
+
+	fallbackRes, err := sched.WaitForRun(ctx, "run-1")
+	if err != nil {
+		t.Fatalf("WaitForRun(run-1) store fallback err = %v", err)
+	}
+	if fallbackRes.Run.Status != domain.RunStatusCompleted {
+		t.Fatalf("fallbackRes.Run.Status = %q, want completed", fallbackRes.Run.Status)
+	}
+}

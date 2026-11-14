@@ -145,7 +145,7 @@ func ComputeCoverageReport(
 			}
 
 			if len(matched) == 0 {
-				if rec.Kind == domain.FileAccessRead || rec.Kind == domain.FileAccessSearch {
+				if rec.Kind == domain.FileAccessRead {
 					if _, seen := contextFilesSet[cleanRecPath]; !seen {
 						contextFilesSet[cleanRecPath] = struct{}{}
 						contextFiles = append(contextFiles, cleanRecPath)
@@ -172,10 +172,10 @@ func ComputeCoverageReport(
 						markAllHunksCovered(ft)
 					}
 				case domain.FileAccessSearch:
-					addAgent(ft, rec.AgentRole)
+					// Record search hits in ReadRangesByAgent for visibility, but do not mark
+					// entire hunks covered or the file inspected from a single-line grep match.
 					if rec.LineRange != nil {
 						addReadRange(ft, rec.AgentRole, *rec.LineRange)
-						markOverlappingHunksCovered(ft, *rec.LineRange)
 					}
 				case domain.FileAccessCite:
 					addAgent(ft, rec.AgentRole)

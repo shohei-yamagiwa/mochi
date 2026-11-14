@@ -227,19 +227,25 @@ func normalizeRepoPath(raw string, allowDot bool) (string, error) {
 
 // truncateHeadTail caps s to maxBytes using balanced head+tail slices aligned to UTF-8 rune boundaries.
 func truncateHeadTail(s string, maxBytes int) string {
+	out, _, _, _ := truncateHeadTailWithParts(s, maxBytes)
+	return out
+}
+
+func truncateHeadTailWithParts(s string, maxBytes int) (out, head, tail string, truncated bool) {
 	if maxBytes <= 0 || len(s) <= maxBytes {
-		return s
+		return s, s, "", false
 	}
 	marker := fmt.Sprintf("\n... [truncated %d bytes] ...\n", len(s)-maxBytes)
 	if maxBytes <= len(marker)+16 {
-		return s[:trimUTF8End(s, maxBytes)]
+		h := s[:trimUTF8End(s, maxBytes)]
+		return h, h, "", true
 	}
 	budget := maxBytes - len(marker)
 	headLen := budget / 2
 	tailLen := budget - headLen
 	headEnd := trimUTF8End(s, headLen)
 	tailStart := trimUTF8Start(s, len(s)-tailLen)
-	return s[:headEnd] + marker + s[tailStart:]
+	return s[:headEnd] + marker + s[tailStart:], s[:headEnd], s[tailStart:], true
 }
 
 func trimUTF8End(s string, maxBytes int) int {

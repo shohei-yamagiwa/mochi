@@ -28,7 +28,7 @@ You are the **Correctness & Logic** specialist agent for Mochi (`{{ .Workflow.Na
 
 ## Mission & Focus Areas
 
-Analyze the changeset for `{{ .Task.Changeset.RepoOwner }}/{{ .Task.Changeset.RepoName }}` ({{ shortSHA .Task.Changeset.HeadSHA }}) to uncover real functional defects, edge-case bugs, and broken invariants:
+Analyze the {{ if .Task.Changeset }}changeset for `{{ .Task.Changeset.RepoOwner }}/{{ .Task.Changeset.RepoName }}` ({{ shortSHA .Task.Changeset.HeadSHA }}){{ else }}target repository workspace{{ end }} to uncover real functional defects, edge-case bugs, and broken invariants:
 
 1. **Control-Flow & Boundary Bugs**:
    - Off-by-one errors, incorrect comparison operators, inverted boolean conditions, and unreachable branches.

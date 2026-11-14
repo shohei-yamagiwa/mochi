@@ -41,6 +41,7 @@ type Store interface {
 
 	CreateRun(ctx context.Context, run *domain.RunRecord) error
 	UpdateRunStatus(ctx context.Context, runID string, status domain.RunStatus, errMsg string, completedAt *time.Time) error
+	UpdateRunResolvedConfig(ctx context.Context, runID string, resolvedConfigYAML string) error
 	CompleteRun(ctx context.Context, runID string, status domain.RunStatus, finalArtifact json.RawMessage, completedAt time.Time) error
 	GetRun(ctx context.Context, runID string) (*domain.RunRecord, error)
 	ListRuns(ctx context.Context, filter RunFilter) ([]*domain.RunRecord, error)

@@ -159,6 +159,18 @@ func (s *SQLiteStore) UpdateRunStatus(ctx context.Context, runID string, status 
 	return requireOneRowAffected(res)
 }
 
+func (s *SQLiteStore) UpdateRunResolvedConfig(ctx context.Context, runID string, resolvedConfigYAML string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE workflow_runs
+		SET resolved_config_yaml = ?
+		WHERE run_id = ?
+	`, resolvedConfigYAML, runID)
+	if err != nil {
+		return fmt.Errorf("update workflow_run %q resolved_config_yaml: %w", runID, err)
+	}
+	return requireOneRowAffected(res)
+}
+
 func (s *SQLiteStore) CompleteRun(ctx context.Context, runID string, status domain.RunStatus, finalArtifact json.RawMessage, completedAt time.Time) error {
 	if completedAt.IsZero() {
 		completedAt = time.Now().UTC()

@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -10,12 +11,14 @@ import (
 
 	"github.com/shohei-yamagiwa/mochi/internal/config"
 	"github.com/shohei-yamagiwa/mochi/internal/domain"
+	"github.com/shohei-yamagiwa/mochi/internal/output"
 	"github.com/shohei-yamagiwa/mochi/internal/store"
 )
 
 const (
-	defaultMaxWorkers = 4
-	defaultQueueSize  = 128
+	defaultMaxWorkers       = 4
+	defaultQueueSize        = 128
+	defaultMaxCompletedJobs = 256
 )
 
 var (
@@ -25,10 +28,11 @@ var (
 	ErrRunSuperseded = errors.New("workflow run superseded by newer run for dedup key")
 )
 
-// SchedulerConfig configures the async worker pool and queue capacity.
+// SchedulerConfig configures the async worker pool, queue capacity, and in-memory completed job retention.
 type SchedulerConfig struct {
-	MaxWorkers int
-	QueueSize  int
+	MaxWorkers       int
+	QueueSize        int
+	MaxCompletedJobs int
 }
 
 type scheduledJob struct {
@@ -38,6 +42,7 @@ type scheduledJob struct {
 	wf       *domain.Workflow
 	ctx      context.Context
 	cancel   context.CancelCauseFunc
+	ready    chan struct{}
 	done     chan struct{}
 	result   *RunResult
 	err      error
@@ -50,14 +55,17 @@ type Scheduler struct {
 	cfg        SchedulerConfig
 	baseCtx    context.Context
 	baseCancel context.CancelCauseFunc
+	closing    chan struct{}
 	queue      chan *scheduledJob
+	senders    sync.WaitGroup
 	wg         sync.WaitGroup
 
-	mu            sync.Mutex
-	closed        bool
-	activeByRunID map[string]*scheduledJob
-	activeByDedup map[string]*scheduledJob
-	jobsByRunID   map[string]*scheduledJob
+	mu              sync.Mutex
+	closed          bool
+	activeByRunID   map[string]*scheduledJob
+	activeByDedup   map[string]*scheduledJob
+	jobsByRunID     map[string]*scheduledJob
+	completedRunIDs []string
 }
 
 // NewScheduler constructs and starts a Scheduler backed by runner.
@@ -68,6 +76,9 @@ func NewScheduler(runner *Runner, cfg SchedulerConfig) *Scheduler {
 	if cfg.QueueSize <= 0 {
 		cfg.QueueSize = defaultQueueSize
 	}
+	if cfg.MaxCompletedJobs <= 0 {
+		cfg.MaxCompletedJobs = defaultMaxCompletedJobs
+	}
 
 	baseCtx, baseCancel := context.WithCancelCause(context.Background())
 	s := &Scheduler{
@@ -75,6 +86,7 @@ func NewScheduler(runner *Runner, cfg SchedulerConfig) *Scheduler {
 		cfg:           cfg,
 		baseCtx:       baseCtx,
 		baseCancel:    baseCancel,
+		closing:       make(chan struct{}),
 		queue:         make(chan *scheduledJob, cfg.QueueSize),
 		activeByRunID: make(map[string]*scheduledJob),
 		activeByDedup: make(map[string]*scheduledJob),
@@ -88,8 +100,8 @@ func NewScheduler(runner *Runner, cfg SchedulerConfig) *Scheduler {
 	return s
 }
 
-// Enqueue persists the initial pending RunRecord and ChangesetSnapshot, cancels any superseded active run
-// sharing task.DedupKey, and schedules the workflow run on the async worker pool.
+// Enqueue persists the initial pending RunRecord and ChangesetSnapshot, schedules the workflow run
+// on the async worker pool, and cancels any superseded active run sharing task.DedupKey once queued.
 func (s *Scheduler) Enqueue(ctx context.Context, task *domain.TaskContext, wf *domain.Workflow) (string, error) {
 	if s == nil || s.runner == nil {
 		return "", fmt.Errorf("scheduler: runner must not be nil")
@@ -113,6 +125,16 @@ func (s *Scheduler) Enqueue(ctx context.Context, task *domain.TaskContext, wf *d
 		return "", fmt.Errorf("scheduler marshal workflow yaml: %w", err)
 	}
 
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return "", ErrSchedulerClosed
+	}
+	s.senders.Add(1)
+	s.mu.Unlock()
+	defer s.senders.Done()
+
+	createdPendingRun := false
 	if s.runner.Store != nil {
 		if _, err := s.runner.Store.GetRun(ctx, task.RunID); errors.Is(err, store.ErrNotFound) {
 			runRec := &domain.RunRecord{
@@ -127,6 +149,7 @@ func (s *Scheduler) Enqueue(ctx context.Context, task *domain.TaskContext, wf *d
 			if err := s.runner.Store.CreateRun(ctx, runRec); err != nil {
 				return "", fmt.Errorf("scheduler create pending run %q: %w", task.RunID, err)
 			}
+			createdPendingRun = true
 		} else if err != nil {
 			return "", fmt.Errorf("scheduler check existing run %q: %w", task.RunID, err)
 		}
@@ -138,12 +161,6 @@ func (s *Scheduler) Enqueue(ctx context.Context, task *domain.TaskContext, wf *d
 		}
 	}
 
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return "", ErrSchedulerClosed
-	}
-
 	jobCtx, jobCancel := context.WithCancelCause(s.baseCtx)
 	dedupKey := strings.TrimSpace(task.DedupKey)
 	job := &scheduledJob{
@@ -153,44 +170,94 @@ func (s *Scheduler) Enqueue(ctx context.Context, task *domain.TaskContext, wf *d
 		wf:       wf,
 		ctx:      jobCtx,
 		cancel:   jobCancel,
+		ready:    make(chan struct{}),
 		done:     make(chan struct{}),
 	}
 
-	if dedupKey != "" {
-		if prev, exists := s.activeByDedup[dedupKey]; exists && prev.runID != job.runID {
-			prev.cancel(fmt.Errorf("%w: superseded by %s", ErrRunSuperseded, job.runID))
+	abortEnqueue := func(abortErr error) {
+		jobCancel(abortErr)
+		close(job.ready)
+		close(job.done)
+		if createdPendingRun && s.runner.Store != nil {
+			now := time.Now().UTC()
+			persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			_ = s.runner.Store.UpdateRunStatus(persistCtx, task.RunID, domain.RunStatusCancelled, abortErr.Error(), &now)
 		}
-		s.activeByDedup[dedupKey] = job
 	}
-	s.activeByRunID[job.runID] = job
-	s.jobsByRunID[job.runID] = job
-	s.mu.Unlock()
 
 	select {
 	case s.queue <- job:
+		s.mu.Lock()
+		if dedupKey != "" {
+			if prev, exists := s.activeByDedup[dedupKey]; exists && prev.runID != job.runID {
+				prev.cancel(fmt.Errorf("%w: superseded by %s", ErrRunSuperseded, job.runID))
+			}
+			s.activeByDedup[dedupKey] = job
+		}
+		s.activeByRunID[job.runID] = job
+		s.jobsByRunID[job.runID] = job
+		s.mu.Unlock()
+		close(job.ready)
 		return job.runID, nil
+	case <-s.closing:
+		abortEnqueue(ErrSchedulerClosed)
+		return "", ErrSchedulerClosed
 	case <-ctx.Done():
-		jobCancel(ctx.Err())
-		s.cleanupActiveJob(job)
+		abortEnqueue(ctx.Err())
 		return "", ctx.Err()
 	}
 }
 
 // WaitForRun blocks until the specified runID finishes (or ctx expires) and returns its RunResult and error.
+// If the completed job has already been evicted from in-memory retention, WaitForRun falls back to Store.GetRun.
 func (s *Scheduler) WaitForRun(ctx context.Context, runID string) (*RunResult, error) {
 	s.mu.Lock()
 	job, ok := s.jobsByRunID[runID]
 	s.mu.Unlock()
-	if !ok {
-		return nil, fmt.Errorf("run %q not found in scheduler", runID)
+	if ok {
+		select {
+		case <-job.done:
+			return job.result, job.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 
-	select {
-	case <-job.done:
-		return job.result, job.err
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	if s.runner != nil && s.runner.Store != nil {
+		runRec, err := s.runner.Store.GetRun(ctx, runID)
+		if err == nil && runRec != nil {
+			switch runRec.Status {
+			case domain.RunStatusCompleted:
+				res := &RunResult{
+					Run:          runRec,
+					ArtifactJSON: runRec.FinalArtifactJSON,
+				}
+				if len(runRec.FinalArtifactJSON) > 0 {
+					var rep output.ReviewReport
+					if json.Unmarshal(runRec.FinalArtifactJSON, &rep) == nil {
+						res.Report = &rep
+					}
+				}
+				return res, nil
+			case domain.RunStatusCancelled:
+				if strings.Contains(runRec.ErrorMessage, ErrRunSuperseded.Error()) {
+					return nil, fmt.Errorf("%w: %s", ErrRunSuperseded, runRec.ErrorMessage)
+				}
+				if runRec.ErrorMessage != "" {
+					return nil, fmt.Errorf("%w: %s", context.Canceled, runRec.ErrorMessage)
+				}
+				return nil, context.Canceled
+			case domain.RunStatusFailed:
+				if runRec.ErrorMessage != "" {
+					return nil, errors.New(runRec.ErrorMessage)
+				}
+				return nil, fmt.Errorf("run %q failed", runID)
+			}
+		}
 	}
+
+	return nil, fmt.Errorf("run %q not found in scheduler", runID)
 }
 
 // CancelRun cancels an active or queued run by its RunID.
@@ -244,15 +311,22 @@ func (s *Scheduler) ActiveRunID(dedupKey string) (string, bool) {
 	return job.runID, true
 }
 
-// Shutdown stops accepting new runs, drains the queue, and waits for workers to finish.
+// Shutdown stops accepting new runs, waits for any in-flight Enqueue calls to finish,
+// closes and drains the queue, and waits for workers to finish.
 // If ctx expires before workers complete, all remaining in-flight runs are cancelled.
 func (s *Scheduler) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
+	wasClosed := s.closed
 	if !s.closed {
 		s.closed = true
-		close(s.queue)
+		close(s.closing)
 	}
 	s.mu.Unlock()
+
+	if !wasClosed {
+		s.senders.Wait()
+		close(s.queue)
+	}
 
 	done := make(chan struct{})
 	go func() {
@@ -279,13 +353,26 @@ func (s *Scheduler) workerLoop() {
 }
 
 func (s *Scheduler) executeJob(job *scheduledJob) {
+	<-job.ready
+
+	task := job.task
+	wf := job.wf
+
 	defer func() {
 		job.cancel(nil)
 		s.cleanupActiveJob(job)
 		close(job.done)
 	}()
 
-	res, err := s.runner.Execute(job.ctx, job.task, job.wf)
+	res, err := s.runner.Execute(job.ctx, task, wf)
+	if res != nil {
+		// Strip heavy per-tool output payloads from in-memory retention once persisted to Store.
+		for _, sr := range res.Specialists {
+			if sr != nil {
+				sr.ToolExecutions = nil
+			}
+		}
+	}
 	job.result = res
 	job.err = err
 }
@@ -293,12 +380,26 @@ func (s *Scheduler) executeJob(job *scheduledJob) {
 func (s *Scheduler) cleanupActiveJob(job *scheduledJob) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Release heavy input references (UnifiedDiff, prompts, workflow AST) once execution completes.
+	job.task = nil
+	job.wf = nil
+
 	if cur, ok := s.activeByRunID[job.runID]; ok && cur == job {
 		delete(s.activeByRunID, job.runID)
 	}
 	if job.dedupKey != "" {
 		if cur, ok := s.activeByDedup[job.dedupKey]; ok && cur == job {
 			delete(s.activeByDedup, job.dedupKey)
+		}
+	}
+
+	s.completedRunIDs = append(s.completedRunIDs, job.runID)
+	for len(s.completedRunIDs) > s.cfg.MaxCompletedJobs {
+		evictID := s.completedRunIDs[0]
+		s.completedRunIDs = s.completedRunIDs[1:]
+		if _, stillActive := s.activeByRunID[evictID]; !stillActive {
+			delete(s.jobsByRunID, evictID)
 		}
 	}
 }

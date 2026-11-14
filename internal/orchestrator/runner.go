@@ -31,6 +31,7 @@ type SpecialistResult struct {
 	Findings       *tools.AgentFindings     `json:"findings,omitempty"`
 	RawOutput      json.RawMessage          `json:"raw_output,omitempty"`
 	ToolExecutions []*domain.ToolExecRecord `json:"tool_executions,omitempty"`
+	Error          error                    `json:"-"`
 }
 
 // RunResult bundles all artifacts and audit records produced by a workflow execution.
@@ -57,17 +58,18 @@ type RepoOverrideLoader func(ctx context.Context, task *domain.TaskContext, base
 // Runner orchestrates base sandbox preparation, parallel specialist agent fan-out (Fork + errgroup),
 // deterministic diff coverage verification, Synthesizer execution, and OutputSink delivery.
 type Runner struct {
-	Store              store.Store
-	SandboxProvider    sandbox.Provider
-	LLMRegistry        *llm.Registry
-	DefaultLLMProvider llm.Provider
-	ToolRegistry       *tools.Registry
-	PromptEngine       *config.PromptEngine
-	SinkRegistry       *output.Registry
-	Sinks              []output.OutputSink
-	StrictSinks        bool
-	RepoOverrideLoader RepoOverrideLoader
-	Logger             *slog.Logger
+	Store               store.Store
+	SandboxProvider     sandbox.Provider
+	LLMRegistry         *llm.Registry
+	DefaultLLMProvider  llm.Provider
+	ToolRegistry        *tools.Registry
+	PromptEngine        *config.PromptEngine
+	SinkRegistry        *output.Registry
+	Sinks               []output.OutputSink
+	StrictSinks         bool
+	FailFastSpecialists bool
+	RepoOverrideLoader  RepoOverrideLoader
+	Logger              *slog.Logger
 }
 
 // Execute runs the full end-to-end lifecycle for a single workflow TaskContext.
@@ -185,8 +187,17 @@ func (r *Runner) Execute(ctx context.Context, task *domain.TaskContext, wf *doma
 				return nil, fmt.Errorf("merge repo overrides: %w", err)
 			}
 			activeWf = mergedWf
-			if updatedYAML, err := config.MarshalWorkflowYAML(activeWf); err == nil {
-				runRec.ResolvedConfigYAML = updatedYAML
+			updatedYAML, err := config.MarshalWorkflowYAML(activeWf)
+			if err != nil {
+				r.markRunFailedOrCancelled(ctx, task, runRec, startedSinks, err)
+				return nil, fmt.Errorf("marshal merged workflow yaml: %w", err)
+			}
+			runRec.ResolvedConfigYAML = updatedYAML
+			if r.Store != nil {
+				if err := r.Store.UpdateRunResolvedConfig(ctx, task.RunID, updatedYAML); err != nil {
+					r.markRunFailedOrCancelled(ctx, task, runRec, startedSinks, err)
+					return nil, fmt.Errorf("update resolved config yaml: %w", err)
+				}
 			}
 			if bundle.PromptDir != "" && promptEngine != nil {
 				promptEngine = promptEngine.WithRepoDir(bundle.PromptDir)
@@ -223,10 +234,24 @@ func (r *Runner) Execute(ctx context.Context, task *domain.TaskContext, wf *doma
 	destroyBase()
 
 	specialistsByRole := make(map[string]*SpecialistResult, len(specialistSlice))
+	succeededSpecialists := 0
+	var specialistErrs []error
 	for _, sr := range specialistSlice {
-		if sr != nil {
-			specialistsByRole[sr.Role] = sr
+		if sr == nil {
+			continue
 		}
+		specialistsByRole[sr.Role] = sr
+		if sr.Error != nil {
+			specialistErrs = append(specialistErrs, sr.Error)
+		} else {
+			succeededSpecialists++
+		}
+	}
+
+	if len(activeWf.Agents) > 0 && succeededSpecialists == 0 {
+		runErr := contextCauseOrErr(ctx, errors.Join(specialistErrs...))
+		r.markRunFailedOrCancelled(ctx, task, runRec, startedSinks, runErr)
+		return nil, runErr
 	}
 
 	toolExecs, err := r.collectToolExecutions(ctx, task.RunID, specialistSlice)
@@ -266,15 +291,7 @@ func (r *Runner) Execute(ctx context.Context, task *domain.TaskContext, wf *doma
 		}
 	}
 
-	for _, s := range startedSinks {
-		if err := s.Publish(ctx, task, artifactJSON); err != nil {
-			pubErr := fmt.Errorf("output sink %q publish: %w", s.Name(), err)
-			r.markRunFailedOrCancelled(ctx, task, runRec, startedSinks, pubErr)
-			return nil, pubErr
-		}
-	}
-
-	return &RunResult{
+	runRes := &RunResult{
 		Run:            runRec,
 		Workflow:       activeWf,
 		Specialists:    specialistsByRole,
@@ -282,7 +299,32 @@ func (r *Runner) Execute(ctx context.Context, task *domain.TaskContext, wf *doma
 		SynthesizerRun: synthRun,
 		Report:         report,
 		ArtifactJSON:   artifactJSON,
-	}, nil
+	}
+
+	var publishErrs []error
+	var failedSinks []output.OutputSink
+	for _, s := range startedSinks {
+		if err := s.Publish(ctx, task, artifactJSON); err != nil {
+			publishErrs = append(publishErrs, fmt.Errorf("output sink %q publish: %w", s.Name(), err))
+			failedSinks = append(failedSinks, s)
+		}
+	}
+	if len(publishErrs) > 0 {
+		joinedPubErr := errors.Join(publishErrs...)
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		for _, s := range failedSinks {
+			_ = s.OnRunFailed(persistCtx, task, joinedPubErr)
+		}
+		// Only transition the persisted run status to failed if every started sink failed to publish;
+		// if at least one sink published the artifact, preserve the completed status.
+		if len(failedSinks) == len(startedSinks) {
+			r.markRunFailedOrCancelled(ctx, task, runRec, nil, joinedPubErr)
+		}
+		return runRes, joinedPubErr
+	}
+
+	return runRes, nil
 }
 
 func (r *Runner) runSpecialistAgent(
@@ -355,13 +397,38 @@ func (r *Runner) runSpecialistAgent(
 		ToolSet:      toolSet,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("specialist agent %q: %w", role.Role, err)
+		roleErr := fmt.Errorf("specialist agent %q: %w", role.Role, err)
+		if r.FailFastSpecialists || ctx.Err() != nil {
+			return nil, roleErr
+		}
+		var ar *domain.AgentRunRecord
+		var execs []*domain.ToolExecRecord
+		if loopRes != nil {
+			ar = loopRes.AgentRun
+			execs = loopRes.ToolExecutions
+		}
+		return &SpecialistResult{
+			Role:           role.Role,
+			AgentRun:       ar,
+			ToolExecutions: execs,
+			Error:          roleErr,
+		}, nil
 	}
 
 	var findings tools.AgentFindings
 	if len(loopRes.SubmittedOutput) > 0 {
 		if err := json.Unmarshal(loopRes.SubmittedOutput, &findings); err != nil {
-			return nil, fmt.Errorf("decode findings for role %q: %w", role.Role, err)
+			roleErr := fmt.Errorf("decode findings for role %q: %w", role.Role, err)
+			if r.FailFastSpecialists || ctx.Err() != nil {
+				return nil, roleErr
+			}
+			return &SpecialistResult{
+				Role:           role.Role,
+				AgentRun:       loopRes.AgentRun,
+				RawOutput:      loopRes.SubmittedOutput,
+				ToolExecutions: loopRes.ToolExecutions,
+				Error:          roleErr,
+			}, nil
 		}
 	}
 	if findings.Findings == nil {
@@ -389,13 +456,24 @@ func (r *Runner) runSynthesizer(
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("init review report validator: %w", err)
 	}
+	synthSchema, err := output.NewSynthesizerResponseSchema()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("init synthesizer response schema: %w", err)
+	}
 
 	agentSummaries := make(map[string]string, len(specialists))
 	specialistFindings := make(map[string]*tools.AgentFindings, len(specialists))
 	var testExec *output.TestSummary
 
 	for _, sr := range specialists {
-		if sr == nil || sr.Findings == nil {
+		if sr == nil {
+			continue
+		}
+		if sr.Error != nil {
+			agentSummaries[sr.Role] = fmt.Sprintf("Specialist agent %q failed: %v", sr.Role, sr.Error)
+			continue
+		}
+		if sr.Findings == nil {
 			continue
 		}
 		agentSummaries[sr.Role] = sr.Findings.Summary
@@ -517,7 +595,7 @@ func (r *Runner) runSynthesizer(
 			Config:         wf.Synthesizer.LLM,
 			SystemPrompt:   sysPrompt,
 			Messages:       messages,
-			ResponseSchema: validator.Schema(),
+			ResponseSchema: synthSchema,
 		}
 
 		turnStart := time.Now()
@@ -795,7 +873,13 @@ func BuildSynthesizerUserPrompt(
 			continue
 		}
 		fmt.Fprintf(&b, "\n#### Role: `%s`\n```json\n", sr.Role)
-		if sr.Findings != nil {
+		if sr.Error != nil {
+			errPayload, _ := json.MarshalIndent(map[string]string{
+				"status": "failed",
+				"error":  sr.Error.Error(),
+			}, "", "  ")
+			b.Write(errPayload)
+		} else if sr.Findings != nil {
 			raw, _ := json.MarshalIndent(sr.Findings, "", "  ")
 			b.Write(raw)
 		} else if len(sr.RawOutput) > 0 {
@@ -806,7 +890,7 @@ func BuildSynthesizerUserPrompt(
 		b.WriteString("\n```\n")
 	}
 
-	b.WriteString("\nSynthesize the specialist outputs and coverage report into a single validated `ReviewReport` JSON object.\n")
+	b.WriteString("\nSynthesize the specialist outputs and coverage report into a single validated `ReviewReport` JSON object (omit `coverage`; Mochi injects the deterministic coverage object automatically).\n")
 	return b.String()
 }
 

@@ -74,17 +74,30 @@ func TestComputeCoverageReport_MultiAgentAndHunkCoverage(t *testing.T) {
 			},
 		},
 		{
-			ToolName: "search_code",
+			ToolName: "read_file",
 			ExitCode: 0,
 			AccessedFiles: []domain.FileAccessRecord{
 				{
 					Path:      "internal/api/routes.go", // accessed via PreviousPath
-					LineRange: &domain.LineRange{StartLine: 35, EndLine: 35},
+					LineRange: &domain.LineRange{StartLine: 30, EndLine: 45},
+					AgentRole: "security",
+					Kind:      domain.FileAccessRead,
+				},
+			},
+		},
+		{
+			ToolName: "search_code",
+			ExitCode: 0,
+			AccessedFiles: []domain.FileAccessRecord{
+				{
+					// Single-line grep hit inside docs/README.md must NOT mark the file inspected or its hunk covered.
+					Path:      "docs/README.md",
+					LineRange: &domain.LineRange{StartLine: 5, EndLine: 5},
 					AgentRole: "security",
 					Kind:      domain.FileAccessSearch,
 				},
 				{
-					Path:      "internal/config/config.go", // out-of-diff context file
+					Path:      "internal/config/config.go", // search hit on unchanged file (not read_file)
 					LineRange: &domain.LineRange{StartLine: 12, EndLine: 12},
 					AgentRole: "security",
 					Kind:      domain.FileAccessSearch,
@@ -177,7 +190,7 @@ func TestComputeCoverageReport_MultiAgentAndHunkCoverage(t *testing.T) {
 		t.Fatalf("UnreviewedFiles = %v, want [docs/README.md]", report.UnreviewedFiles)
 	}
 
-	wantContext := []string{"internal/config/config.go", "pkg/helper/util.go"}
+	wantContext := []string{"pkg/helper/util.go"}
 	if !slices.Equal(report.ContextFilesRead, wantContext) {
 		t.Fatalf("ContextFilesRead = %v, want %v", report.ContextFilesRead, wantContext)
 	}
@@ -208,6 +221,19 @@ func TestComputeCoverageReport_MultiAgentAndHunkCoverage(t *testing.T) {
 	}
 	if len(routerDetail.UncoveredHunks) != 0 {
 		t.Fatalf("routerDetail.UncoveredHunks = %+v, want empty", routerDetail.UncoveredHunks)
+	}
+
+	// Verify docs/README.md recorded the search_code line in ReadRangesByAgent for visibility,
+	// but remains uninspected and its hunk remains uncovered.
+	docsDetail := report.FileDetails[4]
+	if len(docsDetail.InspectedByAgents) != 0 {
+		t.Fatalf("docsDetail.InspectedByAgents = %v, want empty", docsDetail.InspectedByAgents)
+	}
+	if len(docsDetail.UncoveredHunks) != 1 {
+		t.Fatalf("docsDetail.UncoveredHunks = %+v, want 1 uncovered hunk", docsDetail.UncoveredHunks)
+	}
+	if !slices.Equal(docsDetail.ReadRangesByAgent["security"], []domain.LineRange{{StartLine: 5, EndLine: 5}}) {
+		t.Fatalf("docsDetail.ReadRangesByAgent[security] = %+v, want [{5 5}]", docsDetail.ReadRangesByAgent["security"])
 	}
 }
 

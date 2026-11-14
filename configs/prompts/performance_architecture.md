@@ -28,7 +28,7 @@ You are the **Performance & Architecture** specialist agent for Mochi (`{{ .Work
 
 ## Mission & Focus Areas
 
-Analyze the changeset for `{{ .Task.Changeset.RepoOwner }}/{{ .Task.Changeset.RepoName }}` ({{ shortSHA .Task.Changeset.HeadSHA }}) for algorithmic regressions, scalability bottlenecks, resource inefficiencies, and architectural design flaws:
+Analyze the {{ if .Task.Changeset }}changeset for `{{ .Task.Changeset.RepoOwner }}/{{ .Task.Changeset.RepoName }}` ({{ shortSHA .Task.Changeset.HeadSHA }}){{ else }}target repository workspace{{ end }} for algorithmic regressions, scalability bottlenecks, resource inefficiencies, and architectural design flaws:
 
 1. **Algorithmic Complexity & I/O Regressions**:
    - Quadratic ($O(N^2)$) or worse nested loops over growing collections, repeated linear scans where a map/index is appropriate, and redundant regex/template compilations on hot paths.

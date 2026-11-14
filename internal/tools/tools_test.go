@@ -346,6 +346,57 @@ func TestSubmitOutputTool_ValidationAndCiteRecords(t *testing.T) {
 	}
 }
 
+func TestReadFileAndGitDiff_TruncatedOutputOnlyRecordsSurvivingAccess(t *testing.T) {
+	ctx := context.Background()
+	sb := newMockSandbox()
+
+	// 1. Truncated read_file: 1000 lines (~50 KB), so middle lines are dropped by 32 KB truncation.
+	var lines strings.Builder
+	for i := 1; i <= 1000; i++ {
+		lines.WriteString(strings.Repeat("x", 50) + "\n")
+	}
+	sb.files["pkg/big.go"] = lines.String()
+
+	rfTool := NewReadFileTool()
+	rfRes, err := rfTool.Execute(ctx, ExecutionContext{AgentRole: "correctness", Sandbox: sb}, json.RawMessage(`{"path":"pkg/big.go"}`))
+	if err != nil || rfRes.ExitCode != 0 {
+		t.Fatalf("read_file err=%v res=%+v", err, rfRes)
+	}
+	if len(rfRes.AccessedFiles) != 2 {
+		t.Fatalf("len(rfRes.AccessedFiles) = %d, want 2 (head and tail ranges)", len(rfRes.AccessedFiles))
+	}
+	headRange := rfRes.AccessedFiles[0].LineRange
+	tailRange := rfRes.AccessedFiles[1].LineRange
+	if headRange == nil || tailRange == nil || headRange.EndLine >= tailRange.StartLine {
+		t.Fatalf("expected disjoint head (%+v) and tail (%+v) read ranges on truncated file", headRange, tailRange)
+	}
+
+	// 2. Truncated git_diff: middle file (pkg/middle.go) is completely in the dropped middle section.
+	var diffBuilder strings.Builder
+	diffBuilder.WriteString("diff --git a/pkg/first.go b/pkg/first.go\n--- a/pkg/first.go\n+++ b/pkg/first.go\n@@ -1,2 +1,5 @@\n+line\n")
+	diffBuilder.WriteString("diff --git a/pkg/pad_head.go b/pkg/pad_head.go\n--- a/pkg/pad_head.go\n+++ b/pkg/pad_head.go\n@@ -1,2 +1,5 @@\n")
+	diffBuilder.WriteString(strings.Repeat("+padding_head\n", 1400))
+	diffBuilder.WriteString("diff --git a/pkg/middle_dropped.go b/pkg/middle_dropped.go\n--- a/pkg/middle_dropped.go\n+++ b/pkg/middle_dropped.go\n@@ -1,2 +1,5 @@\n+dropped\n")
+	diffBuilder.WriteString(strings.Repeat("+padding_tail\n", 1400))
+	diffBuilder.WriteString("diff --git a/pkg/last.go b/pkg/last.go\n--- a/pkg/last.go\n+++ b/pkg/last.go\n@@ -1,2 +1,5 @@\n+last\n")
+
+	sb.execResult = &sandbox.ExecResult{
+		ExitCode: 0,
+		Stdout:   diffBuilder.String(),
+	}
+
+	gdTool := NewGitDiffTool()
+	gdRes, err := gdTool.Execute(ctx, ExecutionContext{AgentRole: "security", Sandbox: sb}, json.RawMessage(`{}`))
+	if err != nil || gdRes.ExitCode != 0 {
+		t.Fatalf("git_diff err=%v res=%+v", err, gdRes)
+	}
+	for _, rec := range gdRes.AccessedFiles {
+		if rec.Path == "pkg/middle_dropped.go" {
+			t.Fatalf("pkg/middle_dropped.go was dropped by truncation and must not appear in AccessedFiles: %+v", gdRes.AccessedFiles)
+		}
+	}
+}
+
 func jsonCall(name, args string) llm.ToolCall {
 	return llm.ToolCall{
 		ID:        "call_" + name,
