@@ -1,0 +1,102 @@
+version: "1"
+name: pr-review
+description: Multi-agent PR code review with isolated Daytona sandbox verification
+
+input:
+  adapter: github_pr
+  triggers:
+    events: ["opened", "synchronize", "reopened", "ready_for_review"]
+    comment_command: "/mochi review"
+    ignore_drafts: true
+
+repo_overrides:
+  enabled: true
+  path: ".mochi/config.yaml"
+  allow_custom_prompts: true
+  allow_custom_images: false # Security control: prevent untrusted PRs from running arbitrary container images
+
+sandbox:
+  provider: daytona
+  default_snapshot: "mochi-default-polyglot"
+  default_image: "ubuntu:24.04"
+  fork_from_base: true # Clone repo once in base sandbox and fork per specialist agent
+  setup_timeout: 3m
+
+agents:
+  - role: correctness
+    prompt_file: "configs/prompts/correctness.md"
+    llm:
+      provider: anthropic
+      model: claude-sonnet-5-5
+      reasoning_effort: high
+    sandbox:
+      enabled: true
+    tools: ["read_file", "list_dir", "search_code", "git_diff", "exec_command", "submit_output"]
+    budgets:
+      max_turns: 15
+      max_tokens: 120000
+      command_timeout: 60s
+      run_timeout: 5m
+
+  - role: security
+    prompt_file: "configs/prompts/security.md"
+    llm:
+      provider: anthropic
+      model: claude-opus-5-5
+      reasoning_effort: high
+    sandbox:
+      enabled: true
+    tools: ["read_file", "list_dir", "search_code", "git_diff", "exec_command", "submit_output"]
+    budgets:
+      max_turns: 15
+      max_tokens: 120000
+      command_timeout: 60s
+      run_timeout: 5m
+
+  - role: performance-architecture
+    prompt_file: "configs/prompts/performance_architecture.md"
+    llm:
+      provider: gemini
+      model: gemini-3.8-flash
+      reasoning_effort: high
+    sandbox:
+      enabled: true
+    tools: ["read_file", "list_dir", "search_code", "git_diff", "exec_command", "submit_output"]
+    budgets:
+      max_turns: 12
+      max_tokens: 150000
+      command_timeout: 60s
+      run_timeout: 5m
+
+  - role: test-runner
+    prompt_file: "configs/prompts/test_runner.md"
+    llm:
+      provider: openai
+      model: gpt-6.1-sol
+      reasoning_effort: medium
+    sandbox:
+      enabled: true
+    tools: ["read_file", "write_file", "list_dir", "search_code", "git_diff", "exec_command", "submit_output"]
+    budgets:
+      max_turns: 20
+      max_tokens: 150000
+      command_timeout: 180s
+      run_timeout: 8m
+
+synthesizer:
+  prompt_file: "configs/prompts/synthesizer.md"
+  llm:
+    provider: openai
+    model: gpt-6.1-sol
+    reasoning_effort: medium
+  budgets:
+    run_timeout: 2m
+
+output:
+  sinks:
+    - type: github_pr_review
+      post_inline_comments: true
+      include_coverage_summary: true
+      min_severity: "low"
+      min_confidence: 0.7
+      verdict_mode: "comment_only"
