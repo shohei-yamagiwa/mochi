@@ -77,6 +77,52 @@ type OutputSink interface {
 	OnRunFailed(ctx context.Context, task *domain.TaskContext, err error) error
 }
 
+// ConfigurableSink is optionally implemented by OutputSinks that accept per-workflow SinkConfig overrides.
+type ConfigurableSink interface {
+	OutputSink
+	WithConfig(cfg domain.SinkConfig) OutputSink
+}
+
+// SeverityRank returns a numeric ordering for Severity (nit=1 .. critical=5).
+func SeverityRank(s Severity) int {
+	switch s {
+	case SeverityNit:
+		return 1
+	case SeverityLow:
+		return 2
+	case SeverityMedium:
+		return 3
+	case SeverityHigh:
+		return 4
+	case SeverityCritical:
+		return 5
+	default:
+		return 0
+	}
+}
+
+// ParseSeverity normalizes a severity string into a Severity constant.
+func ParseSeverity(raw string) (Severity, bool) {
+	switch Severity(raw) {
+	case SeverityCritical, SeverityHigh, SeverityMedium, SeverityLow, SeverityNit:
+		return Severity(raw), true
+	default:
+		return "", false
+	}
+}
+
+// SeverityMeetsMinimum reports whether sev is at least as severe as minSev.
+func SeverityMeetsMinimum(sev Severity, minSev string) bool {
+	if minSev == "" {
+		return true
+	}
+	parsedMin, ok := ParseSeverity(minSev)
+	if !ok {
+		return true
+	}
+	return SeverityRank(sev) >= SeverityRank(parsedMin)
+}
+
 // NewReviewReportValidator builds a JSON Schema validator for ReviewReport with enum and range constraints.
 func NewReviewReportValidator() (*schema.Validator[ReviewReport], error) {
 	return schema.NewValidator[ReviewReport](applyReviewReportSchemaConstraints)
