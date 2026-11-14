@@ -44,23 +44,23 @@ type RunRecord struct {
 
 // AgentRunRecord persists a single specialist or synthesizer agent execution.
 type AgentRunRecord struct {
-	AgentRunID          string          `json:"agent_run_id"`
-	RunID               string          `json:"run_id"`
-	Role                string          `json:"role"`
-	Provider            string          `json:"provider"`
-	Model               string          `json:"model"`
-	SandboxID           string          `json:"sandbox_id,omitempty"`
-	RenderedSystemPrompt string         `json:"rendered_system_prompt,omitempty"`
-	RenderedUserPrompt   string         `json:"rendered_user_prompt,omitempty"`
-	Status              AgentRunStatus  `json:"status"`
-	TurnsUsed           int             `json:"turns_used"`
-	InputTokens         int             `json:"input_tokens"`
-	OutputTokens        int             `json:"output_tokens"`
-	CachedTokens        int             `json:"cached_tokens"`
-	SubmittedOutputJSON json.RawMessage `json:"submitted_output_json,omitempty"`
-	ErrorMessage        string          `json:"error_message,omitempty"`
-	StartedAt           time.Time       `json:"started_at"`
-	CompletedAt         *time.Time      `json:"completed_at,omitempty"`
+	AgentRunID           string          `json:"agent_run_id"`
+	RunID                string          `json:"run_id"`
+	Role                 string          `json:"role"`
+	Provider             string          `json:"provider"`
+	Model                string          `json:"model"`
+	SandboxID            string          `json:"sandbox_id,omitempty"`
+	RenderedSystemPrompt string          `json:"rendered_system_prompt,omitempty"`
+	RenderedUserPrompt   string          `json:"rendered_user_prompt,omitempty"`
+	Status               AgentRunStatus  `json:"status"`
+	TurnsUsed            int             `json:"turns_used"`
+	InputTokens          int             `json:"input_tokens"`
+	OutputTokens         int             `json:"output_tokens"`
+	CachedTokens         int             `json:"cached_tokens"`
+	SubmittedOutputJSON  json.RawMessage `json:"submitted_output_json,omitempty"`
+	ErrorMessage         string          `json:"error_message,omitempty"`
+	StartedAt            time.Time       `json:"started_at"`
+	CompletedAt          *time.Time      `json:"completed_at,omitempty"`
 }
 
 // LLMTurnRecord persists a single model request/response turn for an agent run.

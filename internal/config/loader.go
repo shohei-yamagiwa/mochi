@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,11 +18,19 @@ var (
 	ErrCustomImagesDisallowed = errors.New("custom sandbox images are disallowed by repo_overrides.allow_custom_images=false")
 	// ErrCustomPromptsDisallowed is returned when a repo override attempts to alter prompt files while disabled.
 	ErrCustomPromptsDisallowed = errors.New("custom prompt overrides are disallowed by repo_overrides.allow_custom_prompts=false")
+	// ErrDisallowedOverrideField is returned when a repo override attempts to modify a security-sensitive field.
+	ErrDisallowedOverrideField = errors.New("repo override attempts to modify a disallowed field")
+	// ErrDisallowedToolOverride is returned when a repo override attempts to grant a tool not permitted by the server workflow.
+	ErrDisallowedToolOverride = errors.New("repo override attempts to grant a tool not in the base role allowlist")
 )
 
-var validProviders = []string{"anthropic", "openai", "gemini", "openai_compat"}
+var (
+	validProviders  = []string{"anthropic", "openai", "gemini", "openai_compat"}
+	validSeverities = []string{"critical", "high", "medium", "low", "nit"}
+)
 
-// RepoOverride defines the subset of workflow fields that a target repository's .mochi/config.yaml may customize.
+// RepoOverride defines the allowlisted workflow fields that a target repository's .mochi/config.yaml
+// (loaded from the base branch) may customize.
 type RepoOverride struct {
 	Input       *InputOverride       `yaml:"input,omitempty"`
 	Sandbox     *SandboxOverride     `yaml:"sandbox,omitempty"`
@@ -32,7 +41,14 @@ type RepoOverride struct {
 
 // InputOverride overrides trigger settings.
 type InputOverride struct {
-	Triggers *domain.TriggerConfig `yaml:"triggers,omitempty"`
+	Triggers *TriggerOverride `yaml:"triggers,omitempty"`
+}
+
+// TriggerOverride uses pointer bools so unset fields preserve base workflow defaults.
+type TriggerOverride struct {
+	Events         []string `yaml:"events,omitempty"`
+	CommentCommand string   `yaml:"comment_command,omitempty"`
+	IgnoreDrafts   *bool    `yaml:"ignore_drafts,omitempty"`
 }
 
 // SandboxOverride captures sandbox override attempts from a target repository.
@@ -42,30 +58,52 @@ type SandboxOverride struct {
 	DefaultImage    string `yaml:"default_image,omitempty"`
 }
 
-// AgentRoleOverride customizes an existing role by name.
+// ModelOverride defines the safe subset of LLM settings a repo override may tune.
+// Provider, Model, and BaseURL are captured only to reject disallowed override attempts explicitly.
+type ModelOverride struct {
+	Provider        string   `yaml:"provider,omitempty"`
+	Model           string   `yaml:"model,omitempty"`
+	BaseURL         string   `yaml:"base_url,omitempty"`
+	Temperature     *float64 `yaml:"temperature,omitempty"`
+	MaxOutputTokens int      `yaml:"max_output_tokens,omitempty"`
+	ReasoningEffort string   `yaml:"reasoning_effort,omitempty"`
+}
+
+// AgentRoleOverride customizes an existing role by name within server-defined bounds.
 type AgentRoleOverride struct {
 	Role       string               `yaml:"role"`
 	Enabled    *bool                `yaml:"enabled,omitempty"`
 	PromptFile string               `yaml:"prompt_file,omitempty"`
-	LLM        *domain.ModelConfig  `yaml:"llm,omitempty"`
+	LLM        *ModelOverride       `yaml:"llm,omitempty"`
 	Tools      []string             `yaml:"tools,omitempty"`
 	Budgets    *domain.BudgetConfig `yaml:"budgets,omitempty"`
 }
 
-// SynthesizerOverride customizes synthesizer prompt or LLM settings.
+// SynthesizerOverride customizes synthesizer prompt or safe LLM/budget settings.
 type SynthesizerOverride struct {
 	PromptFile string               `yaml:"prompt_file,omitempty"`
-	LLM        *domain.ModelConfig  `yaml:"llm,omitempty"`
+	LLM        *ModelOverride       `yaml:"llm,omitempty"`
 	Budgets    *domain.BudgetConfig `yaml:"budgets,omitempty"`
 }
 
-// OutputOverride customizes output sinks.
+// OutputOverride tunes existing output sinks without allowing new sinks or external webhook URLs.
 type OutputOverride struct {
-	Sinks []domain.SinkConfig `yaml:"sinks,omitempty"`
+	Sinks []SinkOverride `yaml:"sinks,omitempty"`
+}
+
+// SinkOverride defines safe tuning knobs for an existing output sink.
+type SinkOverride struct {
+	Type                   string   `yaml:"type"`
+	PostInlineComments     *bool    `yaml:"post_inline_comments,omitempty"`
+	IncludeCoverageSummary *bool    `yaml:"include_coverage_summary,omitempty"`
+	MinSeverity            string   `yaml:"min_severity,omitempty"`
+	MinConfidence          *float64 `yaml:"min_confidence,omitempty"`
+	VerdictMode            string   `yaml:"verdict_mode,omitempty"`
+	URL                    string   `yaml:"url,omitempty"`
 }
 
 // LoadWorkflowFile reads, parses, and validates a declarative workflow YAML file.
-// baseDir is used to resolve relative prompt_file paths; if empty, the workflow file's working-directory-relative path is checked as-is.
+// baseDir is used to resolve relative prompt_file paths; if empty, only structural validation is performed.
 func LoadWorkflowFile(path string, baseDir string) (*domain.Workflow, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -134,7 +172,11 @@ func ValidateWorkflow(wf *domain.Workflow, baseDir string) error {
 		}
 		seenRoles[role] = struct{}{}
 
-		if err := validatePromptPath(agent.PromptFile, baseDir); err != nil {
+		promptBase := baseDir
+		if agent.PromptFromRepo {
+			promptBase = ""
+		}
+		if err := validatePromptPath(agent.PromptFile, promptBase); err != nil {
 			return fmt.Errorf("agents[%s].prompt_file: %w", role, err)
 		}
 		if err := validateModelConfig(agent.LLM); err != nil {
@@ -148,7 +190,11 @@ func ValidateWorkflow(wf *domain.Workflow, baseDir string) error {
 		}
 	}
 
-	if err := validatePromptPath(wf.Synthesizer.PromptFile, baseDir); err != nil {
+	synthBase := baseDir
+	if wf.Synthesizer.PromptFromRepo {
+		synthBase = ""
+	}
+	if err := validatePromptPath(wf.Synthesizer.PromptFile, synthBase); err != nil {
 		return fmt.Errorf("synthesizer.prompt_file: %w", err)
 	}
 	if err := validateModelConfig(wf.Synthesizer.LLM); err != nil {
@@ -165,25 +211,28 @@ func ValidateWorkflow(wf *domain.Workflow, baseDir string) error {
 		if strings.TrimSpace(s.Type) == "" {
 			return fmt.Errorf("output.sinks[%d].type is required", i)
 		}
+		if s.MinSeverity != "" && !slices.Contains(validSeverities, s.MinSeverity) {
+			return fmt.Errorf("output.sinks[%d].min_severity %q is invalid", i, s.MinSeverity)
+		}
 		if s.MinConfidence < 0 || s.MinConfidence > 1 {
 			return fmt.Errorf("output.sinks[%d].min_confidence must be between 0.0 and 1.0", i)
+		}
+		if s.VerdictMode != "" && s.VerdictMode != "comment_only" && s.VerdictMode != "enforce" {
+			return fmt.Errorf("output.sinks[%d].verdict_mode %q is invalid", i, s.VerdictMode)
 		}
 	}
 
 	return nil
 }
 
-// MergeRepoOverrides applies repository-level .mochi/config.yaml overrides onto a cloned base workflow
-// while enforcing security controls (allow_custom_images, allow_custom_prompts).
+// MergeRepoOverrides applies repository-level .mochi/config.yaml overrides (fetched from the base branch)
+// onto a cloned base workflow while enforcing an explicit allowlist of safe fields and re-validating the result.
 func MergeRepoOverrides(base *domain.Workflow, overrideYAML []byte) (*domain.Workflow, error) {
 	if base == nil {
 		return nil, fmt.Errorf("base workflow must not be nil")
 	}
 
-	cloned, err := cloneWorkflow(base)
-	if err != nil {
-		return nil, err
-	}
+	cloned := cloneWorkflow(base)
 	if !cloned.RepoOverrides.Enabled || len(strings.TrimSpace(string(overrideYAML))) == 0 {
 		return cloned, nil
 	}
@@ -216,7 +265,9 @@ func MergeRepoOverrides(base *domain.Workflow, overrideYAML []byte) (*domain.Wor
 		if ov.Input.Triggers.CommentCommand != "" {
 			cloned.Input.Triggers.CommentCommand = ov.Input.Triggers.CommentCommand
 		}
-		cloned.Input.Triggers.IgnoreDrafts = ov.Input.Triggers.IgnoreDrafts
+		if ov.Input.Triggers.IgnoreDrafts != nil {
+			cloned.Input.Triggers.IgnoreDrafts = *ov.Input.Triggers.IgnoreDrafts
+		}
 	}
 
 	if len(ov.Agents) > 0 {
@@ -227,9 +278,6 @@ func MergeRepoOverrides(base *domain.Workflow, overrideYAML []byte) (*domain.Wor
 
 		disabled := make(map[string]bool)
 		for _, aov := range ov.Agents {
-			if aov.PromptFile != "" && !cloned.RepoOverrides.AllowCustomPrompts {
-				return nil, fmt.Errorf("agent %q: %w", aov.Role, ErrCustomPromptsDisallowed)
-			}
 			idx, exists := roleIndex[aov.Role]
 			if !exists {
 				return nil, fmt.Errorf("repo override references unknown agent role %q", aov.Role)
@@ -239,19 +287,33 @@ func MergeRepoOverrides(base *domain.Workflow, overrideYAML []byte) (*domain.Wor
 				continue
 			}
 			if aov.PromptFile != "" {
-				if err := ensureSafeRelativePath(aov.PromptFile); err != nil {
+				if !cloned.RepoOverrides.AllowCustomPrompts {
+					return nil, fmt.Errorf("agent %q: %w", aov.Role, ErrCustomPromptsDisallowed)
+				}
+				if err := ensureSafeRepoPromptPath(aov.PromptFile); err != nil {
 					return nil, fmt.Errorf("agent %q prompt_file: %w", aov.Role, err)
 				}
-				cloned.Agents[idx].PromptFile = aov.PromptFile
+				cloned.Agents[idx].PromptFile = filepath.ToSlash(filepath.Clean(filepath.FromSlash(aov.PromptFile)))
+				cloned.Agents[idx].PromptFromRepo = true
 			}
 			if aov.LLM != nil {
-				mergeModelConfig(&cloned.Agents[idx].LLM, aov.LLM)
+				if err := mergeModelOverride(&cloned.Agents[idx].LLM, aov.LLM); err != nil {
+					return nil, fmt.Errorf("agent %q llm: %w", aov.Role, err)
+				}
 			}
 			if len(aov.Tools) > 0 {
+				allowed := cloned.Agents[idx].Tools
+				for _, t := range aov.Tools {
+					if !slices.Contains(allowed, t) {
+						return nil, fmt.Errorf("agent %q tool %q: %w", aov.Role, t, ErrDisallowedToolOverride)
+					}
+				}
 				cloned.Agents[idx].Tools = slices.Clone(aov.Tools)
 			}
 			if aov.Budgets != nil {
-				mergeBudgetConfig(&cloned.Agents[idx].Budgets, aov.Budgets)
+				if err := mergeClampedBudgetConfig(&cloned.Agents[idx].Budgets, aov.Budgets); err != nil {
+					return nil, fmt.Errorf("agent %q budgets: %w", aov.Role, err)
+				}
 			}
 		}
 
@@ -271,69 +333,144 @@ func MergeRepoOverrides(base *domain.Workflow, overrideYAML []byte) (*domain.Wor
 			if !cloned.RepoOverrides.AllowCustomPrompts {
 				return nil, fmt.Errorf("synthesizer: %w", ErrCustomPromptsDisallowed)
 			}
-			if err := ensureSafeRelativePath(ov.Synthesizer.PromptFile); err != nil {
+			if err := ensureSafeRepoPromptPath(ov.Synthesizer.PromptFile); err != nil {
 				return nil, fmt.Errorf("synthesizer prompt_file: %w", err)
 			}
-			cloned.Synthesizer.PromptFile = ov.Synthesizer.PromptFile
+			cloned.Synthesizer.PromptFile = filepath.ToSlash(filepath.Clean(filepath.FromSlash(ov.Synthesizer.PromptFile)))
+			cloned.Synthesizer.PromptFromRepo = true
 		}
 		if ov.Synthesizer.LLM != nil {
-			mergeModelConfig(&cloned.Synthesizer.LLM, ov.Synthesizer.LLM)
+			if err := mergeModelOverride(&cloned.Synthesizer.LLM, ov.Synthesizer.LLM); err != nil {
+				return nil, fmt.Errorf("synthesizer llm: %w", err)
+			}
 		}
 		if ov.Synthesizer.Budgets != nil {
-			mergeBudgetConfig(&cloned.Synthesizer.Budgets, ov.Synthesizer.Budgets)
+			if err := mergeClampedBudgetConfig(&cloned.Synthesizer.Budgets, ov.Synthesizer.Budgets); err != nil {
+				return nil, fmt.Errorf("synthesizer budgets: %w", err)
+			}
 		}
 	}
 
 	if ov.Output != nil && len(ov.Output.Sinks) > 0 {
-		cloned.Output.Sinks = slices.Clone(ov.Output.Sinks)
+		sinkIndex := make(map[string]int, len(cloned.Output.Sinks))
+		for i, s := range cloned.Output.Sinks {
+			sinkIndex[s.Type] = i
+		}
+		for _, sov := range ov.Output.Sinks {
+			if sov.URL != "" {
+				return nil, fmt.Errorf("output sink %q url: %w", sov.Type, ErrDisallowedOverrideField)
+			}
+			if sov.VerdictMode != "" {
+				return nil, fmt.Errorf("output sink %q verdict_mode: %w", sov.Type, ErrDisallowedOverrideField)
+			}
+			idx, ok := sinkIndex[sov.Type]
+			if !ok {
+				return nil, fmt.Errorf("output sink %q not configured on server: %w", sov.Type, ErrDisallowedOverrideField)
+			}
+			if sov.PostInlineComments != nil {
+				cloned.Output.Sinks[idx].PostInlineComments = *sov.PostInlineComments
+			}
+			if sov.IncludeCoverageSummary != nil {
+				cloned.Output.Sinks[idx].IncludeCoverageSummary = *sov.IncludeCoverageSummary
+			}
+			if sov.MinSeverity != "" {
+				cloned.Output.Sinks[idx].MinSeverity = sov.MinSeverity
+			}
+			if sov.MinConfidence != nil {
+				cloned.Output.Sinks[idx].MinConfidence = *sov.MinConfidence
+			}
+		}
+	}
+
+	if err := ValidateWorkflow(cloned, ""); err != nil {
+		return nil, fmt.Errorf("validate merged workflow: %w", err)
 	}
 
 	return cloned, nil
 }
 
-func cloneWorkflow(wf *domain.Workflow) (*domain.Workflow, error) {
-	raw, err := yaml.Marshal(wf)
-	if err != nil {
-		return nil, fmt.Errorf("clone workflow: %w", err)
+func cloneWorkflow(wf *domain.Workflow) *domain.Workflow {
+	out := *wf
+	out.Input.Triggers.Events = slices.Clone(wf.Input.Triggers.Events)
+	out.Agents = make([]domain.RoleConfig, len(wf.Agents))
+	for i, a := range wf.Agents {
+		clonedAgent := a
+		clonedAgent.Tools = slices.Clone(a.Tools)
+		if a.LLM.Temperature != nil {
+			t := *a.LLM.Temperature
+			clonedAgent.LLM.Temperature = &t
+		}
+		out.Agents[i] = clonedAgent
 	}
-	return ParseWorkflow(raw)
+	if wf.Synthesizer.LLM.Temperature != nil {
+		t := *wf.Synthesizer.LLM.Temperature
+		out.Synthesizer.LLM.Temperature = &t
+	}
+	out.Output.Sinks = make([]domain.SinkConfig, len(wf.Output.Sinks))
+	for i, s := range wf.Output.Sinks {
+		clonedSink := s
+		if s.Options != nil {
+			clonedSink.Options = maps.Clone(s.Options)
+		}
+		out.Output.Sinks[i] = clonedSink
+	}
+	return &out
 }
 
-func mergeModelConfig(dst, src *domain.ModelConfig) {
+func mergeModelOverride(dst *domain.ModelConfig, src *ModelOverride) error {
+	if src.BaseURL != "" {
+		return fmt.Errorf("base_url: %w", ErrDisallowedOverrideField)
+	}
 	if src.Provider != "" {
-		dst.Provider = src.Provider
+		return fmt.Errorf("provider: %w", ErrDisallowedOverrideField)
 	}
 	if src.Model != "" {
-		dst.Model = src.Model
-	}
-	if src.BaseURL != "" {
-		dst.BaseURL = src.BaseURL
+		return fmt.Errorf("model: %w", ErrDisallowedOverrideField)
 	}
 	if src.Temperature != nil {
 		t := *src.Temperature
 		dst.Temperature = &t
 	}
 	if src.MaxOutputTokens > 0 {
-		dst.MaxOutputTokens = src.MaxOutputTokens
+		dst.MaxOutputTokens = clampInt(src.MaxOutputTokens, dst.MaxOutputTokens)
 	}
 	if src.ReasoningEffort != "" {
 		dst.ReasoningEffort = src.ReasoningEffort
 	}
+	return nil
 }
 
-func mergeBudgetConfig(dst, src *domain.BudgetConfig) {
+func mergeClampedBudgetConfig(dst, src *domain.BudgetConfig) error {
+	if err := validateBudgetConfig(*src); err != nil {
+		return err
+	}
 	if src.MaxTurns > 0 {
-		dst.MaxTurns = src.MaxTurns
+		dst.MaxTurns = clampInt(src.MaxTurns, dst.MaxTurns)
 	}
 	if src.MaxTokens > 0 {
-		dst.MaxTokens = src.MaxTokens
+		dst.MaxTokens = clampInt(src.MaxTokens, dst.MaxTokens)
 	}
 	if src.CommandTimeout > 0 {
-		dst.CommandTimeout = src.CommandTimeout
+		dst.CommandTimeout = clampDuration(src.CommandTimeout, dst.CommandTimeout)
 	}
 	if src.RunTimeout > 0 {
-		dst.RunTimeout = src.RunTimeout
+		dst.RunTimeout = clampDuration(src.RunTimeout, dst.RunTimeout)
 	}
+	return nil
+}
+
+func clampInt(requested, base int) int {
+	if base > 0 && requested > base {
+		return base
+	}
+	return requested
+}
+
+func clampDuration(requested, base domain.Duration) domain.Duration {
+	if base > 0 && requested > base {
+		return base
+	}
+	return requested
 }
 
 func validateModelConfig(m domain.ModelConfig) error {
@@ -383,14 +520,31 @@ func validatePromptPath(promptPath, baseDir string) error {
 		return err
 	}
 	if baseDir != "" {
-		resolved := filepath.Join(baseDir, filepath.FromSlash(promptPath))
-		info, err := os.Stat(resolved)
+		root, err := os.OpenRoot(baseDir)
 		if err != nil {
-			return fmt.Errorf("stat prompt file %q: %w", resolved, err)
+			return fmt.Errorf("open prompt root %q: %w", baseDir, err)
+		}
+		defer root.Close()
+
+		cleanRel := filepath.ToSlash(filepath.Clean(filepath.FromSlash(promptPath)))
+		info, err := root.Stat(cleanRel)
+		if err != nil {
+			return fmt.Errorf("stat prompt file %q under %q: %w", cleanRel, baseDir, err)
 		}
 		if info.IsDir() {
-			return fmt.Errorf("prompt path %q is a directory", resolved)
+			return fmt.Errorf("prompt path %q is a directory", cleanRel)
 		}
+	}
+	return nil
+}
+
+func ensureSafeRepoPromptPath(p string) error {
+	if err := ensureSafeRelativePath(p); err != nil {
+		return err
+	}
+	cleanSlash := filepath.ToSlash(filepath.Clean(filepath.FromSlash(p)))
+	if cleanSlash != ".mochi" && !strings.HasPrefix(cleanSlash, ".mochi/") {
+		return fmt.Errorf("repo prompt_file %q must reside under .mochi/", p)
 	}
 	return nil
 }
@@ -400,7 +554,7 @@ func ensureSafeRelativePath(p string) error {
 	if trimmed == "" {
 		return fmt.Errorf("prompt_file is required")
 	}
-	if filepath.IsAbs(trimmed) {
+	if filepath.IsAbs(trimmed) || strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, `\`) {
 		return fmt.Errorf("prompt_file %q must be a relative path", trimmed)
 	}
 	cleaned := filepath.Clean(filepath.FromSlash(trimmed))

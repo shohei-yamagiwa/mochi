@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,9 @@ import (
 	"github.com/shohei-yamagiwa/mochi/internal/store"
 )
 
+// sqliteTimeLayout uses fixed-width 9-digit fractional seconds in UTC so TEXT ORDER BY matches chronological order.
+const sqliteTimeLayout = "2006-01-02T15:04:05.000000000Z"
+
 // SQLiteStore implements store.Store backed by CGO-free embedded SQLite (modernc.org/sqlite).
 type SQLiteStore struct {
 	db *sql.DB
@@ -25,7 +29,8 @@ type SQLiteStore struct {
 // Compile-time check that SQLiteStore satisfies store.Store.
 var _ store.Store = (*SQLiteStore)(nil)
 
-// Open opens (or creates) a SQLite database at path, applies WAL/pool tuning, and runs schema migrations.
+// Open opens (or creates) a SQLite database at path, applies connection-persistent DSN pragmas and
+// single-writer pool tuning, and runs schema migrations.
 // Use ":memory:" for an ephemeral in-memory database (primarily for tests).
 func Open(ctx context.Context, path string) (*SQLiteStore, error) {
 	if path == "" {
@@ -33,7 +38,7 @@ func Open(ctx context.Context, path string) (*SQLiteStore, error) {
 	}
 
 	isMemory := path == ":memory:" || strings.HasPrefix(path, "file::memory:")
-	if !isMemory {
+	if !isMemory && !strings.HasPrefix(path, "file:") {
 		dir := filepath.Dir(path)
 		if dir != "" && dir != "." {
 			if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -42,7 +47,8 @@ func Open(ctx context.Context, path string) (*SQLiteStore, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", path)
+	dsn := buildSQLiteDSN(path, isMemory)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite %q: %w", path, err)
 	}
@@ -51,19 +57,9 @@ func Open(ctx context.Context, path string) (*SQLiteStore, error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
-	pragmas := []string{
-		"PRAGMA foreign_keys = ON;",
-		"PRAGMA busy_timeout = 5000;",
-		"PRAGMA synchronous = NORMAL;",
-	}
-	if !isMemory {
-		pragmas = append([]string{"PRAGMA journal_mode = WAL;"}, pragmas...)
-	}
-	for _, p := range pragmas {
-		if _, err := db.ExecContext(ctx, p); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("apply sqlite pragma %q: %w", p, err)
-		}
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ping sqlite %q: %w", path, err)
 	}
 
 	if err := runMigrations(ctx, db); err != nil {
@@ -72,6 +68,33 @@ func Open(ctx context.Context, path string) (*SQLiteStore, error) {
 	}
 
 	return &SQLiteStore{db: db}, nil
+}
+
+func buildSQLiteDSN(path string, isMemory bool) string {
+	q := url.Values{}
+	q.Add("_pragma", "foreign_keys(1)")
+	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("_pragma", "synchronous(NORMAL)")
+	if !isMemory {
+		q.Add("_pragma", "journal_mode(WAL)")
+	}
+
+	if strings.HasPrefix(path, "file:") {
+		sep := "?"
+		if strings.Contains(path, "?") {
+			sep = "&"
+		}
+		return path + sep + q.Encode()
+	}
+	if path == ":memory:" {
+		return "file::memory:?" + q.Encode()
+	}
+	u := url.URL{
+		Scheme:   "file",
+		Path:     filepath.ToSlash(path),
+		RawQuery: q.Encode(),
+	}
+	return u.String()
 }
 
 // Close closes the underlying database connection pool.
@@ -141,20 +164,7 @@ func (s *SQLiteStore) CompleteRun(ctx context.Context, runID string, status doma
 }
 
 func (s *SQLiteStore) GetRun(ctx context.Context, runID string) (*domain.RunRecord, error) {
-	row := s.db.QueryRowContext(ctx, `
-		SELECT run_id, workflow_name, trigger_type, dedup_key, status,
-		       resolved_config_yaml, final_artifact_json, error_message, started_at, completed_at
-		FROM workflow_runs
-		WHERE run_id = ?
-	`, runID)
-	rec, err := scanRunRecord(row)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, store.ErrNotFound
-		}
-		return nil, fmt.Errorf("get workflow_run %q: %w", runID, err)
-	}
-	return rec, nil
+	return getRun(ctx, s.db, runID)
 }
 
 func (s *SQLiteStore) ListRuns(ctx context.Context, filter store.RunFilter) ([]*domain.RunRecord, error) {
@@ -270,42 +280,7 @@ func (s *SQLiteStore) SaveChangesetSnapshot(ctx context.Context, runID string, c
 }
 
 func (s *SQLiteStore) GetChangesetSnapshot(ctx context.Context, runID string) (*domain.ChangesetSpec, error) {
-	var cs domain.ChangesetSpec
-	var changedFilesJSON string
-	err := s.db.QueryRowContext(ctx, `
-		SELECT provider, repo_owner, repo_name, pr_number, pr_url,
-		       pr_title, pr_description, pr_author, trigger_event, installation_id,
-		       base_branch, base_sha, head_branch, head_sha, unified_diff, changed_files_json
-		FROM changeset_snapshots
-		WHERE run_id = ?
-	`, runID).Scan(
-		&cs.Provider,
-		&cs.RepoOwner,
-		&cs.RepoName,
-		&cs.PRNumber,
-		&cs.PRURL,
-		&cs.Title,
-		&cs.Description,
-		&cs.Author,
-		&cs.TriggerEvent,
-		&cs.InstallationID,
-		&cs.BaseBranch,
-		&cs.BaseSHA,
-		&cs.HeadBranch,
-		&cs.HeadSHA,
-		&cs.UnifiedDiff,
-		&changedFilesJSON,
-	)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, store.ErrNotFound
-		}
-		return nil, fmt.Errorf("get changeset_snapshot for %q: %w", runID, err)
-	}
-	if err := json.Unmarshal([]byte(changedFilesJSON), &cs.ChangedFiles); err != nil {
-		return nil, fmt.Errorf("unmarshal changed_files_json for %q: %w", runID, err)
-	}
-	return &cs, nil
+	return getChangesetSnapshot(ctx, s.db, runID)
 }
 
 func (s *SQLiteStore) CreateAgentRun(ctx context.Context, ar *domain.AgentRunRecord) error {
@@ -362,7 +337,7 @@ func (s *SQLiteStore) UpdateAgentRun(ctx context.Context, ar *domain.AgentRunRec
 		    cached_tokens = ?,
 		    submitted_output_json = ?,
 		    error_message = ?,
-		    completed_at = ?
+		    completed_at = COALESCE(?, completed_at)
 		WHERE agent_run_id = ?
 	`,
 		ar.SandboxID,
@@ -383,67 +358,7 @@ func (s *SQLiteStore) UpdateAgentRun(ctx context.Context, ar *domain.AgentRunRec
 }
 
 func (s *SQLiteStore) ListAgentRuns(ctx context.Context, runID string) ([]*domain.AgentRunRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT agent_run_id, run_id, role, provider, model, sandbox_id,
-		       rendered_system_prompt, rendered_user_prompt, status, turns_used,
-		       input_tokens, output_tokens, cached_tokens, submitted_output_json,
-		       error_message, started_at, completed_at
-		FROM agent_runs
-		WHERE run_id = ?
-		ORDER BY started_at ASC, agent_run_id ASC
-	`, runID)
-	if err != nil {
-		return nil, fmt.Errorf("list agent_runs for %q: %w", runID, err)
-	}
-	defer rows.Close()
-
-	var out []*domain.AgentRunRecord
-	for rows.Next() {
-		var rec domain.AgentRunRecord
-		var statusStr string
-		var submittedJSON, completedStr sql.NullString
-		var startedStr string
-		if err := rows.Scan(
-			&rec.AgentRunID,
-			&rec.RunID,
-			&rec.Role,
-			&rec.Provider,
-			&rec.Model,
-			&rec.SandboxID,
-			&rec.RenderedSystemPrompt,
-			&rec.RenderedUserPrompt,
-			&statusStr,
-			&rec.TurnsUsed,
-			&rec.InputTokens,
-			&rec.OutputTokens,
-			&rec.CachedTokens,
-			&submittedJSON,
-			&rec.ErrorMessage,
-			&startedStr,
-			&completedStr,
-		); err != nil {
-			return nil, fmt.Errorf("scan agent_run: %w", err)
-		}
-		rec.Status = domain.AgentRunStatus(statusStr)
-		if submittedJSON.Valid {
-			rec.SubmittedOutputJSON = json.RawMessage(submittedJSON.String)
-		}
-		startedAt, err := parseTime(startedStr)
-		if err != nil {
-			return nil, fmt.Errorf("parse agent_run started_at: %w", err)
-		}
-		rec.StartedAt = startedAt
-		completedAt, err := parseNullableTime(completedStr)
-		if err != nil {
-			return nil, fmt.Errorf("parse agent_run completed_at: %w", err)
-		}
-		rec.CompletedAt = completedAt
-		out = append(out, &rec)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate agent_runs: %w", err)
-	}
-	return out, nil
+	return listAgentRuns(ctx, s.db, runID)
 }
 
 func (s *SQLiteStore) SaveLLMTurn(ctx context.Context, turn *domain.LLMTurnRecord) error {
@@ -481,56 +396,7 @@ func (s *SQLiteStore) SaveLLMTurn(ctx context.Context, turn *domain.LLMTurnRecor
 }
 
 func (s *SQLiteStore) ListLLMTurns(ctx context.Context, agentRunID string) ([]*domain.LLMTurnRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT turn_id, agent_run_id, turn_index, request_messages_json, response_message_json,
-		       thinking_trace, tool_calls_json, input_tokens, output_tokens, cached_tokens,
-		       latency_ms, created_at
-		FROM llm_turns
-		WHERE agent_run_id = ?
-		ORDER BY turn_index ASC, created_at ASC
-	`, agentRunID)
-	if err != nil {
-		return nil, fmt.Errorf("list llm_turns for %q: %w", agentRunID, err)
-	}
-	defer rows.Close()
-
-	var out []*domain.LLMTurnRecord
-	for rows.Next() {
-		var rec domain.LLMTurnRecord
-		var reqJSON, respJSON, createdStr string
-		var toolCallsJSON sql.NullString
-		if err := rows.Scan(
-			&rec.TurnID,
-			&rec.AgentRunID,
-			&rec.TurnIndex,
-			&reqJSON,
-			&respJSON,
-			&rec.ThinkingTrace,
-			&toolCallsJSON,
-			&rec.InputTokens,
-			&rec.OutputTokens,
-			&rec.CachedTokens,
-			&rec.LatencyMS,
-			&createdStr,
-		); err != nil {
-			return nil, fmt.Errorf("scan llm_turn: %w", err)
-		}
-		rec.RequestMessagesJSON = json.RawMessage(reqJSON)
-		rec.ResponseMessageJSON = json.RawMessage(respJSON)
-		if toolCallsJSON.Valid {
-			rec.ToolCallsJSON = json.RawMessage(toolCallsJSON.String)
-		}
-		createdAt, err := parseTime(createdStr)
-		if err != nil {
-			return nil, fmt.Errorf("parse llm_turn created_at: %w", err)
-		}
-		rec.CreatedAt = createdAt
-		out = append(out, &rec)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate llm_turns: %w", err)
-	}
-	return out, nil
+	return listLLMTurns(ctx, s.db, agentRunID)
 }
 
 func (s *SQLiteStore) SaveToolExecution(ctx context.Context, exec *domain.ToolExecRecord) error {
@@ -580,18 +446,7 @@ func (s *SQLiteStore) SaveToolExecution(ctx context.Context, exec *domain.ToolEx
 }
 
 func (s *SQLiteStore) ListToolExecutions(ctx context.Context, agentRunID string) ([]*domain.ToolExecRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT tool_exec_id, agent_run_id, turn_id, tool_call_id, tool_name,
-		       arguments_json, output_text, exit_code, accessed_files_json, duration_ms, created_at
-		FROM tool_executions
-		WHERE agent_run_id = ?
-		ORDER BY created_at ASC, tool_exec_id ASC
-	`, agentRunID)
-	if err != nil {
-		return nil, fmt.Errorf("list tool_executions for %q: %w", agentRunID, err)
-	}
-	defer rows.Close()
-	return scanToolExecutions(rows)
+	return listToolExecutions(ctx, s.db, agentRunID)
 }
 
 func (s *SQLiteStore) ListToolExecutionsByRun(ctx context.Context, runID string) ([]*domain.ToolExecRecord, error) {
@@ -689,10 +544,263 @@ func (s *SQLiteStore) SaveCoverageReport(ctx context.Context, report *domain.Cov
 }
 
 func (s *SQLiteStore) GetCoverageReport(ctx context.Context, runID string) (*domain.CoverageReport, error) {
+	return getCoverageReport(ctx, s.db, runID)
+}
+
+func (s *SQLiteStore) GetRunDetail(ctx context.Context, runID string) (*store.RunDetail, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("begin read tx for run %q: %w", runID, err)
+	}
+	defer tx.Rollback()
+
+	run, err := getRun(ctx, tx, runID)
+	if err != nil {
+		return nil, err
+	}
+
+	detail := &store.RunDetail{
+		Run: run,
+	}
+
+	cs, err := getChangesetSnapshot(ctx, tx, runID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
+	detail.Changeset = cs
+
+	agentRuns, err := listAgentRuns(ctx, tx, runID)
+	if err != nil {
+		return nil, err
+	}
+	detail.AgentRuns = make([]*store.AgentRunDetail, 0, len(agentRuns))
+	for _, ar := range agentRuns {
+		turns, err := listLLMTurns(ctx, tx, ar.AgentRunID)
+		if err != nil {
+			return nil, err
+		}
+		execs, err := listToolExecutions(ctx, tx, ar.AgentRunID)
+		if err != nil {
+			return nil, err
+		}
+		detail.AgentRuns = append(detail.AgentRuns, &store.AgentRunDetail{
+			AgentRun:       ar,
+			LLMTurns:       turns,
+			ToolExecutions: execs,
+		})
+	}
+
+	cov, err := getCoverageReport(ctx, tx, runID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
+	detail.Coverage = cov
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit read tx for run %q: %w", runID, err)
+	}
+
+	return detail, nil
+}
+
+type queryRunner interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func getRun(ctx context.Context, q queryRunner, runID string) (*domain.RunRecord, error) {
+	row := q.QueryRowContext(ctx, `
+		SELECT run_id, workflow_name, trigger_type, dedup_key, status,
+		       resolved_config_yaml, final_artifact_json, error_message, started_at, completed_at
+		FROM workflow_runs
+		WHERE run_id = ?
+	`, runID)
+	rec, err := scanRunRecord(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, store.ErrNotFound
+		}
+		return nil, fmt.Errorf("get workflow_run %q: %w", runID, err)
+	}
+	return rec, nil
+}
+
+func getChangesetSnapshot(ctx context.Context, q queryRunner, runID string) (*domain.ChangesetSpec, error) {
+	var cs domain.ChangesetSpec
+	var changedFilesJSON string
+	err := q.QueryRowContext(ctx, `
+		SELECT provider, repo_owner, repo_name, pr_number, pr_url,
+		       pr_title, pr_description, pr_author, trigger_event, installation_id,
+		       base_branch, base_sha, head_branch, head_sha, unified_diff, changed_files_json
+		FROM changeset_snapshots
+		WHERE run_id = ?
+	`, runID).Scan(
+		&cs.Provider,
+		&cs.RepoOwner,
+		&cs.RepoName,
+		&cs.PRNumber,
+		&cs.PRURL,
+		&cs.Title,
+		&cs.Description,
+		&cs.Author,
+		&cs.TriggerEvent,
+		&cs.InstallationID,
+		&cs.BaseBranch,
+		&cs.BaseSHA,
+		&cs.HeadBranch,
+		&cs.HeadSHA,
+		&cs.UnifiedDiff,
+		&changedFilesJSON,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, store.ErrNotFound
+		}
+		return nil, fmt.Errorf("get changeset_snapshot for %q: %w", runID, err)
+	}
+	if err := json.Unmarshal([]byte(changedFilesJSON), &cs.ChangedFiles); err != nil {
+		return nil, fmt.Errorf("unmarshal changed_files_json for %q: %w", runID, err)
+	}
+	return &cs, nil
+}
+
+func listAgentRuns(ctx context.Context, q queryRunner, runID string) ([]*domain.AgentRunRecord, error) {
+	rows, err := q.QueryContext(ctx, `
+		SELECT agent_run_id, run_id, role, provider, model, sandbox_id,
+		       rendered_system_prompt, rendered_user_prompt, status, turns_used,
+		       input_tokens, output_tokens, cached_tokens, submitted_output_json,
+		       error_message, started_at, completed_at
+		FROM agent_runs
+		WHERE run_id = ?
+		ORDER BY started_at ASC, agent_run_id ASC
+	`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("list agent_runs for %q: %w", runID, err)
+	}
+	defer rows.Close()
+
+	var out []*domain.AgentRunRecord
+	for rows.Next() {
+		var rec domain.AgentRunRecord
+		var statusStr string
+		var submittedJSON, completedStr sql.NullString
+		var startedStr string
+		if err := rows.Scan(
+			&rec.AgentRunID,
+			&rec.RunID,
+			&rec.Role,
+			&rec.Provider,
+			&rec.Model,
+			&rec.SandboxID,
+			&rec.RenderedSystemPrompt,
+			&rec.RenderedUserPrompt,
+			&statusStr,
+			&rec.TurnsUsed,
+			&rec.InputTokens,
+			&rec.OutputTokens,
+			&rec.CachedTokens,
+			&submittedJSON,
+			&rec.ErrorMessage,
+			&startedStr,
+			&completedStr,
+		); err != nil {
+			return nil, fmt.Errorf("scan agent_run: %w", err)
+		}
+		rec.Status = domain.AgentRunStatus(statusStr)
+		if submittedJSON.Valid {
+			rec.SubmittedOutputJSON = json.RawMessage(submittedJSON.String)
+		}
+		startedAt, err := parseTime(startedStr)
+		if err != nil {
+			return nil, fmt.Errorf("parse agent_run started_at: %w", err)
+		}
+		rec.StartedAt = startedAt
+		completedAt, err := parseNullableTime(completedStr)
+		if err != nil {
+			return nil, fmt.Errorf("parse agent_run completed_at: %w", err)
+		}
+		rec.CompletedAt = completedAt
+		out = append(out, &rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate agent_runs: %w", err)
+	}
+	return out, nil
+}
+
+func listLLMTurns(ctx context.Context, q queryRunner, agentRunID string) ([]*domain.LLMTurnRecord, error) {
+	rows, err := q.QueryContext(ctx, `
+		SELECT turn_id, agent_run_id, turn_index, request_messages_json, response_message_json,
+		       thinking_trace, tool_calls_json, input_tokens, output_tokens, cached_tokens,
+		       latency_ms, created_at
+		FROM llm_turns
+		WHERE agent_run_id = ?
+		ORDER BY turn_index ASC, created_at ASC
+	`, agentRunID)
+	if err != nil {
+		return nil, fmt.Errorf("list llm_turns for %q: %w", agentRunID, err)
+	}
+	defer rows.Close()
+
+	var out []*domain.LLMTurnRecord
+	for rows.Next() {
+		var rec domain.LLMTurnRecord
+		var reqJSON, respJSON, createdStr string
+		var toolCallsJSON sql.NullString
+		if err := rows.Scan(
+			&rec.TurnID,
+			&rec.AgentRunID,
+			&rec.TurnIndex,
+			&reqJSON,
+			&respJSON,
+			&rec.ThinkingTrace,
+			&toolCallsJSON,
+			&rec.InputTokens,
+			&rec.OutputTokens,
+			&rec.CachedTokens,
+			&rec.LatencyMS,
+			&createdStr,
+		); err != nil {
+			return nil, fmt.Errorf("scan llm_turn: %w", err)
+		}
+		rec.RequestMessagesJSON = json.RawMessage(reqJSON)
+		rec.ResponseMessageJSON = json.RawMessage(respJSON)
+		if toolCallsJSON.Valid {
+			rec.ToolCallsJSON = json.RawMessage(toolCallsJSON.String)
+		}
+		createdAt, err := parseTime(createdStr)
+		if err != nil {
+			return nil, fmt.Errorf("parse llm_turn created_at: %w", err)
+		}
+		rec.CreatedAt = createdAt
+		out = append(out, &rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate llm_turns: %w", err)
+	}
+	return out, nil
+}
+
+func listToolExecutions(ctx context.Context, q queryRunner, agentRunID string) ([]*domain.ToolExecRecord, error) {
+	rows, err := q.QueryContext(ctx, `
+		SELECT tool_exec_id, agent_run_id, turn_id, tool_call_id, tool_name,
+		       arguments_json, output_text, exit_code, accessed_files_json, duration_ms, created_at
+		FROM tool_executions
+		WHERE agent_run_id = ?
+		ORDER BY created_at ASC, tool_exec_id ASC
+	`, agentRunID)
+	if err != nil {
+		return nil, fmt.Errorf("list tool_executions for %q: %w", agentRunID, err)
+	}
+	defer rows.Close()
+	return scanToolExecutions(rows)
+}
+
+func getCoverageReport(ctx context.Context, q queryRunner, runID string) (*domain.CoverageReport, error) {
 	var report domain.CoverageReport
 	var unreviewedJSON, detailsJSON, contextFilesJSON, createdStr string
 
-	err := s.db.QueryRowContext(ctx, `
+	err := q.QueryRowContext(ctx, `
 		SELECT run_id, pr_number, base_sha, head_sha,
 		       total_changed_files, reviewed_changed_files, file_coverage_ratio,
 		       total_changed_hunks, reviewed_changed_hunks, hunk_coverage_ratio,
@@ -737,52 +845,6 @@ func (s *SQLiteStore) GetCoverageReport(ctx context.Context, runID string) (*dom
 	}
 	report.CreatedAt = createdAt
 	return &report, nil
-}
-
-func (s *SQLiteStore) GetRunDetail(ctx context.Context, runID string) (*store.RunDetail, error) {
-	run, err := s.GetRun(ctx, runID)
-	if err != nil {
-		return nil, err
-	}
-
-	detail := &store.RunDetail{
-		Run: run,
-	}
-
-	cs, err := s.GetChangesetSnapshot(ctx, runID)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return nil, err
-	}
-	detail.Changeset = cs
-
-	agentRuns, err := s.ListAgentRuns(ctx, runID)
-	if err != nil {
-		return nil, err
-	}
-	detail.AgentRuns = make([]*store.AgentRunDetail, 0, len(agentRuns))
-	for _, ar := range agentRuns {
-		turns, err := s.ListLLMTurns(ctx, ar.AgentRunID)
-		if err != nil {
-			return nil, err
-		}
-		execs, err := s.ListToolExecutions(ctx, ar.AgentRunID)
-		if err != nil {
-			return nil, err
-		}
-		detail.AgentRuns = append(detail.AgentRuns, &store.AgentRunDetail{
-			AgentRun:       ar,
-			LLMTurns:       turns,
-			ToolExecutions: execs,
-		})
-	}
-
-	cov, err := s.GetCoverageReport(ctx, runID)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return nil, err
-	}
-	detail.Coverage = cov
-
-	return detail, nil
 }
 
 type rowScanner interface {
@@ -879,7 +941,7 @@ func requireOneRowAffected(res sql.Result) error {
 }
 
 func formatTime(t time.Time) string {
-	return t.UTC().Format(time.RFC3339Nano)
+	return t.UTC().Format(sqliteTimeLayout)
 }
 
 func formatNullableTime(t *time.Time) sql.NullString {

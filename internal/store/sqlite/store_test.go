@@ -84,6 +84,20 @@ func TestSQLiteStoreFullLifecycle(t *testing.T) {
 		t.Fatalf("CreateAgentRun failed: %v", err)
 	}
 
+	// Verify FK enforcement via DSN pragma.
+	orphanAgent := &domain.AgentRunRecord{
+		AgentRunID: "agent-orphan",
+		RunID:      "nonexistent-run",
+		Role:       "security",
+		Provider:   "anthropic",
+		Model:      "claude-opus-5-5",
+		Status:     domain.AgentRunStatusRunning,
+		StartedAt:  now,
+	}
+	if err := st.CreateAgentRun(ctx, orphanAgent); err == nil {
+		t.Fatal("expected foreign key error for nonexistent run_id, got nil")
+	}
+
 	turn := &domain.LLMTurnRecord{
 		TurnID:              "turn-1",
 		AgentRunID:          ar.AgentRunID,
@@ -138,6 +152,12 @@ func TestSQLiteStoreFullLifecycle(t *testing.T) {
 		t.Fatalf("UpdateAgentRun failed: %v", err)
 	}
 
+	// Updating with nil CompletedAt should preserve existing completed_at (COALESCE semantics).
+	ar.CompletedAt = nil
+	if err := st.UpdateAgentRun(ctx, ar); err != nil {
+		t.Fatalf("UpdateAgentRun(nil CompletedAt) failed: %v", err)
+	}
+
 	cov := &domain.CoverageReport{
 		RunID:                run.RunID,
 		PRNumber:             7,
@@ -183,7 +203,10 @@ func TestSQLiteStoreFullLifecycle(t *testing.T) {
 	if detail.Changeset == nil || detail.Changeset.HeadSHA != "bbbb2222" || len(detail.Changeset.ChangedFiles) != 1 {
 		t.Fatalf("unexpected changeset in RunDetail: %+v", detail.Changeset)
 	}
-	if len(detail.AgentRuns) != 1 || len(detail.AgentRuns[0].LLMTurns) != 1 || len(detail.AgentRuns[0].ToolExecutions) != 1 {
+	if len(detail.AgentRuns) != 1 || detail.AgentRuns[0].AgentRun.CompletedAt == nil {
+		t.Fatalf("expected agent_run completed_at preserved, got %+v", detail.AgentRuns)
+	}
+	if len(detail.AgentRuns[0].LLMTurns) != 1 || len(detail.AgentRuns[0].ToolExecutions) != 1 {
 		t.Fatalf("unexpected agent run detail counts: %+v", detail.AgentRuns)
 	}
 	if detail.AgentRuns[0].ToolExecutions[0].AccessedFiles[0].Path != "main.go" {
@@ -205,5 +228,87 @@ func TestSQLiteStoreFullLifecycle(t *testing.T) {
 
 	if _, err := st.GetRunDetail(ctx, "does-not-exist"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for missing run, got %v", err)
+	}
+}
+
+func TestSQLiteStoreSubSecondTimestampOrdering(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("sqlite.Open(:memory:) failed: %v", err)
+	}
+	defer st.Close()
+
+	// Exact whole-second timestamp vs +500ms timestamp within the same second.
+	t0 := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	t1 := t0.Add(500 * time.Millisecond)
+
+	if err := st.CreateRun(ctx, &domain.RunRecord{
+		RunID:        "run-older",
+		WorkflowName: "pr-review",
+		TriggerType:  "cli",
+		DedupKey:     "k1",
+		Status:       domain.RunStatusCompleted,
+		StartedAt:    t0,
+	}); err != nil {
+		t.Fatalf("CreateRun(older) failed: %v", err)
+	}
+	if err := st.CreateRun(ctx, &domain.RunRecord{
+		RunID:        "run-newer",
+		WorkflowName: "pr-review",
+		TriggerType:  "cli",
+		DedupKey:     "k2",
+		Status:       domain.RunStatusCompleted,
+		StartedAt:    t1,
+	}); err != nil {
+		t.Fatalf("CreateRun(newer) failed: %v", err)
+	}
+
+	runs, err := st.ListRuns(ctx, store.RunFilter{})
+	if err != nil {
+		t.Fatalf("ListRuns failed: %v", err)
+	}
+	if len(runs) != 2 || runs[0].RunID != "run-newer" || runs[1].RunID != "run-older" {
+		t.Fatalf("ListRuns sub-second ordering wrong: got [%s, %s], want [run-newer, run-older]", runs[0].RunID, runs[1].RunID)
+	}
+
+	if err := st.CreateAgentRun(ctx, &domain.AgentRunRecord{
+		AgentRunID: "ar-1",
+		RunID:      "run-older",
+		Role:       "correctness",
+		Provider:   "anthropic",
+		Model:      "claude-sonnet-5-5",
+		Status:     domain.AgentRunStatusRunning,
+		StartedAt:  t0,
+	}); err != nil {
+		t.Fatalf("CreateAgentRun failed: %v", err)
+	}
+
+	// Save newer before older? No, save older (t0) and newer (t1), and verify ASC ordering.
+	if err := st.SaveToolExecution(ctx, &domain.ToolExecRecord{
+		ToolExecID: "exec-2",
+		AgentRunID: "ar-1",
+		ToolCallID: "tc-2",
+		ToolName:   "read_file",
+		CreatedAt:  t1,
+	}); err != nil {
+		t.Fatalf("SaveToolExecution(t1) failed: %v", err)
+	}
+	if err := st.SaveToolExecution(ctx, &domain.ToolExecRecord{
+		ToolExecID: "exec-1",
+		AgentRunID: "ar-1",
+		ToolCallID: "tc-1",
+		ToolName:   "read_file",
+		CreatedAt:  t0,
+	}); err != nil {
+		t.Fatalf("SaveToolExecution(t0) failed: %v", err)
+	}
+
+	execs, err := st.ListToolExecutions(ctx, "ar-1")
+	if err != nil {
+		t.Fatalf("ListToolExecutions failed: %v", err)
+	}
+	if len(execs) != 2 || execs[0].ToolExecID != "exec-1" || execs[1].ToolExecID != "exec-2" {
+		t.Fatalf("ListToolExecutions sub-second ordering wrong: got [%s, %s], want [exec-1, exec-2]", execs[0].ToolExecID, execs[1].ToolExecID)
 	}
 }

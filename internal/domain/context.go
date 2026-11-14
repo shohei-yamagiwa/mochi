@@ -27,10 +27,10 @@ type WorkspaceSpec struct {
 
 // ChangesetSpec records the exact VCS / Pull Request state at trigger time.
 type ChangesetSpec struct {
-	Provider       string        `json:"provider"`                  // "github", "git_local", etc.
-	RepoOwner      string        `json:"repo_owner"`                // e.g. "shohei-yamagiwa"
-	RepoName       string        `json:"repo_name"`                 // e.g. "mochi"
-	PRNumber       int           `json:"pr_number,omitempty"`       // Pull Request number (e.g. 42)
+	Provider       string        `json:"provider"`            // "github", "git_local", etc.
+	RepoOwner      string        `json:"repo_owner"`          // e.g. "shohei-yamagiwa"
+	RepoName       string        `json:"repo_name"`           // e.g. "mochi"
+	PRNumber       int           `json:"pr_number,omitempty"` // Pull Request number (e.g. 42)
 	PRURL          string        `json:"pr_url,omitempty"`
 	Title          string        `json:"title"`
 	Description    string        `json:"description"`

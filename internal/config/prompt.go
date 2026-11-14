@@ -8,13 +8,61 @@ import (
 	"path/filepath"
 	"strings"
 	"text/template"
+	"unicode/utf8"
 
 	"github.com/shohei-yamagiwa/mochi/internal/domain"
 )
 
-// PromptData exposes canonical workflow and task context variables to prompt templates.
+// PromptWorkspaceSpec is a secret-free projection of domain.WorkspaceSpec for prompt templates.
+// It intentionally omits CloneToken so credentials can never be interpolated into LLM prompts.
+type PromptWorkspaceSpec struct {
+	RepoURL    string `json:"repo_url"`
+	Ref        string `json:"ref"`
+	BaseRef    string `json:"base_ref"`
+	Snapshot   string `json:"snapshot,omitempty"`
+	Image      string `json:"image,omitempty"`
+	Dockerfile string `json:"dockerfile,omitempty"`
+}
+
+// PromptTaskContext is a secret-free projection of domain.TaskContext exposed to prompt templates.
+type PromptTaskContext struct {
+	RunID        string                `json:"run_id"`
+	WorkflowName string                `json:"workflow_name"`
+	TriggerType  string                `json:"trigger_type"`
+	DedupKey     string                `json:"dedup_key"`
+	Workspace    PromptWorkspaceSpec   `json:"workspace"`
+	Changeset    *domain.ChangesetSpec `json:"changeset"`
+	Variables    map[string]any        `json:"variables"`
+	SinkMetadata map[string]any        `json:"sink_metadata"`
+}
+
+// NewPromptTaskContext constructs a secret-free PromptTaskContext from a domain.TaskContext.
+func NewPromptTaskContext(task *domain.TaskContext) *PromptTaskContext {
+	if task == nil {
+		return nil
+	}
+	return &PromptTaskContext{
+		RunID:        task.RunID,
+		WorkflowName: task.WorkflowName,
+		TriggerType:  task.TriggerType,
+		DedupKey:     task.DedupKey,
+		Workspace: PromptWorkspaceSpec{
+			RepoURL:    task.Workspace.RepoURL,
+			Ref:        task.Workspace.Ref,
+			BaseRef:    task.Workspace.BaseRef,
+			Snapshot:   task.Workspace.Snapshot,
+			Image:      task.Workspace.Image,
+			Dockerfile: task.Workspace.Dockerfile,
+		},
+		Changeset:    task.Changeset,
+		Variables:    task.Variables,
+		SinkMetadata: task.SinkMetadata,
+	}
+}
+
+// PromptData exposes canonical, secret-free workflow and task context variables to prompt templates.
 type PromptData struct {
-	Task           *domain.TaskContext
+	Task           *PromptTaskContext
 	Workflow       *domain.Workflow
 	Role           *domain.RoleConfig
 	AgentSummaries map[string]string
@@ -22,16 +70,34 @@ type PromptData struct {
 	Extra          map[string]any
 }
 
-// PromptEngine loads and renders Go text/template prompt files safely.
-type PromptEngine struct {
-	baseDir string
-	funcs   template.FuncMap
+// NewPromptData builds a secret-free PromptData from a domain.TaskContext.
+func NewPromptData(task *domain.TaskContext, wf *domain.Workflow, role *domain.RoleConfig) PromptData {
+	return PromptData{
+		Task:     NewPromptTaskContext(task),
+		Workflow: wf,
+		Role:     role,
+	}
 }
 
-// NewPromptEngine constructs a PromptEngine rooted at baseDir for resolving relative prompt file paths.
-func NewPromptEngine(baseDir string) *PromptEngine {
+// PromptEngine loads and renders Go text/template prompt files using separate server and repo roots.
+// Both roots are opened via os.Root to prevent path traversal and symlink escapes.
+type PromptEngine struct {
+	serverDir string
+	repoDir   string
+	funcs     template.FuncMap
+}
+
+// NewPromptEngine constructs a PromptEngine rooted at serverDir for server-owned prompt files.
+func NewPromptEngine(serverDir string) *PromptEngine {
+	return NewPromptEngineWithRoots(serverDir, "")
+}
+
+// NewPromptEngineWithRoots constructs a PromptEngine with separate roots for server prompts and
+// repository-overridden prompts (which must be fetched from the repository's base branch).
+func NewPromptEngineWithRoots(serverDir, repoDir string) *PromptEngine {
 	return &PromptEngine{
-		baseDir: baseDir,
+		serverDir: serverDir,
+		repoDir:   repoDir,
 		funcs: template.FuncMap{
 			"shortSHA": func(s string) string {
 				if len(s) > 7 {
@@ -39,12 +105,7 @@ func NewPromptEngine(baseDir string) *PromptEngine {
 				}
 				return s
 			},
-			"truncate": func(maxLen int, s string) string {
-				if maxLen <= 0 || len(s) <= maxLen {
-					return s
-				}
-				return s[:maxLen] + "...(truncated)"
-			},
+			"truncate": truncateRunes,
 			"join": func(sep string, items []string) string {
 				return strings.Join(items, sep)
 			},
@@ -81,15 +142,38 @@ func NewPromptEngine(baseDir string) *PromptEngine {
 	}
 }
 
-// RenderFile reads a prompt template relative to baseDir and renders it with data.
+// RenderFile reads a server-owned prompt template relative to serverDir and renders it with data.
 func (e *PromptEngine) RenderFile(promptPath string, data PromptData) (string, error) {
-	if err := ensureSafeRelativePath(promptPath); err != nil {
-		return "", err
+	return e.RenderPrompt(promptPath, false, data)
+}
+
+// RenderRepoFile reads a repository-supplied prompt template (under .mochi/ from the base branch)
+// relative to repoDir and renders it with data.
+func (e *PromptEngine) RenderRepoFile(promptPath string, data PromptData) (string, error) {
+	return e.RenderPrompt(promptPath, true, data)
+}
+
+// RenderPrompt reads a prompt template from either serverDir (fromRepo=false) or repoDir (fromRepo=true)
+// using os.Root confinement so symlinks cannot escape the designated root.
+func (e *PromptEngine) RenderPrompt(promptPath string, fromRepo bool, data PromptData) (string, error) {
+	rootDir := e.serverDir
+	if fromRepo {
+		if err := ensureSafeRepoPromptPath(promptPath); err != nil {
+			return "", err
+		}
+		if strings.TrimSpace(e.repoDir) == "" {
+			return "", fmt.Errorf("cannot render repo prompt %q: repo prompt root is not configured", promptPath)
+		}
+		rootDir = e.repoDir
+	} else {
+		if err := ensureSafeRelativePath(promptPath); err != nil {
+			return "", err
+		}
 	}
-	fullPath := filepath.Join(e.baseDir, filepath.FromSlash(promptPath))
-	raw, err := os.ReadFile(fullPath)
+
+	raw, err := readFileInRoot(rootDir, promptPath)
 	if err != nil {
-		return "", fmt.Errorf("read prompt template %q: %w", fullPath, err)
+		return "", err
 	}
 	return e.RenderTemplate(promptPath, string(raw), data)
 }
@@ -113,4 +197,36 @@ func (e *PromptEngine) ValidateTemplate(name, tmplText string) error {
 		return fmt.Errorf("invalid prompt template %q: %w", name, err)
 	}
 	return nil
+}
+
+func readFileInRoot(rootDir, promptPath string) ([]byte, error) {
+	if strings.TrimSpace(rootDir) == "" {
+		return nil, fmt.Errorf("prompt root directory is empty")
+	}
+	root, err := os.OpenRoot(rootDir)
+	if err != nil {
+		return nil, fmt.Errorf("open prompt root %q: %w", rootDir, err)
+	}
+	defer root.Close()
+
+	cleanRel := filepath.ToSlash(filepath.Clean(filepath.FromSlash(promptPath)))
+	raw, err := root.ReadFile(cleanRel)
+	if err != nil {
+		return nil, fmt.Errorf("read prompt template %q in root %q: %w", cleanRel, rootDir, err)
+	}
+	return raw, nil
+}
+
+func truncateRunes(maxRunes int, s string) string {
+	if maxRunes <= 0 || utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	var count int
+	for idx := range s {
+		if count == maxRunes {
+			return s[:idx] + "...(truncated)"
+		}
+		count++
+	}
+	return s
 }

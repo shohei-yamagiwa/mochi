@@ -85,9 +85,9 @@ func (d Duration) MarshalYAML() (any, error) {
 
 // ModelConfig configures an LLM provider, model, and inference options for a role.
 type ModelConfig struct {
-	Provider        string   `yaml:"provider" json:"provider"`                                   // "anthropic", "openai", "gemini", "openai_compat"
-	Model           string   `yaml:"model" json:"model"`                                         // e.g. "claude-sonnet-5-5", "gpt-6.1-sol", "gemini-3.8-flash"
-	BaseURL         string   `yaml:"base_url,omitempty" json:"base_url,omitempty"`               // Optional base URL for openai_compat endpoints
+	Provider        string   `yaml:"provider" json:"provider"`                     // "anthropic", "openai", "gemini", "openai_compat"
+	Model           string   `yaml:"model" json:"model"`                           // e.g. "claude-sonnet-5-5", "gpt-6.1-sol", "gemini-3.8-flash"
+	BaseURL         string   `yaml:"base_url,omitempty" json:"base_url,omitempty"` // Optional base URL for openai_compat endpoints
 	Temperature     *float64 `yaml:"temperature,omitempty" json:"temperature,omitempty"`
 	MaxOutputTokens int      `yaml:"max_output_tokens,omitempty" json:"max_output_tokens,omitempty"`
 	ReasoningEffort string   `yaml:"reasoning_effort,omitempty" json:"reasoning_effort,omitempty"` // "minimal", "low", "medium", "high"
@@ -138,12 +138,13 @@ type SandboxConfig struct {
 
 // RoleConfig defines an individual specialist agent role in a workflow.
 type RoleConfig struct {
-	Role       string             `yaml:"role" json:"role"`
-	PromptFile string             `yaml:"prompt_file" json:"prompt_file"`
-	LLM        ModelConfig        `yaml:"llm" json:"llm"`
-	Sandbox    AgentSandboxConfig `yaml:"sandbox,omitempty" json:"sandbox,omitempty"`
-	Tools      []string           `yaml:"tools" json:"tools"`
-	Budgets    BudgetConfig       `yaml:"budgets,omitempty" json:"budgets,omitempty"`
+	Role           string             `yaml:"role" json:"role"`
+	PromptFile     string             `yaml:"prompt_file" json:"prompt_file"`
+	PromptFromRepo bool               `yaml:"-" json:"prompt_from_repo,omitempty"`
+	LLM            ModelConfig        `yaml:"llm" json:"llm"`
+	Sandbox        AgentSandboxConfig `yaml:"sandbox,omitempty" json:"sandbox,omitempty"`
+	Tools          []string           `yaml:"tools" json:"tools"`
+	Budgets        BudgetConfig       `yaml:"budgets,omitempty" json:"budgets,omitempty"`
 }
 
 // AgentSandboxConfig controls whether a specialist role runs with a sandbox VM.
@@ -161,9 +162,10 @@ type BudgetConfig struct {
 
 // SynthesizerConfig defines the final synthesis agent step.
 type SynthesizerConfig struct {
-	PromptFile string       `yaml:"prompt_file" json:"prompt_file"`
-	LLM        ModelConfig  `yaml:"llm" json:"llm"`
-	Budgets    BudgetConfig `yaml:"budgets,omitempty" json:"budgets,omitempty"`
+	PromptFile     string       `yaml:"prompt_file" json:"prompt_file"`
+	PromptFromRepo bool         `yaml:"-" json:"prompt_from_repo,omitempty"`
+	LLM            ModelConfig  `yaml:"llm" json:"llm"`
+	Budgets        BudgetConfig `yaml:"budgets,omitempty" json:"budgets,omitempty"`
 }
 
 // OutputConfig defines one or more output sinks for delivering the final artifact.

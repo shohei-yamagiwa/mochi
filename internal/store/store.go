@@ -22,8 +22,8 @@ type RunFilter struct {
 
 // AgentRunDetail bundles an AgentRunRecord with its recorded LLM turns and tool executions.
 type AgentRunDetail struct {
-	AgentRun       *domain.AgentRunRecord  `json:"agent_run"`
-	LLMTurns       []*domain.LLMTurnRecord `json:"llm_turns"`
+	AgentRun       *domain.AgentRunRecord   `json:"agent_run"`
+	LLMTurns       []*domain.LLMTurnRecord  `json:"llm_turns"`
 	ToolExecutions []*domain.ToolExecRecord `json:"tool_executions"`
 }
 
