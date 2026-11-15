@@ -509,3 +509,51 @@ func TestGitDiff_ThreeDotExcludesBaseBranchAdvance(t *testing.T) {
 		t.Fatalf("three-dot diff must NOT show base branch advance as reverted, got:\n%s", res.Output)
 	}
 }
+
+func TestReadFile_ClampsTailRangeToEOF(t *testing.T) {
+	reg, err := NewRegistry()
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	ts, err := reg.ScopeForRole([]string{"read_file"})
+	if err != nil {
+		t.Fatalf("ScopeForRole: %v", err)
+	}
+
+	var b strings.Builder
+	for i := 1; i <= 2000; i++ {
+		if i > 1 {
+			b.WriteByte('\n')
+		}
+		b.WriteString("// line padding to trigger 32KB head+tail truncation in read_file")
+	}
+
+	sb := newMockSandbox()
+	sb.files["big.go"] = b.String()
+
+	res, err := ts.Execute(context.Background(), ExecutionContext{
+		AgentRole: "correctness",
+		Sandbox:   sb,
+	}, jsonCall("read_file", `{"path":"big.go","start_line":1,"end_line":99999}`))
+	if err != nil {
+		t.Fatalf("read_file failed: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("read_file exit=%d output=%s", res.ExitCode, res.Output)
+	}
+	if len(res.AccessedFiles) != 2 {
+		t.Fatalf("expected head+tail FileAccessRecords (2), got %+v", res.AccessedFiles)
+	}
+	headRec := res.AccessedFiles[0]
+	tailRec := res.AccessedFiles[1]
+	if headRec.LineRange == nil || headRec.LineRange.StartLine != 1 {
+		t.Fatalf("unexpected head range: %+v", headRec.LineRange)
+	}
+	if tailRec.LineRange == nil || tailRec.LineRange.EndLine != 2000 {
+		t.Fatalf("expected tail EndLine clamped to 2000, got %+v", tailRec.LineRange)
+	}
+	if tailRec.LineRange.StartLine > 1990 || tailRec.LineRange.EndLine < 1995 {
+		t.Fatalf("expected tail range to cover hunk 1990-1995, got %+v", tailRec.LineRange)
+	}
+}
+
