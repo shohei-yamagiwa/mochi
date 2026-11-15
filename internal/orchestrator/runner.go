@@ -204,6 +204,16 @@ func (r *Runner) Execute(ctx context.Context, task *domain.TaskContext, wf *doma
 			} else if bundle.PromptDir != "" {
 				promptEngine = config.NewPromptEngineWithRoots(".", bundle.PromptDir)
 			}
+			for i, s := range startedSinks {
+				if cfgSink, ok := s.(output.ConfigurableSink); ok {
+					for _, sc := range activeWf.Output.Sinks {
+						if strings.TrimSpace(sc.Type) == s.Name() {
+							startedSinks[i] = cfgSink.WithConfig(sc)
+							break
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -1030,6 +1040,9 @@ func (r *Runner) resolveSinks(wf *domain.Workflow) ([]output.OutputSink, error) 
 			if s, ok := r.SinkRegistry.Get(sinkType); ok {
 				if _, dup := seen[s.Name()]; !dup {
 					seen[s.Name()] = struct{}{}
+					if cfgSink, ok := s.(output.ConfigurableSink); ok {
+						s = cfgSink.WithConfig(sc)
+					}
 					resolved = append(resolved, s)
 				}
 				continue

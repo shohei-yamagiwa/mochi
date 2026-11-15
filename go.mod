@@ -4,10 +4,15 @@ go 1.27.3
 
 require (
 	github.com/anthropics/anthropic-sdk-go/v2 v2.9.0
+	github.com/bradleyfalzon/ghinstallation/v2 v2.19.0
 	github.com/daytona/clients/sdk-go v0.231.1
+	github.com/go-chi/chi/v5 v5.5.0
 	github.com/goccy/go-yaml v1.19.2
+	github.com/google/go-github/v93 v93.0.0
 	github.com/google/jsonschema-go v0.4.3
 	github.com/openai/openai-go/v3 v3.99.0
+	github.com/spf13/cobra v1.10.2
+	golang.org/x/sync v0.23.0
 	google.golang.org/genai v1.77.0
 	modernc.org/sqlite v1.59.0
 )
@@ -41,18 +46,23 @@ require (
 	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/golang-jwt/jwt/v4 v4.5.2 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
+	github.com/google/go-github/v88 v88.0.0 // indirect
+	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.11 // indirect
 	github.com/googleapis/gax-go/v2 v2.17.0 // indirect
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.30.0 // indirect
+	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/invopop/jsonschema v0.14.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/pb33f/ordered-map/v2 v2.3.1 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/standard-webhooks/standard-webhooks/libraries v0.0.1 // indirect
 	github.com/tidwall/gjson v1.20.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
@@ -73,7 +83,6 @@ require (
 	go.yaml.in/yaml/v4 v4.0.0-rc.2 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/net v0.60.0 // indirect
-	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260928230214-8a89bd6388cc // indirect
