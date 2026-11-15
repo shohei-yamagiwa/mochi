@@ -518,6 +518,7 @@ func newInspectCmd() *cobra.Command {
 
 func newValidateCmd() *cobra.Command {
 	var baseDir string
+	var runtime bool
 
 	cmd := &cobra.Command{
 		Use:   "validate [workflow_paths...]",
@@ -572,6 +573,11 @@ func newValidateCmd() *cobra.Command {
 				if err := validateRoleTemplates(); err != nil {
 					return err
 				}
+				if runtime {
+					if err := validateRuntimeWorkflow(wf); err != nil {
+						return fmt.Errorf("%s: runtime configuration: %w", wfPath, err)
+					}
+				}
 
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "valid: %s (%s, %d agents, %d sinks)\n",
 					wf.Name, wfPath, len(wf.Agents), len(wf.Output.Sinks))
@@ -581,6 +587,7 @@ func newValidateCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&baseDir, "base-dir", "", "Base directory for resolving prompt_file paths (auto-detected if empty)")
+	cmd.Flags().BoolVar(&runtime, "runtime", false, "Also check server authentication and required provider credentials locally (no external API calls)")
 	return cmd
 }
 

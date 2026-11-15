@@ -1,0 +1,22 @@
+name: CI
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.4'
+          cache: true
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: Build deployment image
+        run: docker build -t mochi:ci .
+      - name: Validate packaged workflows
+        run: docker run --rm mochi:ci validate configs/workflows/pr-review.yaml configs/workflows/pr-review-small.yaml

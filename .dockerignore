@@ -1,0 +1,10 @@
+.git
+.env
+.env.*
+secrets
+*.pem
+*.key
+data
+bin
+*.db*
+coverage.out
