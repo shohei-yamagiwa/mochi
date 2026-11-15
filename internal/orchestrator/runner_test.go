@@ -21,6 +21,7 @@ import (
 type trackingSandboxProvider struct {
 	mu            sync.Mutex
 	createdBase   []*trackingSandbox
+	createdOpts   []sandbox.CreateOptions
 	forkedByName  map[string]*trackingSandbox
 	forkErrByName map[string]error
 	files         map[string]string
@@ -51,6 +52,7 @@ func (p *trackingSandboxProvider) CreateAndPrepareBaseSandbox(_ context.Context,
 		searchMatches: p.searchMatches,
 	}
 	p.createdBase = append(p.createdBase, sb)
+	p.createdOpts = append(p.createdOpts, opts)
 	return sb, nil
 }
 
@@ -869,11 +871,8 @@ func TestRunner_RepoOverridesMerge(t *testing.T) {
 		SandboxProvider:    sbProvider,
 		DefaultLLMProvider: llmProvider,
 		PromptEngine:       config.NewPromptEngine(repoRoot),
-		RepoOverrideLoader: func(_ context.Context, _ *domain.TaskContext, baseSB sandbox.Sandbox, overridePath string) (*RepoOverrideBundle, error) {
+		RepoOverrideLoader: func(_ context.Context, _ *domain.TaskContext, _ sandbox.Sandbox, overridePath string) (*RepoOverrideBundle, error) {
 			overrideCalled = true
-			if baseSB == nil {
-				t.Errorf("expected non-nil baseSandbox in RepoOverrideLoader")
-			}
 			if overridePath != ".mochi/config.yaml" {
 				t.Errorf("overridePath = %q, want .mochi/config.yaml", overridePath)
 			}
@@ -931,6 +930,82 @@ agents:
 		t.Fatalf("expected persisted resolved_config_yaml to reflect merged override (without performance-architecture), got:\n%s", persistedRun.ResolvedConfigYAML)
 	}
 	_ = tools.AgentFinding{}
+}
+
+func TestRunner_RepoOverridesSandboxAppliesToBaseSandbox(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer st.Close()
+
+	repoRoot := filepath.Join("..", "..")
+	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, "configs", "workflows", "pr-review.yaml"), repoRoot)
+	if err != nil {
+		t.Fatalf("LoadWorkflowFile: %v", err)
+	}
+	wf.RepoOverrides.AllowCustomImages = true
+
+	sbProvider := newTrackingSandboxProvider(nil)
+	llmProvider := newRoutingLLMProvider("mock", func(_ context.Context, role string, _ int, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+		if role == "synthesizer" {
+			return &llm.ChatResponse{
+				Message: llm.Message{
+					Role:    llm.RoleAssistant,
+					Content: `{"summary":"All clear","verdict":"APPROVE","findings":[]}`,
+				},
+			}, nil
+		}
+		tc := llm.ToolCall{
+			ID:        "tc_submit_" + role,
+			Name:      "submit_output",
+			Arguments: json.RawMessage(`{"summary":"ok","findings":[]}`),
+		}
+		return &llm.ChatResponse{
+			Message:   llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{tc}},
+			ToolCalls: []llm.ToolCall{tc},
+		}, nil
+	})
+
+	runner := &Runner{
+		Store:              st,
+		SandboxProvider:    sbProvider,
+		DefaultLLMProvider: llmProvider,
+		PromptEngine:       config.NewPromptEngine(repoRoot),
+		RepoOverrideLoader: func(_ context.Context, _ *domain.TaskContext, _ sandbox.Sandbox, _ string) (*RepoOverrideBundle, error) {
+			return &RepoOverrideBundle{
+				ConfigYAML: []byte(`
+sandbox:
+  default_snapshot: "acme-rust-toolchain"
+`),
+			}, nil
+		},
+	}
+
+	task := &domain.TaskContext{
+		RunID:        "run-override-sandbox",
+		WorkflowName: wf.Name,
+		TriggerType:  "cli",
+		DedupKey:     "repo:pr:4",
+		Changeset: &domain.ChangesetSpec{
+			RepoOwner: "shohei-yamagiwa",
+			RepoName:  "mochi",
+			PRNumber:  4,
+			BaseSHA:   "1111111",
+			HeadSHA:   "2222222",
+		},
+	}
+
+	if _, err := runner.Execute(ctx, task, wf); err != nil {
+		t.Fatalf("Runner.Execute: %v", err)
+	}
+	if len(sbProvider.createdOpts) != 1 {
+		t.Fatalf("createdBase count = %d, want 1", len(sbProvider.createdOpts))
+	}
+	if sbProvider.createdOpts[0].Workspace.Snapshot != "acme-rust-toolchain" {
+		t.Fatalf("base sandbox Snapshot = %q, want %q", sbProvider.createdOpts[0].Workspace.Snapshot, "acme-rust-toolchain")
+	}
 }
 
 func TestRunner_SingleSpecialistForkFailureContinuesWithFailFastFalse(t *testing.T) {

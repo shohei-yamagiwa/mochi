@@ -146,38 +146,13 @@ func (r *Runner) Execute(ctx context.Context, task *domain.TaskContext, wf *doma
 		}
 	}
 
-	var baseSandbox sandbox.Sandbox
-	var destroyBaseOnce sync.Once
-	destroyBase := func() {
-		destroyBaseOnce.Do(func() {
-			if baseSandbox != nil {
-				_ = baseSandbox.Destroy(context.WithoutCancel(ctx))
-			}
-		})
-	}
-	defer destroyBase()
-
-	if r.needsBaseSandbox(activeWf) {
-		if r.SandboxProvider == nil {
-			err := fmt.Errorf("runner: sandbox provider is required when agent sandboxes are enabled")
-			r.markRunFailedOrCancelled(ctx, task, runRec, startedSinks, err)
-			return nil, err
-		}
-		sb, err := r.createSandbox(ctx, fmt.Sprintf("mochi-%s-base", task.RunID), task.Workspace, activeWf.Sandbox)
-		if err != nil {
-			r.markRunFailedOrCancelled(ctx, task, runRec, startedSinks, err)
-			return nil, fmt.Errorf("prepare base sandbox: %w", err)
-		}
-		baseSandbox = sb
-	}
-
 	promptEngine := r.PromptEngine
 	if activeWf.RepoOverrides.Enabled && r.RepoOverrideLoader != nil {
 		overridePath := strings.TrimSpace(activeWf.RepoOverrides.Path)
 		if overridePath == "" {
 			overridePath = ".mochi/config.yaml"
 		}
-		bundle, err := r.RepoOverrideLoader(ctx, task, baseSandbox, overridePath)
+		bundle, err := r.RepoOverrideLoader(ctx, task, nil, overridePath)
 		if err != nil {
 			r.markRunFailedOrCancelled(ctx, task, runRec, startedSinks, err)
 			return nil, fmt.Errorf("load repo overrides: %w", err)
@@ -217,6 +192,31 @@ func (r *Runner) Execute(ctx context.Context, task *domain.TaskContext, wf *doma
 				}
 			}
 		}
+	}
+
+	var baseSandbox sandbox.Sandbox
+	var destroyBaseOnce sync.Once
+	destroyBase := func() {
+		destroyBaseOnce.Do(func() {
+			if baseSandbox != nil {
+				_ = baseSandbox.Destroy(context.WithoutCancel(ctx))
+			}
+		})
+	}
+	defer destroyBase()
+
+	if r.needsBaseSandbox(activeWf) {
+		if r.SandboxProvider == nil {
+			err := fmt.Errorf("runner: sandbox provider is required when agent sandboxes are enabled")
+			r.markRunFailedOrCancelled(ctx, task, runRec, startedSinks, err)
+			return nil, err
+		}
+		sb, err := r.createSandbox(ctx, fmt.Sprintf("mochi-%s-base", task.RunID), task.Workspace, activeWf.Sandbox)
+		if err != nil {
+			r.markRunFailedOrCancelled(ctx, task, runRec, startedSinks, err)
+			return nil, fmt.Errorf("prepare base sandbox: %w", err)
+		}
+		baseSandbox = sb
 	}
 
 	specialistSlice := make([]*SpecialistResult, len(activeWf.Agents))

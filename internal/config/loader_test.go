@@ -159,11 +159,21 @@ agents:
 		}
 	})
 
-	t.Run("clamps unset budgets and persists prompt_from_repo", func(t *testing.T) {
+	t.Run("rejects input.triggers override because webhooks run before repo override load", func(t *testing.T) {
 		override := []byte(`
 input:
   triggers:
     events: ["opened"]
+    comment_command: "/review"
+`)
+		_, err := config.MergeRepoOverrides(wf, override)
+		if !errors.Is(err, config.ErrDisallowedOverrideField) {
+			t.Fatalf("expected ErrDisallowedOverrideField for input.triggers, got %v", err)
+		}
+	})
+
+	t.Run("clamps unset budgets and persists prompt_from_repo", func(t *testing.T) {
+		override := []byte(`
 agents:
   - role: correctness
     prompt_file: ".mochi/prompts/correctness.md"
@@ -193,7 +203,7 @@ output:
 			t.Fatalf("MergeRepoOverrides failed: %v", err)
 		}
 		if !merged.Input.Triggers.IgnoreDrafts {
-			t.Fatal("expected ignore_drafts=true to be preserved when unset in override")
+			t.Fatal("expected ignore_drafts=true to be preserved")
 		}
 		if len(merged.Agents) != 3 {
 			t.Fatalf("expected 3 agents after disabling performance-architecture, got %d", len(merged.Agents))

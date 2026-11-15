@@ -277,15 +277,7 @@ func MergeRepoOverrides(base *domain.Workflow, overrideYAML []byte) (*domain.Wor
 	}
 
 	if ov.Input != nil && ov.Input.Triggers != nil {
-		if len(ov.Input.Triggers.Events) > 0 {
-			cloned.Input.Triggers.Events = slices.Clone(ov.Input.Triggers.Events)
-		}
-		if ov.Input.Triggers.CommentCommand != "" {
-			cloned.Input.Triggers.CommentCommand = ov.Input.Triggers.CommentCommand
-		}
-		if ov.Input.Triggers.IgnoreDrafts != nil {
-			cloned.Input.Triggers.IgnoreDrafts = *ov.Input.Triggers.IgnoreDrafts
-		}
+		return nil, fmt.Errorf("input.triggers: %w (webhook triggers are evaluated before repository overrides are loaded)", ErrDisallowedOverrideField)
 	}
 
 	if len(ov.Agents) > 0 {
