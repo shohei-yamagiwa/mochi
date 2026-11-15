@@ -17,7 +17,9 @@ repo_overrides:
 sandbox:
   provider: daytona
   default_snapshot: mochi-review
-  fork_from_base: true
+  # Dockerfile-built container snapshots do not support Daytona fork.
+  # A single specialist needs only its own sandbox, without a shared base.
+  fork_from_base: false
   setup_timeout: 3m
 agents:
   - role: correctness

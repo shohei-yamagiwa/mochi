@@ -1085,6 +1085,55 @@ func TestRunner_SingleSpecialistForkFailureContinuesWithFailFastFalse(t *testing
 	}
 }
 
+func TestRunner_SmallPresetRunsOnSandboxWithoutForkSupport(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	repoRoot := filepath.Join("..", "..")
+	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, "configs", "workflows", "pr-review-small.yaml"), repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sbProvider := newTrackingSandboxProvider(nil)
+	// Any fork request reproduces the real container sandbox's rejection.
+	sbProvider.forkErrByName[""] = errors.New("Daytona error (status 422): Forking is not supported for this sandbox")
+	provider := newRoutingLLMProvider("mock", func(_ context.Context, role string, _ int, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+		if role == "synthesizer" {
+			return &llm.ChatResponse{Message: llm.Message{
+				Role: llm.RoleAssistant, Content: `{"summary":"Review completed","verdict":"COMMENT","findings":[]}`,
+			}}, nil
+		}
+		call := llm.ToolCall{ID: "small-submit", Name: "submit_output", Arguments: json.RawMessage(`{"summary":"Review completed","findings":[]}`)}
+		return &llm.ChatResponse{Message: llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{call}}, ToolCalls: []llm.ToolCall{call}}, nil
+	})
+	runner := &Runner{Store: st, SandboxProvider: sbProvider, DefaultLLMProvider: provider, PromptEngine: config.NewPromptEngine(repoRoot)}
+	task := &domain.TaskContext{
+		RunID: "run-container-no-fork", WorkflowName: wf.Name, TriggerType: "github_pr",
+		Workspace: domain.WorkspaceSpec{RepoURL: "https://github.com/example/repo", Ref: "head-sha"},
+		Changeset: &domain.ChangesetSpec{RepoOwner: "example", RepoName: "repo", PRNumber: 1, BaseSHA: "base-sha", HeadSHA: "head-sha"},
+	}
+	result, err := runner.Execute(ctx, task, wf)
+	if err != nil {
+		t.Fatalf("review on sandbox without fork support: %v", err)
+	}
+	if result.Run.Status != domain.RunStatusCompleted || len(result.Report.FailedAgents) != 0 {
+		t.Fatalf("review did not complete successfully: status=%s failed_agents=%v", result.Run.Status, result.Report.FailedAgents)
+	}
+	if len(sbProvider.createdBase) != 1 || len(sbProvider.forkedByName) != 0 {
+		t.Fatalf("expected one directly created sandbox, got created=%d forked=%d", len(sbProvider.createdBase), len(sbProvider.forkedByName))
+	}
+	created := sbProvider.createdBase[0]
+	if !strings.HasSuffix(created.name, "-correctness") || created.destroyed != 1 {
+		t.Fatalf("specialist sandbox not created/cleaned up as expected: name=%q destroyed=%d", created.name, created.destroyed)
+	}
+	if opts := sbProvider.createdOpts[0]; opts.Workspace.Snapshot != "mochi-review" || opts.Workspace.Ref != "head-sha" {
+		t.Fatalf("configured snapshot or target commit lost: %+v", opts.Workspace)
+	}
+}
+
 func TestRunner_CleansUpRepoOverridePromptDir(t *testing.T) {
 	ctx := context.Background()
 	st, err := sqlite.Open(ctx, ":memory:")
@@ -1192,4 +1241,3 @@ agents:
 		t.Fatalf("expected %q to be removed on merge error, stat err=%v", errDir, statErr)
 	}
 }
-
