@@ -30,7 +30,8 @@ Webhook の応答後に非同期レビューを続け、SQLite とメモリー�
 同梱の `configs/workflows/pr-review-small.yaml` は、既存の correctness プロンプトを
 使う専門エージェント 1 つと synthesizer に絞る。4 専門分野のフルレビューではない。
 Gemini のキーだけで LLM を設定でき、サーバーの同時実行数は 1、待ち行列は 16。
-Daytona では通常、ベースと専門エージェント用の計 2 サンドボックスが必要になる。
+Daytona は専門エージェント用の 1 サンドボックスを直接作成する。
+小規模プリセットでは `fork_from_base: false` とし、ベースと fork の 2 台構成を避ける。
 監査データや PR の大きさによって 512 MB RAM が不足する場合はプランを上げる。
 
 GitHub App は **Pull request と Issue comment の両方**を購読する。
@@ -87,6 +88,12 @@ Daytona のアカウントと API キーを作成する。`deploy/sandbox/Docker
 Daytona の Snapshot 作成画面または CLI で **`mochi-review`** という Snapshot を作る。
 対象サーバーと近いリージョン/target を選び、Snapshot が利用可能な状態になるまで待つ。
 名称を変える場合は small プリセットの `sandbox.default_snapshot` も変更する。
+
+Dockerfile から作る通常のコンテナ型 Snapshot は fork に対応しないため、
+小規模プリセットでは fork を使わない。[Daytona の fork の仕様](https://www.daytona.io/docs/en/sandboxes.md#fork-sandboxes)
+では VM 型 Sandbox が必要となる。フルプリセットなどで `fork_from_base: true` を使う場合は、
+fork 対応の Linux VM Snapshot を用意する。コンテナ型のままなら `false` にして
+エージェントごとに直接作成する。
 
 この Snapshot には git、bash、ripgrep、CA 証明書を含む。対象プロジェクトのテストを
 実行するには、その言語ランタイムやビルドツールも Dockerfile に追加して Snapshot を更新する。
