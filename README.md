@@ -1,48 +1,59 @@
 # mochi
-Mochi is a workflow-agnostic agent orchestration server.
 
-Mochi reviews GitHub pull requests with LLM agents running tools in isolated
-Daytona sandboxes, and stores runs, traces, and diff coverage in SQLite.
+Mochi is a Go server and CLI for agent workflows. Its bundled workflows review
+GitHub pull requests with LLM agents, execute tools in isolated Daytona
+sandboxes, and store reports, execution traces, and diff coverage in SQLite.
 
-## Deploy as a GitHub App
+## Get started
 
-See **[デプロイ手順とホスティング比較](docs/deployment.md)** for GitHub App permissions,
-secrets, Daytona snapshot setup, Render deployment, verification, and recovery.
-
-- [Dockerfile](Dockerfile) and [Compose](compose.yaml) package the existing Go application.
-- [Render Blueprint](render.yaml) runs one paid instance with a persistent disk.
-- [Full preset](configs/workflows/pr-review.yaml), the deployment default: four Gemini
-  specialists (correctness, security, performance/architecture, and tests) plus one
-  Gemini synthesizer. Each specialist directly creates its own Daytona container
-  sandbox from `mochi-review-go`; the synthesizer needs no sandbox.
-- [Small preset](configs/workflows/pr-review-small.yaml): one specialist + synthesizer,
-  Gemini only, using the existing `mochi-review` snapshot. Keep it for rollback.
-- Both presets support automatic reviews. Subscribe to `pull_request` and
-  `issue_comment` events for automatic reviews when a non-draft PR is opened,
-  updated, reopened, or marked ready. Owners/members/collaborators can also
-  invoke `/mochi review` to rerun a review.
-- One workflow runs at a time; the full preset can use four sandboxes concurrently.
-  See the [migration runbook](docs/multi-agent-rollout.md) before changing an existing
-  deployment. Both presets use the existing `GEMINI_API_KEY`.
+Follow the [deployment guide](docs/deployment.md) to configure a GitHub App,
+API credentials, and a Daytona snapshot. Then start the server with Docker Compose:
 
 ```sh
 cp .env.example .env
 chmod 600 .env
-# Fill .env and create the Daytona snapshot as described in the deployment guide.
+# Replace the placeholders in .env before continuing.
 docker compose build
 docker compose run --rm mochi validate --runtime configs/workflows/pr-review.yaml
 docker compose up -d
 curl --fail http://localhost:8080/readyz
 ```
 
-For local development with Go 1.27.3 or later:
+Compose exposes port 8080 on localhost. GitHub webhooks need a public HTTPS
+endpoint; the guide also covers the supplied [Render Blueprint](render.yaml).
+
+For CLI use, install the Go version required by [go.mod](go.mod) or later, then
+build from the repository root:
 
 ```sh
-go test ./...
-go run ./cmd/mochi validate configs/workflows/pr-review.yaml configs/workflows/pr-review-small.yaml
+go build -o mochi ./cmd/mochi
+./mochi validate configs/workflows/pr-review.yaml configs/workflows/pr-review-small.yaml
+./mochi run --repo . --base HEAD~1 --head HEAD --dry-run
 ```
 
-`validate --runtime` checks local credentials/configuration without making external
-API calls. Remote API access, model availability, and a real PR review still need
-verification after deployment. The [architecture document](docs/architecture.md)
-describes the broader system design.
+Validation and local dry runs need no LLM or Daytona credentials. Actual reviews
+require provider credentials and a prepared snapshot; see [usage](docs/usage.md).
+
+## Review workflows
+
+| Preset | Specialists | Daytona snapshot |
+| --- | --- | --- |
+| [Full](configs/workflows/pr-review.yaml), the default | Correctness, security, performance/architecture, and tests | `mochi-review-go` |
+| [Small](configs/workflows/pr-review-small.yaml) | Correctness | `mochi-review` |
+
+Both presets use Gemini and a final synthesizer that combines specialist results.
+Each specialist creates its own sandbox; the synthesizer uses no sandbox.
+The container runs one workflow at a time, with specialists running in parallel.
+
+With the GitHub App installed and subscribed to `pull_request` and `issue_comment`,
+both presets review open, non-draft PRs when opened, updated, reopened, or marked
+ready. Owners, members, and collaborators can rerun a review with `/mochi review`.
+The presets publish comments and Check Runs without enforcing the review verdict.
+
+## Documentation
+
+- [Usage](docs/usage.md): CLI commands, HTTP endpoints, and review results.
+- [Configuration](docs/configuration.md): workflows, providers, prompts, and repository overrides.
+- [Deployment and operations](docs/deployment.md): GitHub App setup, snapshots, hosting, and backups.
+- [Contributing](CONTRIBUTING.md): development setup, checks, and pull requests.
+- [Architecture](docs/architecture.md): execution flow, package responsibilities, and extension points.
