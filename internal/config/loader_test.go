@@ -159,11 +159,21 @@ agents:
 		}
 	})
 
-	t.Run("clamps unset budgets and persists prompt_from_repo", func(t *testing.T) {
+	t.Run("rejects input.triggers override because webhooks run before repo override load", func(t *testing.T) {
 		override := []byte(`
 input:
   triggers:
     events: ["opened"]
+    comment_command: "/review"
+`)
+		_, err := config.MergeRepoOverrides(wf, override)
+		if !errors.Is(err, config.ErrDisallowedOverrideField) {
+			t.Fatalf("expected ErrDisallowedOverrideField for input.triggers, got %v", err)
+		}
+	})
+
+	t.Run("clamps unset budgets and persists prompt_from_repo", func(t *testing.T) {
+		override := []byte(`
 agents:
   - role: correctness
     prompt_file: ".mochi/prompts/correctness.md"
@@ -193,7 +203,7 @@ output:
 			t.Fatalf("MergeRepoOverrides failed: %v", err)
 		}
 		if !merged.Input.Triggers.IgnoreDrafts {
-			t.Fatal("expected ignore_drafts=true to be preserved when unset in override")
+			t.Fatal("expected ignore_drafts=true to be preserved")
 		}
 		if len(merged.Agents) != 3 {
 			t.Fatalf("expected 3 agents after disabling performance-architecture, got %d", len(merged.Agents))
@@ -369,4 +379,67 @@ func TestPromptEngineSecurityAndRendering(t *testing.T) {
 	if _, err := engine.RenderTemplate("strict", "hello {{ .MissingField }}", config.NewPromptData(task, wf, nil)); err == nil {
 		t.Fatal("expected error for missing template field")
 	}
+
+	// Operator sink secrets (URL and Options) must not be readable from PromptData.Workflow.
+	wfWithSecrets := *wf
+	wfWithSecrets.Output.Sinks = []domain.SinkConfig{
+		{
+			Type: "webhook",
+			URL:  "https://hooks.internal.example/secret-token-123",
+			Options: map[string]any{
+				"secret":       "hmac-signing-secret-xyz",
+				"bearer_token": "tok-operator-999",
+			},
+		},
+	}
+	secretData := config.NewPromptData(task, &wfWithSecrets, nil)
+	if _, err := engine.RenderTemplate("sink_url", "{{ (index .Workflow.Output.Sinks 0).URL }}", secretData); err == nil {
+		t.Fatal("expected error accessing sink URL from PromptData.Workflow")
+	}
+	if _, err := engine.RenderTemplate("sink_opts", "{{ (index .Workflow.Output.Sinks 0).Options }}", secretData); err == nil {
+		t.Fatal("expected error accessing sink Options from PromptData.Workflow")
+	}
+	outJSON, err := engine.RenderTemplate("sink_json", "{{ toJSON .Workflow }}", secretData)
+	if err != nil {
+		t.Fatalf("toJSON .Workflow failed: %v", err)
+	}
+	for _, secret := range []string{"secret-token-123", "hmac-signing-secret-xyz", "tok-operator-999"} {
+		if strings.Contains(outJSON, secret) {
+			t.Fatalf("sink secret %q leaked via toJSON .Workflow:\n%s", secret, outJSON)
+		}
+	}
 }
+
+func TestReasoningEffortValidation(t *testing.T) {
+	root := repoRoot(t)
+	wf, err := config.LoadWorkflowFile(filepath.Join(root, "configs", "workflows", "pr-review.yaml"), root)
+	if err != nil {
+		t.Fatalf("LoadWorkflowFile: %v", err)
+	}
+
+	for _, valid := range []string{"minimal", "low", "medium", "high", "xhigh", "max"} {
+		override := []byte("agents:\n  - role: correctness\n    llm:\n      reasoning_effort: " + valid + "\n")
+		merged, err := config.MergeRepoOverrides(wf, override)
+		if err != nil {
+			t.Fatalf("expected reasoning_effort %q to be valid, got error: %v", valid, err)
+		}
+		if merged.Agents[0].LLM.ReasoningEffort != valid {
+			t.Fatalf("got ReasoningEffort = %q, want %q", merged.Agents[0].LLM.ReasoningEffort, valid)
+		}
+		resolvedYAML, err := config.MarshalWorkflowYAML(merged)
+		if err != nil {
+			t.Fatalf("MarshalWorkflowYAML(%q): %v", valid, err)
+		}
+		if _, err := config.ParseWorkflow([]byte(resolvedYAML)); err != nil {
+			t.Fatalf("ParseWorkflow(%q): %v", valid, err)
+		}
+	}
+
+	for _, invalid := range []string{"none", "ultra"} {
+		override := []byte("agents:\n  - role: correctness\n    llm:\n      reasoning_effort: " + invalid + "\n")
+		if _, err := config.MergeRepoOverrides(wf, override); err == nil {
+			t.Fatalf("expected reasoning_effort %q to be rejected by MergeRepoOverrides", invalid)
+		}
+	}
+}
+

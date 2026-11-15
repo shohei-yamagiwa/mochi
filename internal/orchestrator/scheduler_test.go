@@ -11,6 +11,7 @@ import (
 
 	"github.com/shohei-yamagiwa/mochi/internal/domain"
 	"github.com/shohei-yamagiwa/mochi/internal/llm"
+	"github.com/shohei-yamagiwa/mochi/internal/store"
 	"github.com/shohei-yamagiwa/mochi/internal/store/sqlite"
 )
 
@@ -624,5 +625,77 @@ func TestScheduler_BoundedCompletedJobsEvictionAndStoreFallback(t *testing.T) {
 	}
 	if fallbackRes.Run.Status != domain.RunStatusCompleted {
 		t.Fatalf("fallbackRes.Run.Status = %q, want completed", fallbackRes.Run.Status)
+	}
+}
+
+func TestScheduler_OlderSequenceDoesNotSupersedeCompletedOrActiveRun(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer st.Close()
+
+	provider := &concurrentFakeProvider{
+		name: "mock",
+		fn: func(_ context.Context, _ int, req llm.ChatRequest) (*llm.ChatResponse, error) {
+			if req.ResponseSchema != nil {
+				return &llm.ChatResponse{
+					Message: llm.Message{
+						Role:    llm.RoleAssistant,
+						Content: `{"summary":"OK","verdict":"APPROVE","findings":[]}`,
+					},
+				}, nil
+			}
+			tc := llm.ToolCall{
+				ID:        "tc_submit",
+				Name:      "submit_output",
+				Arguments: json.RawMessage(`{"summary":"OK","findings":[]}`),
+			}
+			return &llm.ChatResponse{
+				Message:   llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{tc}},
+				ToolCalls: []llm.ToolCall{tc},
+			}, nil
+		},
+	}
+
+	sched := NewScheduler(&Runner{Store: st, DefaultLLMProvider: provider}, SchedulerConfig{MaxWorkers: 2, QueueSize: 8})
+	defer func() { _ = sched.Shutdown(ctx) }()
+	wf := minimalSchedulerWorkflow()
+
+	const dedupKey = "github:shohei-yamagiwa/mochi:pr:88"
+
+	// Newer push arrives and finishes first (sequence 2).
+	newerTask := &domain.TaskContext{
+		RunID:         "run-seq-2",
+		WorkflowName:  wf.Name,
+		TriggerType:   "github_webhook",
+		DedupKey:      dedupKey,
+		DedupSequence: 2,
+	}
+	if _, err := sched.Enqueue(ctx, newerTask, wf); err != nil {
+		t.Fatalf("Enqueue(newerTask): %v", err)
+	}
+	res2, err := sched.WaitForRun(ctx, newerTask.RunID)
+	if err != nil {
+		t.Fatalf("WaitForRun(newerTask): %v", err)
+	}
+	if res2.Run.Status != domain.RunStatusCompleted {
+		t.Fatalf("newerTask status = %q, want completed", res2.Run.Status)
+	}
+
+	// Older push finishes hydrating later (sequence 1) after newerTask has already completed.
+	olderTask := &domain.TaskContext{
+		RunID:         "run-seq-1",
+		WorkflowName:  wf.Name,
+		TriggerType:   "github_webhook",
+		DedupKey:      dedupKey,
+		DedupSequence: 1,
+	}
+	if _, err := sched.Enqueue(ctx, olderTask, wf); !errors.Is(err, ErrRunSuperseded) {
+		t.Fatalf("Enqueue(olderTask) err = %v, want ErrRunSuperseded", err)
+	}
+	if _, err := st.GetRun(ctx, olderTask.RunID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("stale olderTask should not overwrite/create run record, got err=%v", err)
 	}
 }

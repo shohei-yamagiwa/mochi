@@ -200,3 +200,52 @@ func TestAnthropicProvider_AdaptiveThinkingAndMultiToolBatch(t *testing.T) {
 		t.Fatalf("expected 2 merged tool_result blocks, got %d", len(toolBlocks))
 	}
 }
+
+func TestAnthropic_ReasoningEffortMapping(t *testing.T) {
+	var efforts []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		effort := ""
+		if oc, ok := body["output_config"].(map[string]any); ok {
+			effort, _ = oc["effort"].(string)
+		}
+		efforts = append(efforts, effort)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"m1","type":"message","role":"assistant","model":"claude-opus-5-5","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	p, err := NewProvider(WithAPIKey("test-key"), WithBaseURL(srv.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"minimal", "low"},
+		{"low", "low"},
+		{"medium", "medium"},
+		{"high", "high"},
+		{"xhigh", "xhigh"},
+		{"max", "max"},
+		{"none", ""},
+	}
+	for _, tc := range cases {
+		if _, err := p.Generate(context.Background(), llm.ChatRequest{
+			Config:   llm.ModelConfig{Provider: "anthropic", Model: "claude-opus-5-5", ReasoningEffort: tc.in},
+			Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
+		}); err != nil {
+			t.Fatalf("Generate(%q): %v", tc.in, err)
+		}
+	}
+
+	for i, tc := range cases {
+		if efforts[i] != tc.want {
+			t.Fatalf("reasoning_effort %q mapped to %q, want %q", tc.in, efforts[i], tc.want)
+		}
+	}
+}
+

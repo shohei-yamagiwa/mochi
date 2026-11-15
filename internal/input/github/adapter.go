@@ -33,7 +33,8 @@ var (
 	// ErrInvalidSignature is returned when X-Hub-Signature-256 fails constant-time HMAC verification.
 	ErrInvalidSignature = errors.New("invalid github webhook signature")
 
-	defaultPREvents = []string{"opened", "synchronize", "reopened", "ready_for_review"}
+	defaultPREvents            = []string{"opened", "synchronize", "reopened", "ready_for_review"}
+	defaultCommentAssociations = []string{"OWNER", "MEMBER", "COLLABORATOR"}
 )
 
 // WebhookEvent represents a raw HTTP webhook delivery received from GitHub.
@@ -108,9 +109,10 @@ func NewAdapter(clients ClientFactory, opts ...Option) (*Adapter, error) {
 	a := &Adapter{
 		clients: clients,
 		defaultTriggers: domain.TriggerConfig{
-			Events:         slices.Clone(defaultPREvents),
-			CommentCommand: defaultCommentCommand,
-			IgnoreDrafts:   true,
+			Events:                     slices.Clone(defaultPREvents),
+			CommentCommand:             defaultCommentCommand,
+			AllowedCommentAssociations: slices.Clone(defaultCommentAssociations),
+			IgnoreDrafts:               true,
 		},
 		workflowName: "pr-review",
 	}
@@ -182,6 +184,9 @@ func (a *Adapter) ParseWebhookEvent(eventType string, payload []byte, overrideTr
 		if triggers.IgnoreDrafts && pr.GetDraft() {
 			return nil, fmt.Errorf("%w: pull_request #%d is a draft", ErrIgnoredEvent, pr.GetNumber())
 		}
+		if state := strings.TrimSpace(pr.GetState()); state != "" && !strings.EqualFold(state, "open") && action != "closed" {
+			return nil, fmt.Errorf("%w: pull_request #%d state is %q", ErrIgnoredEvent, pr.GetNumber(), state)
+		}
 		owner, repo := extractRepoOwnerName(ev.GetRepo())
 		if owner == "" || repo == "" {
 			return nil, fmt.Errorf("pull_request webhook missing repository owner/name")
@@ -206,12 +211,19 @@ func (a *Adapter) ParseWebhookEvent(eventType string, payload []byte, overrideTr
 		if issue == nil || !issue.IsPullRequest() {
 			return nil, fmt.Errorf("%w: issue_comment is not on a pull request", ErrIgnoredEvent)
 		}
+		if state := strings.TrimSpace(issue.GetState()); state != "" && !strings.EqualFold(state, "open") {
+			return nil, fmt.Errorf("%w: issue_comment on non-open pull request #%d (state=%q)", ErrIgnoredEvent, issue.GetNumber(), state)
+		}
 		cmd := strings.TrimSpace(triggers.CommentCommand)
 		if cmd == "" {
 			return nil, fmt.Errorf("%w: comment_command trigger is disabled", ErrIgnoredEvent)
 		}
 		if !matchesCommentCommand(ev.GetComment().GetBody(), cmd) {
 			return nil, fmt.Errorf("%w: comment does not invoke %q", ErrIgnoredEvent, cmd)
+		}
+		assoc := strings.TrimSpace(ev.GetComment().GetAuthorAssociation())
+		if !isAllowedCommentAssociation(assoc, triggers.AllowedCommentAssociations) {
+			return nil, fmt.Errorf("%w: comment author_association %q is not permitted", ErrIgnoredEvent, assoc)
 		}
 		owner, repo := extractRepoOwnerName(ev.GetRepo())
 		if owner == "" || repo == "" {
@@ -251,6 +263,7 @@ func (a *Adapter) BuildTaskContext(ctx context.Context, rawEvent any) (*domain.T
 		if ev.WorkflowName != "" {
 			parsed.WorkflowName = ev.WorkflowName
 		}
+		parsed.Triggers = ev.Triggers
 		target = parsed
 	case WebhookEvent:
 		return a.BuildTaskContext(ctx, &ev)
@@ -281,7 +294,13 @@ func (a *Adapter) BuildTaskContext(ctx context.Context, rawEvent any) (*domain.T
 		return nil, fmt.Errorf("get pull request %s/%s#%d: %w", target.Owner, target.Repo, target.PRNumber, err)
 	}
 
-	if target.Triggers != nil && target.Triggers.IgnoreDrafts && pr.GetDraft() {
+	triggers := a.effectiveTriggers(target.Triggers)
+	if target.TriggerEvent != "pull_request.closed" {
+		if (pr.GetState() != "" && !strings.EqualFold(pr.GetState(), "open")) || pr.GetMerged() {
+			return nil, fmt.Errorf("%w: pull_request #%d is closed/merged (state=%q merged=%v)", ErrIgnoredEvent, target.PRNumber, pr.GetState(), pr.GetMerged())
+		}
+	}
+	if triggers.IgnoreDrafts && pr.GetDraft() {
 		return nil, fmt.Errorf("%w: pull_request #%d is a draft", ErrIgnoredEvent, target.PRNumber)
 	}
 
@@ -363,6 +382,11 @@ func (a *Adapter) BuildTaskContext(ctx context.Context, rawEvent any) (*domain.T
 
 	dedupKey := fmt.Sprintf("github:%s/%s:pr:%d", target.Owner, target.Repo, target.PRNumber)
 
+	var fetchRefs []string
+	if target.PRNumber > 0 {
+		fetchRefs = append(fetchRefs, fmt.Sprintf("refs/pull/%d/head", target.PRNumber))
+	}
+
 	return &domain.TaskContext{
 		WorkflowName: wfName,
 		TriggerType:  adapterName,
@@ -371,6 +395,9 @@ func (a *Adapter) BuildTaskContext(ctx context.Context, rawEvent any) (*domain.T
 			RepoURL:    repoURL,
 			Ref:        headSHA,
 			BaseRef:    baseSHA,
+			BaseBranch: baseBranch,
+			HeadBranch: headBranch,
+			FetchRefs:  fetchRefs,
 			CloneToken: cloneToken,
 		},
 		Changeset: &domain.ChangesetSpec{
@@ -545,9 +572,31 @@ func (a *Adapter) effectiveTriggers(override *domain.TriggerConfig) domain.Trigg
 		if override.CommentCommand != "" {
 			t.CommentCommand = override.CommentCommand
 		}
+		if len(override.AllowedCommentAssociations) > 0 {
+			t.AllowedCommentAssociations = override.AllowedCommentAssociations
+		}
 		t.IgnoreDrafts = override.IgnoreDrafts
 	}
+	if len(t.AllowedCommentAssociations) == 0 {
+		t.AllowedCommentAssociations = defaultCommentAssociations
+	}
 	return t
+}
+
+func isAllowedCommentAssociation(assoc string, allowed []string) bool {
+	if len(allowed) == 0 {
+		allowed = defaultCommentAssociations
+	}
+	norm := strings.ToUpper(strings.TrimSpace(assoc))
+	if norm == "" {
+		return false
+	}
+	for _, a := range allowed {
+		if strings.EqualFold(strings.TrimSpace(a), norm) {
+			return true
+		}
+	}
+	return false
 }
 
 func listAllPRFiles(ctx context.Context, client *github.Client, owner, repo string, prNum int) ([]*github.CommitFile, error) {

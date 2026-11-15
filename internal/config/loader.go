@@ -277,15 +277,7 @@ func MergeRepoOverrides(base *domain.Workflow, overrideYAML []byte) (*domain.Wor
 	}
 
 	if ov.Input != nil && ov.Input.Triggers != nil {
-		if len(ov.Input.Triggers.Events) > 0 {
-			cloned.Input.Triggers.Events = slices.Clone(ov.Input.Triggers.Events)
-		}
-		if ov.Input.Triggers.CommentCommand != "" {
-			cloned.Input.Triggers.CommentCommand = ov.Input.Triggers.CommentCommand
-		}
-		if ov.Input.Triggers.IgnoreDrafts != nil {
-			cloned.Input.Triggers.IgnoreDrafts = *ov.Input.Triggers.IgnoreDrafts
-		}
+		return nil, fmt.Errorf("input.triggers: %w (webhook triggers are evaluated before repository overrides are loaded)", ErrDisallowedOverrideField)
 	}
 
 	if len(ov.Agents) > 0 {
@@ -410,6 +402,7 @@ func MergeRepoOverrides(base *domain.Workflow, overrideYAML []byte) (*domain.Wor
 func cloneWorkflow(wf *domain.Workflow) *domain.Workflow {
 	out := *wf
 	out.Input.Triggers.Events = slices.Clone(wf.Input.Triggers.Events)
+	out.Input.Triggers.AllowedCommentAssociations = slices.Clone(wf.Input.Triggers.AllowedCommentAssociations)
 	out.Agents = make([]domain.RoleConfig, len(wf.Agents))
 	for i, a := range wf.Agents {
 		clonedAgent := a
@@ -453,6 +446,10 @@ func reasoningEffortRank(effort string) (int, bool) {
 		return 3, true
 	case "high":
 		return 4, true
+	case "xhigh":
+		return 5, true
+	case "max":
+		return 6, true
 	default:
 		return 0, false
 	}

@@ -545,3 +545,191 @@ func TestGitHubSink_LargeReviewBodyCapAndTrackerCleanup(t *testing.T) {
 		t.Fatalf("expected exactly 1 check run update (tracker cleaned up), got %d", checkUpdates)
 	}
 }
+
+func TestGitHubSink_CompactedCheckRunNoSelfReferenceAndBalancedTruncation(t *testing.T) {
+	var (
+		mu             sync.Mutex
+		reviewBodies   []string
+		checkUpdates   []capturedCheckReq
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/shohei-yamagiwa/mochi/check-runs":
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 910})
+		case r.Method == http.MethodPatch && r.URL.Path == "/repos/shohei-yamagiwa/mochi/check-runs/910":
+			var req capturedCheckReq
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			checkUpdates = append(checkUpdates, req)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 910})
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/shohei-yamagiwa/mochi/pulls/42/reviews":
+			var req capturedReviewReq
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			reviewBodies = append(reviewBodies, req.Body)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 2002})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	baseURL := srv.URL + "/"
+	ghClient, err := github.NewClient(github.WithHTTPClient(srv.Client()), github.WithURLs(&baseURL, &baseURL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink, err := ghoutput.NewSink(ghinput.NewStaticClientFactory(ghClient, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	configured := sink.WithConfig(domain.SinkConfig{
+		Type:                   "github_pr_review",
+		PostInlineComments:     false,
+		IncludeCoverageSummary: true,
+		VerdictMode:            "comment_only",
+	})
+
+	// Construct huge FileDetails (~80 KB table) + many findings with ```suggestion blocks,
+	// forcing BOTH Check Run and PR review into compact/bounded output.
+	fileDetails := make([]domain.FileCoverageDetail, 0, 1200)
+	unreviewed := make([]string, 0, 1200)
+	for i := range 1200 {
+		p := fmt.Sprintf("pkg/service/module_%04d/handler_implementation.go", i)
+		fileDetails = append(fileDetails, domain.FileCoverageDetail{
+			Path:              p,
+			ChangeStatus:      "modified",
+			ChangedHunks:      []domain.LineRange{{StartLine: 1, EndLine: 5}},
+			InspectedByAgents: []string{"correctness"},
+		})
+		unreviewed = append(unreviewed, p)
+	}
+	findings := make([]output.Finding, 0, 120)
+	for i := range 120 {
+		findings = append(findings, output.Finding{
+			FilePath:       "internal/auth/service.go",
+			StartLine:      10,
+			Severity:       output.SeverityHigh,
+			Category:       "correctness",
+			Title:          fmt.Sprintf("Finding %03d", i),
+			Description:    strings.Repeat("Detailed rationale block. ", 25),
+			SuggestionCode: "return fmt.Errorf(\"fixed\")",
+			Confidence:     0.9,
+			SourceAgents:   []string{"correctness"},
+		})
+	}
+
+	task := testTaskContext()
+	task.RunID = "run-compact-910"
+	if err := configured.OnRunStarted(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+
+	report := output.ReviewReport{
+		Summary:  "```go\n" + strings.Repeat("// summary padding line\n", 10),
+		Verdict:  output.VerdictComment,
+		Findings: findings,
+		Coverage: &domain.CoverageReport{
+			RunID:                "run-compact-910",
+			TotalChangedFiles:    1200,
+			ReviewedChangedFiles: 0,
+			HunkCoverageRatio:    0,
+			UnreviewedFiles:      unreviewed,
+			FileDetails:          fileDetails,
+		},
+	}
+	// Close the fence cleanly for the summary in this test; a second check verifies unbalanced summary fences.
+	report.Summary += "\n```"
+
+	raw, _ := json.Marshal(report)
+	if err := configured.Publish(context.Background(), task, raw); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	var checkText, checkSummary, reviewBody string
+	mu.Lock()
+	if len(checkUpdates) != 1 || len(reviewBodies) != 1 {
+		mu.Unlock()
+		t.Fatalf("expected 1 check update and 1 review, got checks=%d reviews=%d", len(checkUpdates), len(reviewBodies))
+	}
+	checkText = checkUpdates[0].Output.Text
+	checkSummary = checkUpdates[0].Output.Summary
+	reviewBody = reviewBodies[0]
+	mu.Unlock()
+
+	// 1. Check Run must NEVER self-reference "see the Check Run" or "see Check Run"
+	for _, s := range []string{checkText, checkSummary} {
+		if strings.Contains(s, "Check Run") {
+			t.Fatalf("Check Run output must not self-reference Check Run:\n%s", s)
+		}
+		if !strings.Contains(s, "GET /api/v1/runs/run-compact-910/coverage") {
+			t.Fatalf("expected API coverage hint in compacted Check Run output:\n%s", s)
+		}
+	}
+	// 2. Because Check Run itself is compacted, PR review must also point to the API endpoint, not Check Run.
+	if strings.Contains(reviewBody, "see the Check Run") || strings.Contains(reviewBody, "see Check Run") {
+		t.Fatalf("PR review must not point to compacted Check Run:\n%s", reviewBody)
+	}
+	if !strings.Contains(reviewBody, "GET /api/v1/runs/run-compact-910/coverage") {
+		t.Fatalf("expected API coverage hint in PR review body:\n%s", reviewBody)
+	}
+	// 3. Findings were omitted cleanly on boundary and <details> / fences remain balanced.
+	for name, md := range map[string]string{"reviewBody": reviewBody, "checkText": checkText, "checkSummary": checkSummary} {
+		if len(md) > 65536 {
+			t.Fatalf("%s exceeds GitHub limit (%d)", name, len(md))
+		}
+		if !utf8.ValidString(md) {
+			t.Fatalf("%s has invalid UTF-8", name)
+		}
+		if strings.Count(md, "<details>") != strings.Count(md, "</details>") {
+			t.Fatalf("%s has unbalanced <details> tags: open=%d close=%d",
+				name, strings.Count(md, "<details>"), strings.Count(md, "</details>"))
+		}
+		fenceCount := 0
+		for line := range strings.SplitSeq(md, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "```") {
+				fenceCount++
+			}
+		}
+		if fenceCount%2 != 0 {
+			t.Fatalf("%s has odd number of code fence markers (%d)", name, fenceCount)
+		}
+	}
+	if !strings.Contains(reviewBody, "more finding(s) omitted to fit GitHub's size limit") {
+		t.Fatalf("expected finding boundary omission notice in reviewBody")
+	}
+
+	// 4. Verify hard truncation inside an unclosed ```go code fence closes the fence cleanly.
+	task2 := testTaskContext()
+	task2.RunID = "run-fence-cut"
+	fenceReport := output.ReviewReport{
+		Summary: "```go\n" + strings.Repeat("var x = 1\n", 8000) + "```",
+		Verdict: output.VerdictComment,
+	}
+	rawFence, _ := json.Marshal(fenceReport)
+	if err := configured.Publish(context.Background(), task2, rawFence); err != nil {
+		t.Fatalf("Publish fenceReport: %v", err)
+	}
+	mu.Lock()
+	lastBody := reviewBodies[len(reviewBodies)-1]
+	mu.Unlock()
+	if len(lastBody) > 65536 {
+		t.Fatalf("truncated fence body exceeds limit: %d", len(lastBody))
+	}
+	fenceCount := 0
+	for line := range strings.SplitSeq(lastBody, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			fenceCount++
+		}
+	}
+	if fenceCount == 0 || fenceCount%2 != 0 {
+		t.Fatalf("expected balanced even number of code fences after hard truncation, got %d", fenceCount)
+	}
+}
+

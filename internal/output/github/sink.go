@@ -226,28 +226,61 @@ func (s *Sink) Publish(ctx context.Context, task *domain.TaskContext, artifact j
 		summaryFindings = append(summaryFindings, f)
 	}
 
-	body := renderCappedReviewBody(&report, summaryFindings, droppedCount, target.headSHA, s.cfg.IncludeCoverageSummary, false, maxReviewBodyBytes)
+	var checkRunID int64
+	var hasCheckRun bool
+	checkRunID, hasCheckRun = s.tracker.get(task.RunID)
+
+	runID := strings.TrimSpace(task.RunID)
+	if runID == "" && report.Coverage != nil {
+		runID = strings.TrimSpace(report.Coverage.RunID)
+	}
+
+	var (
+		checkTitle           string
+		checkSummary         string
+		checkText            string
+		checkHasFullCoverage bool
+	)
+	if hasCheckRun && checkRunID > 0 {
+		var summaryCompacted, textCompacted bool
+		checkSummary, summaryCompacted = renderCheckSummary(&report, len(filtered), droppedCount, target.headSHA, runID, s.cfg.IncludeCoverageSummary)
+		checkSummary = truncateMarkdown(checkSummary, maxCheckTextBytes)
+		checkText, textCompacted = renderCappedReviewBody(&report, filtered, droppedCount, renderBodyOptions{
+			headSHA:         target.headSHA,
+			runID:           runID,
+			includeCoverage: s.cfg.IncludeCoverageSummary,
+			noteFallback:    true,
+			isCheckRun:      true,
+		}, maxCheckTextBytes)
+		checkTitle = fmt.Sprintf("Mochi Review: %s (%d findings)", report.Verdict, len(filtered))
+		checkHasFullCoverage = !summaryCompacted && !textCompacted
+	}
+
+	reviewOpts := renderBodyOptions{
+		headSHA:                 target.headSHA,
+		runID:                   runID,
+		includeCoverage:         s.cfg.IncludeCoverageSummary,
+		noteFallback:            false,
+		checkRunHasFullCoverage: checkHasFullCoverage,
+	}
+	body, _ := renderCappedReviewBody(&report, summaryFindings, droppedCount, reviewOpts, maxReviewBodyBytes)
 	event := s.resolveReviewEvent(report.Verdict)
 
 	if target.prNumber > 0 {
-		if err := s.createPRReviewWithFallbacks(ctx, client, target, event, body, draftComments, &report, inlineFindings, summaryFindings, droppedCount); err != nil {
+		if err := s.createPRReviewWithFallbacks(ctx, client, target, event, body, draftComments, &report, inlineFindings, summaryFindings, droppedCount, reviewOpts); err != nil {
 			return err
 		}
 	}
 
-	if checkRunID, ok := s.tracker.get(task.RunID); ok && checkRunID > 0 {
+	if hasCheckRun && checkRunID > 0 {
 		conclusion := s.resolveCheckConclusion(report.Verdict)
-		checkSummary := truncateUTF8(renderCheckSummary(&report, len(filtered), droppedCount, target.headSHA, s.cfg.IncludeCoverageSummary), maxCheckTextBytes)
-		checkText := renderCappedReviewBody(&report, filtered, droppedCount, target.headSHA, s.cfg.IncludeCoverageSummary, true, maxCheckTextBytes)
-		title := fmt.Sprintf("Mochi Review: %s (%d findings)", report.Verdict, len(filtered))
-
 		_, _, err := client.Checks.UpdateCheckRun(ctx, target.owner, target.repo, checkRunID, github.UpdateCheckRunOptions{
 			Name:        s.checkName,
 			Status:      github.Ptr("completed"),
 			Conclusion:  github.Ptr(conclusion),
 			CompletedAt: &github.Timestamp{Time: time.Now().UTC()},
 			Output: &github.CheckRunOutput{
-				Title:   github.Ptr(title),
+				Title:   github.Ptr(checkTitle),
 				Summary: github.Ptr(checkSummary),
 				Text:    github.Ptr(checkText),
 			},
@@ -323,6 +356,7 @@ func (s *Sink) createPRReviewWithFallbacks(
 	inlineFindings []output.Finding,
 	summaryFindings []output.Finding,
 	droppedCount int,
+	renderOpts renderBodyOptions,
 ) error {
 	req := &github.PullRequestReviewRequest{
 		Body:     github.Ptr(body),
@@ -344,7 +378,9 @@ func (s *Sink) createPRReviewWithFallbacks(
 		combined := make([]output.Finding, 0, len(inlineFindings)+len(summaryFindings))
 		combined = append(combined, inlineFindings...)
 		combined = append(combined, summaryFindings...)
-		fallbackBody := renderCappedReviewBody(report, combined, droppedCount, target.headSHA, s.cfg.IncludeCoverageSummary, true, maxReviewBodyBytes)
+		fallbackOpts := renderOpts
+		fallbackOpts.noteFallback = true
+		fallbackBody, _ := renderCappedReviewBody(report, combined, droppedCount, fallbackOpts, maxReviewBodyBytes)
 		fallbackReq := &github.PullRequestReviewRequest{
 			Body:  github.Ptr(fallbackBody),
 			Event: github.Ptr(event),
@@ -499,36 +535,72 @@ func formatInlineFindingBody(f output.Finding) string {
 	return b.String()
 }
 
+type renderBodyOptions struct {
+	headSHA                 string
+	runID                   string
+	includeCoverage         bool
+	noteFallback            bool
+	isCheckRun              bool
+	checkRunHasFullCoverage bool
+	compactCoverage         bool
+	sizeOmittedFindings     int
+}
+
 func renderCappedReviewBody(
 	report *output.ReviewReport,
 	findings []output.Finding,
 	droppedCount int,
-	headSHA string,
-	includeCoverage bool,
-	noteFallback bool,
+	opts renderBodyOptions,
 	maxBytes int,
-) string {
-	body := renderReviewBody(report, findings, droppedCount, headSHA, includeCoverage, noteFallback, false)
+) (string, bool) {
+	opts.compactCoverage = false
+	opts.sizeOmittedFindings = 0
+	body := renderReviewBody(report, findings, droppedCount, opts)
 	if maxBytes <= 0 || len(body) <= maxBytes {
-		return body
+		return body, false
 	}
-	if includeCoverage && report.Coverage != nil {
-		body = renderReviewBody(report, findings, droppedCount, headSHA, includeCoverage, noteFallback, true)
+
+	if opts.includeCoverage && report.Coverage != nil {
+		opts.compactCoverage = true
+		body = renderReviewBody(report, findings, droppedCount, opts)
 		if len(body) <= maxBytes {
-			return body
+			return body, true
 		}
 	}
-	return truncateUTF8(body, maxBytes)
+
+	if len(findings) > 0 {
+		// Drop trailing findings cleanly at finding boundaries before falling back to hard truncation.
+		lo, hi := 0, len(findings)-1
+		best := ""
+		bestFound := false
+		for lo <= hi {
+			mid := lo + (hi-lo)/2
+			tryOpts := opts
+			tryOpts.sizeOmittedFindings = len(findings) - mid
+			candidate := renderReviewBody(report, findings[:mid], droppedCount, tryOpts)
+			if len(candidate) <= maxBytes {
+				best = candidate
+				bestFound = true
+				lo = mid + 1
+			} else {
+				hi = mid - 1
+			}
+		}
+		if bestFound {
+			return best, true
+		}
+		opts.sizeOmittedFindings = len(findings)
+		body = renderReviewBody(report, nil, droppedCount, opts)
+	}
+
+	return truncateMarkdown(body, maxBytes), true
 }
 
 func renderReviewBody(
 	report *output.ReviewReport,
 	findings []output.Finding,
 	droppedCount int,
-	headSHA string,
-	includeCoverage bool,
-	noteFallback bool,
-	compactCoverage bool,
+	opts renderBodyOptions,
 ) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "## Mochi Code Review — `%s`\n\n", report.Verdict)
@@ -542,7 +614,7 @@ func renderReviewBody(
 			strings.Join(report.FailedAgents, "`, `"))
 	}
 
-	if noteFallback && len(findings) > 0 {
+	if opts.noteFallback && (len(findings) > 0 || opts.sizeOmittedFindings > 0) {
 		b.WriteString("_All findings are listed below (inline diff comments were not attached)._\n\n")
 	}
 
@@ -576,6 +648,10 @@ func renderReviewBody(
 		b.WriteByte('\n')
 	}
 
+	if opts.sizeOmittedFindings > 0 {
+		fmt.Fprintf(&b, "_...and %d more finding(s) omitted to fit GitHub's size limit._\n\n", opts.sizeOmittedFindings)
+	}
+
 	if droppedCount > 0 {
 		fmt.Fprintf(&b, "_%d additional finding(s) omitted below configured severity/confidence thresholds._\n\n", droppedCount)
 	}
@@ -599,14 +675,14 @@ func renderReviewBody(
 		}
 	}
 
-	if includeCoverage && report.Coverage != nil {
-		b.WriteString(renderCoverageDetails(report.Coverage, headSHA, compactCoverage))
+	if opts.includeCoverage && report.Coverage != nil {
+		b.WriteString(renderCoverageDetails(report.Coverage, opts.headSHA, opts.runID, opts.compactCoverage, opts.isCheckRun, opts.checkRunHasFullCoverage))
 	}
 
 	return strings.TrimSpace(b.String())
 }
 
-func renderCheckSummary(report *output.ReviewReport, keptCount, droppedCount int, headSHA string, includeCoverage bool) string {
+func renderCheckSummary(report *output.ReviewReport, keptCount, droppedCount int, headSHA, runID string, includeCoverage bool) (string, bool) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "**Verdict:** `%s` | **Findings:** %d", report.Verdict, keptCount)
 	if droppedCount > 0 {
@@ -620,17 +696,29 @@ func renderCheckSummary(report *output.ReviewReport, keptCount, droppedCount int
 	if len(report.FailedAgents) > 0 {
 		fmt.Fprintf(&b, "**Failed agents:** `%s`\n\n", strings.Join(report.FailedAgents, "`, `"))
 	}
+	compacted := false
 	if includeCoverage && report.Coverage != nil {
-		details := renderCoverageDetails(report.Coverage, headSHA, false)
+		details := renderCoverageDetails(report.Coverage, headSHA, runID, false, true, false)
 		if b.Len()+len(details) > maxCheckTextBytes {
-			details = renderCoverageDetails(report.Coverage, headSHA, true)
+			details = renderCoverageDetails(report.Coverage, headSHA, runID, true, true, false)
+			compacted = true
 		}
 		b.WriteString(details)
 	}
-	return strings.TrimSpace(b.String())
+	return strings.TrimSpace(b.String()), compacted
 }
 
-func renderCoverageDetails(cov *domain.CoverageReport, headSHA string, compact bool) string {
+func coverageFallbackTarget(runID string, isCheckRun, checkRunHasFullCoverage bool) string {
+	if !isCheckRun && checkRunHasFullCoverage {
+		return "see the Check Run"
+	}
+	if id := strings.TrimSpace(runID); id != "" {
+		return fmt.Sprintf("inspect `GET /api/v1/runs/%s/coverage`", id)
+	}
+	return "inspect the stored run coverage report"
+}
+
+func renderCoverageDetails(cov *domain.CoverageReport, headSHA, runID string, compact, isCheckRun, checkRunHasFullCoverage bool) string {
 	sha := cov.HeadSHA
 	if sha == "" {
 		sha = headSHA
@@ -641,6 +729,9 @@ func renderCoverageDetails(cov *domain.CoverageReport, headSHA string, compact b
 	if sha == "" {
 		sha = "HEAD"
 	}
+	if strings.TrimSpace(runID) == "" {
+		runID = cov.RunID
+	}
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "<details>\n<summary>Review Coverage (%d/%d files, %.0f%% hunks inspected at commit %s)</summary>\n\n",
@@ -650,11 +741,13 @@ func renderCoverageDetails(cov *domain.CoverageReport, headSHA string, compact b
 		sha,
 	)
 
+	targetHint := coverageFallbackTarget(runID, isCheckRun, checkRunHasFullCoverage)
+
 	if len(cov.UnreviewedFiles) > 0 {
 		const maxUnreviewedListed = 50
 		if compact && len(cov.UnreviewedFiles) > maxUnreviewedListed {
-			fmt.Fprintf(&b, "**Unreviewed changed files (%d total, showing first %d):** `%s`, ... (see Check Run for full list)\n\n",
-				len(cov.UnreviewedFiles), maxUnreviewedListed, strings.Join(cov.UnreviewedFiles[:maxUnreviewedListed], "`, `"))
+			fmt.Fprintf(&b, "**Unreviewed changed files (%d total, showing first %d):** `%s`, ... (%s for full list)\n\n",
+				len(cov.UnreviewedFiles), maxUnreviewedListed, strings.Join(cov.UnreviewedFiles[:maxUnreviewedListed], "`, `"), targetHint)
 		} else {
 			fmt.Fprintf(&b, "**Unreviewed changed files:** `%s`\n\n", strings.Join(cov.UnreviewedFiles, "`, `"))
 		}
@@ -662,7 +755,7 @@ func renderCoverageDetails(cov *domain.CoverageReport, headSHA string, compact b
 
 	if compact {
 		if len(cov.FileDetails) > 0 {
-			fmt.Fprintf(&b, "_Per-file coverage table (%d files) omitted to fit GitHub's size limit; see Check Run for full details._\n\n", len(cov.FileDetails))
+			fmt.Fprintf(&b, "_Per-file coverage table (%d files) omitted to fit GitHub's size limit; %s for full details._\n\n", len(cov.FileDetails), targetHint)
 		}
 		b.WriteString("</details>\n")
 		return b.String()
@@ -791,14 +884,86 @@ func truncateUTF8(s string, maxBytes int) string {
 	const suffix = "\n... [truncated]"
 	limit := maxBytes - len(suffix)
 	if limit <= 0 {
-		limit = maxBytes
-		for limit > 0 && !utf8.RuneStart(s[limit]) {
-			limit--
+		return trimUTF8Prefix(s, maxBytes)
+	}
+	cut := trimUTF8PrefixLen(s, limit)
+	return s[:cut] + suffix
+}
+
+func trimUTF8Prefix(s string, maxBytes int) string {
+	return s[:trimUTF8PrefixLen(s, maxBytes)]
+}
+
+func trimUTF8PrefixLen(s string, maxBytes int) int {
+	if maxBytes <= 0 {
+		return 0
+	}
+	if maxBytes >= len(s) {
+		return len(s)
+	}
+	i := maxBytes
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	return i
+}
+
+// truncateMarkdown truncates s to at most maxBytes on a UTF-8 rune boundary while closing
+// any dangling fenced code blocks, <summary>, or <details> tags introduced by the cut.
+func truncateMarkdown(s string, maxBytes int) string {
+	if maxBytes <= 0 || len(s) <= maxBytes {
+		return s
+	}
+	suffix := "\n... [truncated]"
+	for range 4 {
+		limit := maxBytes - len(suffix)
+		if limit <= 0 {
+			return trimUTF8Prefix(s, maxBytes)
 		}
-		return s[:limit]
+		cut := trimUTF8PrefixLen(s, limit)
+		if lastLT := strings.LastIndexByte(s[:cut], '<'); lastLT >= 0 && lastLT > strings.LastIndexByte(s[:cut], '>') {
+			cut = lastLT
+		}
+		nextSuffix := unclosedMarkdownSuffix(s[:cut])
+		if cut+len(nextSuffix) <= maxBytes {
+			return s[:cut] + nextSuffix
+		}
+		suffix = nextSuffix
 	}
-	for limit > 0 && !utf8.RuneStart(s[limit]) {
-		limit--
+	return truncateUTF8(s, maxBytes)
+}
+
+func unclosedMarkdownSuffix(prefix string) string {
+	inFence := false
+	for line := range strings.SplitSeq(prefix, "\n") {
+		trimmed := strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+		if strings.HasPrefix(trimmed, "```") {
+			if !inFence {
+				inFence = true
+			} else if trimmed == "```" {
+				inFence = false
+			}
+		}
 	}
-	return s[:limit] + suffix
+	detailsDepth := strings.Count(prefix, "<details>") - strings.Count(prefix, "</details>")
+	summaryOpen := false
+	if lastOpen := strings.LastIndex(prefix, "<details>"); lastOpen >= 0 && lastOpen > strings.LastIndex(prefix, "</details>") {
+		tail := prefix[lastOpen:]
+		if strings.Count(tail, "<summary>") > strings.Count(tail, "</summary>") {
+			summaryOpen = true
+		}
+	}
+
+	var b strings.Builder
+	if inFence {
+		b.WriteString("\n```")
+	}
+	if summaryOpen {
+		b.WriteString("</summary>\n")
+	}
+	b.WriteString("\n... [truncated]")
+	for range max(0, detailsDepth) {
+		b.WriteString("\n</details>")
+	}
+	return b.String()
 }

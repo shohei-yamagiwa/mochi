@@ -80,10 +80,70 @@ func sanitizeRepoURL(raw string) string {
 	return raw
 }
 
+// PromptSinkConfig is a secret-free projection of domain.SinkConfig for prompt templates.
+// It omits URL and Options so operator webhook URLs, tokens, or signing secrets can never be read by templates.
+type PromptSinkConfig struct {
+	Type                   string  `json:"type"`
+	PostInlineComments     bool    `json:"post_inline_comments,omitempty"`
+	IncludeCoverageSummary bool    `json:"include_coverage_summary,omitempty"`
+	MinSeverity            string  `json:"min_severity,omitempty"`
+	MinConfidence          float64 `json:"min_confidence,omitempty"`
+	VerdictMode            string  `json:"verdict_mode,omitempty"`
+}
+
+// PromptOutputConfig is a secret-free projection of domain.OutputConfig for prompt templates.
+type PromptOutputConfig struct {
+	Sinks []PromptSinkConfig `json:"sinks"`
+}
+
+// PromptWorkflow is a secret-free projection of domain.Workflow exposed to prompt templates.
+type PromptWorkflow struct {
+	Version       string                     `json:"version"`
+	Name          string                     `json:"name"`
+	Description   string                     `json:"description,omitempty"`
+	Input         domain.InputConfig         `json:"input"`
+	RepoOverrides domain.RepoOverridesConfig `json:"repo_overrides,omitempty"`
+	Sandbox       domain.SandboxConfig       `json:"sandbox"`
+	Agents        []domain.RoleConfig        `json:"agents"`
+	Synthesizer   domain.SynthesizerConfig   `json:"synthesizer"`
+	Output        PromptOutputConfig         `json:"output"`
+}
+
+// NewPromptWorkflow constructs a secret-free PromptWorkflow from a domain.Workflow.
+func NewPromptWorkflow(wf *domain.Workflow) *PromptWorkflow {
+	if wf == nil {
+		return nil
+	}
+	sinks := make([]PromptSinkConfig, len(wf.Output.Sinks))
+	for i, s := range wf.Output.Sinks {
+		sinks[i] = PromptSinkConfig{
+			Type:                   s.Type,
+			PostInlineComments:     s.PostInlineComments,
+			IncludeCoverageSummary: s.IncludeCoverageSummary,
+			MinSeverity:            s.MinSeverity,
+			MinConfidence:          s.MinConfidence,
+			VerdictMode:            s.VerdictMode,
+		}
+	}
+	agents := make([]domain.RoleConfig, len(wf.Agents))
+	copy(agents, wf.Agents)
+	return &PromptWorkflow{
+		Version:       wf.Version,
+		Name:          wf.Name,
+		Description:   wf.Description,
+		Input:         wf.Input,
+		RepoOverrides: wf.RepoOverrides,
+		Sandbox:       wf.Sandbox,
+		Agents:        agents,
+		Synthesizer:   wf.Synthesizer,
+		Output:        PromptOutputConfig{Sinks: sinks},
+	}
+}
+
 // PromptData exposes canonical, secret-free workflow and task context variables to prompt templates.
 type PromptData struct {
 	Task           *PromptTaskContext
-	Workflow       *domain.Workflow
+	Workflow       *PromptWorkflow
 	Role           *domain.RoleConfig
 	AgentSummaries map[string]string
 	Coverage       *domain.CoverageReport
@@ -94,7 +154,7 @@ type PromptData struct {
 func NewPromptData(task *domain.TaskContext, wf *domain.Workflow, role *domain.RoleConfig) PromptData {
 	return PromptData{
 		Task:     NewPromptTaskContext(task),
-		Workflow: wf,
+		Workflow: NewPromptWorkflow(wf),
 		Role:     role,
 	}
 }

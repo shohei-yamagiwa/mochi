@@ -1,8 +1,12 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -241,7 +245,7 @@ func TestSearchCodeAndGitDiffTools(t *testing.T) {
 	if err != nil || dres.ExitCode != 0 {
 		t.Fatalf("git_diff failed: res=%+v err=%v", dres, err)
 	}
-	if !strings.Contains(sb.lastExecReq.Command, "'abc111..def222'") {
+	if !strings.Contains(sb.lastExecReq.Command, "'abc111...def222'") {
 		t.Fatalf("unexpected git diff command: %q", sb.lastExecReq.Command)
 	}
 	if len(dres.AccessedFiles) != 1 || dres.AccessedFiles[0].Kind != domain.FileAccessDiff || dres.AccessedFiles[0].Path != "internal/auth.go" {
@@ -404,3 +408,152 @@ func jsonCall(name, args string) llm.ToolCall {
 		Arguments: json.RawMessage(args),
 	}
 }
+
+type localExecSandbox struct {
+	*mockSandbox
+	dir string
+}
+
+func (l *localExecSandbox) Exec(_ context.Context, req sandbox.ExecRequest) (*sandbox.ExecResult, error) {
+	l.lastExecReq = req
+	cmd := exec.Command("sh", "-c", req.Command)
+	cmd.Dir = l.dir
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	exitCode := 0
+	if err != nil {
+		exitCode = 1
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		}
+	}
+	return &sandbox.ExecResult{
+		ExitCode: exitCode,
+		Stdout:   stdout.String(),
+		Stderr:   stderr.String(),
+	}, nil
+}
+
+func TestGitDiff_ThreeDotExcludesBaseBranchAdvance(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary not found")
+	}
+
+	dir := t.TempDir()
+	runGit := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Mochi Test",
+			"GIT_AUTHOR_EMAIL=mochi@example.com",
+			"GIT_COMMITTER_NAME=Mochi Test",
+			"GIT_COMMITTER_EMAIL=mochi@example.com",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	runGit("init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(dir, "base.txt"), []byte("initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "base.txt")
+	runGit("commit", "-m", "initial")
+
+	// Branch PR off initial commit
+	runGit("checkout", "-b", "feat")
+	if err := os.WriteFile(filepath.Join(dir, "pr.txt"), []byte("pr-change\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "pr.txt")
+	runGit("commit", "-m", "pr change")
+	headSHA := runGit("rev-parse", "HEAD")
+
+	// Advance main after branching (e.g. merged another PR into main)
+	runGit("checkout", "main")
+	if err := os.WriteFile(filepath.Join(dir, "base_later.txt"), []byte("from another PR\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "base_later.txt")
+	runGit("commit", "-m", "advance main")
+	baseSHA := runGit("rev-parse", "HEAD")
+
+	runGit("checkout", headSHA)
+
+	reg, _ := NewRegistry()
+	ts, _ := reg.ScopeForRole([]string{"git_diff"})
+	sb := &localExecSandbox{mockSandbox: newMockSandbox(), dir: dir}
+
+	res, err := ts.Execute(context.Background(), ExecutionContext{
+		AgentRole: "correctness",
+		Sandbox:   sb,
+		BaseRef:   baseSHA,
+		HeadRef:   headSHA,
+	}, jsonCall("git_diff", `{}`))
+	if err != nil {
+		t.Fatalf("git_diff failed: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("git_diff exit=%d output=%s", res.ExitCode, res.Output)
+	}
+	if !strings.Contains(res.Output, "pr.txt") || !strings.Contains(res.Output, "+pr-change") {
+		t.Fatalf("expected PR change in diff output, got:\n%s", res.Output)
+	}
+	if strings.Contains(res.Output, "base_later.txt") || strings.Contains(res.Output, "-from another PR") {
+		t.Fatalf("three-dot diff must NOT show base branch advance as reverted, got:\n%s", res.Output)
+	}
+}
+
+func TestReadFile_ClampsTailRangeToEOF(t *testing.T) {
+	reg, err := NewRegistry()
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	ts, err := reg.ScopeForRole([]string{"read_file"})
+	if err != nil {
+		t.Fatalf("ScopeForRole: %v", err)
+	}
+
+	var b strings.Builder
+	for i := 1; i <= 2000; i++ {
+		if i > 1 {
+			b.WriteByte('\n')
+		}
+		b.WriteString("// line padding to trigger 32KB head+tail truncation in read_file")
+	}
+
+	sb := newMockSandbox()
+	sb.files["big.go"] = b.String()
+
+	res, err := ts.Execute(context.Background(), ExecutionContext{
+		AgentRole: "correctness",
+		Sandbox:   sb,
+	}, jsonCall("read_file", `{"path":"big.go","start_line":1,"end_line":99999}`))
+	if err != nil {
+		t.Fatalf("read_file failed: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("read_file exit=%d output=%s", res.ExitCode, res.Output)
+	}
+	if len(res.AccessedFiles) != 2 {
+		t.Fatalf("expected head+tail FileAccessRecords (2), got %+v", res.AccessedFiles)
+	}
+	headRec := res.AccessedFiles[0]
+	tailRec := res.AccessedFiles[1]
+	if headRec.LineRange == nil || headRec.LineRange.StartLine != 1 {
+		t.Fatalf("unexpected head range: %+v", headRec.LineRange)
+	}
+	if tailRec.LineRange == nil || tailRec.LineRange.EndLine != 2000 {
+		t.Fatalf("expected tail EndLine clamped to 2000, got %+v", tailRec.LineRange)
+	}
+	if tailRec.LineRange.StartLine > 1990 || tailRec.LineRange.EndLine < 1995 {
+		t.Fatalf("expected tail range to cover hunk 1990-1995, got %+v", tailRec.LineRange)
+	}
+}
+

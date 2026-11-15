@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -414,3 +415,138 @@ func TestAgentLoop_RunTimeoutPersistsTimedOutStatus(t *testing.T) {
 		t.Fatalf("expected persisted timed_out status in sqlite, got runs=%+v err=%v", runs, err)
 	}
 }
+
+func TestAgentLoop_MaxTokensWindDownForcesSubmitOutput(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer st.Close()
+	setupTestRun(t, ctx, st, "run-winddown")
+
+	reg, _ := tools.NewRegistry()
+	sb := &fakeSandbox{
+		id:    "sb-winddown",
+		files: map[string]string{"main.go": "package main\nfunc f() {}\n"},
+	}
+
+	var seenChoices []string
+	var seenToolCounts []int
+	provider := &fakeProvider{
+		name: "anthropic",
+		fn: func(_ context.Context, turn int, req llm.ChatRequest) (*llm.ChatResponse, error) {
+			seenChoices = append(seenChoices, req.ToolChoice)
+			seenToolCounts = append(seenToolCounts, len(req.Tools))
+			if req.ToolChoice == "submit_output" {
+				if len(req.Tools) != 1 || req.Tools[0].Name != "submit_output" {
+					t.Fatalf("expected wind-down turn tools scoped strictly to [submit_output], got %+v", req.Tools)
+				}
+				tc := llm.ToolCall{
+					ID:        fmt.Sprintf("tc_sub_%d", turn),
+					Name:      "submit_output",
+					Arguments: json.RawMessage(`{"summary":"Partial findings preserved before token ceiling","findings":[]}`),
+				}
+				return &llm.ChatResponse{
+					Message:      llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{tc}},
+					ToolCalls:    []llm.ToolCall{tc},
+					Usage:        llm.TokenUsage{InputTokens: 32000, OutputTokens: 500, CachedTokens: 28000},
+					FinishReason: "tool_calls",
+				}, nil
+			}
+			// Simulate growing conversation: 12k initial, +4k per turn, 500 output
+			inputTokens := 12000 + turn*4000
+			tc := llm.ToolCall{
+				ID:        fmt.Sprintf("tc_read_%d", turn),
+				Name:      "read_file",
+				Arguments: json.RawMessage(`{"path":"main.go"}`),
+			}
+			return &llm.ChatResponse{
+				Message:      llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{tc}},
+				ToolCalls:    []llm.ToolCall{tc},
+				Usage:        llm.TokenUsage{InputTokens: inputTokens, OutputTokens: 500, CachedTokens: max(0, inputTokens-4000)},
+				FinishReason: "tool_calls",
+			}, nil
+		},
+	}
+
+	loop := &AgentLoop{Provider: provider, Store: st, Registry: reg}
+	res, err := loop.Run(ctx, AgentLoopRequest{
+		RunID:        "run-winddown",
+		SystemPrompt: "Review PR",
+		UserPrompt:   "Inspect main.go",
+		Role: domain.RoleConfig{
+			Role:    "correctness",
+			LLM:     domain.ModelConfig{Provider: "anthropic", Model: "claude-sonnet-5-5"},
+			Tools:   []string{"read_file", "submit_output"},
+			Budgets: domain.BudgetConfig{MaxTurns: 15, MaxTokens: 120000},
+		},
+		Sandbox: sb,
+	})
+	if err != nil {
+		t.Fatalf("expected wind-down submit_output to succeed, got error: %v", err)
+	}
+	if res.AgentRun.Status != domain.AgentRunStatusCompleted {
+		t.Fatalf("Status = %s, want completed", res.AgentRun.Status)
+	}
+	if len(seenChoices) != 6 || seenChoices[5] != "submit_output" {
+		t.Fatalf("expected wind-down at turn 5, seenChoices=%v toolCounts=%v", seenChoices, seenToolCounts)
+	}
+	if seenToolCounts[0] != 2 || seenToolCounts[5] != 1 {
+		t.Fatalf("expected normal turns to expose 2 tools and wind-down 1 tool, got %v", seenToolCounts)
+	}
+	var parsed tools.AgentFindings
+	if err := json.Unmarshal(res.SubmittedOutput, &parsed); err != nil {
+		t.Fatalf("unmarshal submitted output: %v", err)
+	}
+	if !strings.Contains(parsed.Summary, "Partial findings preserved") {
+		t.Fatalf("unexpected submitted summary: %q", parsed.Summary)
+	}
+}
+
+func TestAgentLoop_MaxTokensWindDownFailsIfNotSubmitted(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer st.Close()
+	setupTestRun(t, ctx, st, "run-winddown-fail")
+
+	reg, _ := tools.NewRegistry()
+	provider := &fakeProvider{
+		name: "openai",
+		fn: func(_ context.Context, turn int, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+			tc := llm.ToolCall{
+				ID:        fmt.Sprintf("tc_%d", turn),
+				Name:      "list_dir",
+				Arguments: json.RawMessage(`{}`),
+			}
+			return &llm.ChatResponse{
+				Message:   llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{tc}},
+				ToolCalls: []llm.ToolCall{tc},
+				Usage:     llm.TokenUsage{InputTokens: 60, OutputTokens: 10},
+			}, nil
+		},
+	}
+
+	loop := &AgentLoop{Provider: provider, Store: st, Registry: reg}
+	res, err := loop.Run(ctx, AgentLoopRequest{
+		RunID:      "run-winddown-fail",
+		UserPrompt: "Explore",
+		Role: domain.RoleConfig{
+			Role:    "correctness",
+			LLM:     domain.ModelConfig{Provider: "openai", Model: "gpt-6.1-sol"},
+			Tools:   []string{"list_dir", "submit_output"},
+			Budgets: domain.BudgetConfig{MaxTurns: 5, MaxTokens: 100},
+		},
+		Sandbox: &fakeSandbox{id: "sb-1"},
+	})
+	if !errors.Is(err, ErrMaxTokensExceeded) {
+		t.Fatalf("expected ErrMaxTokensExceeded when wind-down ignores submit_output, got %v", err)
+	}
+	if res.AgentRun.Status != domain.AgentRunStatusFailed || res.AgentRun.TurnsUsed != 2 {
+		t.Fatalf("expected failed after turn 1 wind-down attempt, got %+v", res.AgentRun)
+	}
+}
+

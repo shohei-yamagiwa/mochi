@@ -92,7 +92,7 @@ func (t *gitDiffTool) Execute(ctx context.Context, execCtx ExecutionContext, raw
 	cmdParts := []string{"git diff"}
 	switch {
 	case baseRef != "" && headRef != "":
-		cmdParts = append(cmdParts, shellQuote(baseRef+".."+headRef))
+		cmdParts = append(cmdParts, shellQuote(baseRef+"..."+headRef))
 	case baseRef != "":
 		cmdParts = append(cmdParts, shellQuote(baseRef))
 	}

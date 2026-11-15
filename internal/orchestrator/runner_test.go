@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -21,15 +22,18 @@ import (
 type trackingSandboxProvider struct {
 	mu            sync.Mutex
 	createdBase   []*trackingSandbox
+	createdOpts   []sandbox.CreateOptions
 	forkedByName  map[string]*trackingSandbox
+	forkErrByName map[string]error
 	files         map[string]string
 	searchMatches []sandbox.SearchMatch
 }
 
 func newTrackingSandboxProvider(files map[string]string) *trackingSandboxProvider {
 	return &trackingSandboxProvider{
-		forkedByName: make(map[string]*trackingSandbox),
-		files:        files,
+		forkedByName:  make(map[string]*trackingSandbox),
+		forkErrByName: make(map[string]error),
+		files:         files,
 	}
 }
 
@@ -49,6 +53,7 @@ func (p *trackingSandboxProvider) CreateAndPrepareBaseSandbox(_ context.Context,
 		searchMatches: p.searchMatches,
 	}
 	p.createdBase = append(p.createdBase, sb)
+	p.createdOpts = append(p.createdOpts, opts)
 	return sb, nil
 }
 
@@ -66,6 +71,15 @@ type trackingSandbox struct {
 func (s *trackingSandbox) ID() string { return s.id }
 
 func (s *trackingSandbox) Fork(_ context.Context, name string) (sandbox.Sandbox, error) {
+	s.provider.mu.Lock()
+	for pat, err := range s.provider.forkErrByName {
+		if strings.Contains(name, pat) {
+			s.provider.mu.Unlock()
+			return nil, err
+		}
+	}
+	s.provider.mu.Unlock()
+
 	s.mu.Lock()
 	copiedFiles := make(map[string]string, len(s.files))
 	for k, v := range s.files {
@@ -858,11 +872,8 @@ func TestRunner_RepoOverridesMerge(t *testing.T) {
 		SandboxProvider:    sbProvider,
 		DefaultLLMProvider: llmProvider,
 		PromptEngine:       config.NewPromptEngine(repoRoot),
-		RepoOverrideLoader: func(_ context.Context, _ *domain.TaskContext, baseSB sandbox.Sandbox, overridePath string) (*RepoOverrideBundle, error) {
+		RepoOverrideLoader: func(_ context.Context, _ *domain.TaskContext, _ sandbox.Sandbox, overridePath string) (*RepoOverrideBundle, error) {
 			overrideCalled = true
-			if baseSB == nil {
-				t.Errorf("expected non-nil baseSandbox in RepoOverrideLoader")
-			}
 			if overridePath != ".mochi/config.yaml" {
 				t.Errorf("overridePath = %q, want .mochi/config.yaml", overridePath)
 			}
@@ -921,3 +932,264 @@ agents:
 	}
 	_ = tools.AgentFinding{}
 }
+
+func TestRunner_RepoOverridesSandboxAppliesToBaseSandbox(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer st.Close()
+
+	repoRoot := filepath.Join("..", "..")
+	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, "configs", "workflows", "pr-review.yaml"), repoRoot)
+	if err != nil {
+		t.Fatalf("LoadWorkflowFile: %v", err)
+	}
+	wf.RepoOverrides.AllowCustomImages = true
+
+	sbProvider := newTrackingSandboxProvider(nil)
+	llmProvider := newRoutingLLMProvider("mock", func(_ context.Context, role string, _ int, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+		if role == "synthesizer" {
+			return &llm.ChatResponse{
+				Message: llm.Message{
+					Role:    llm.RoleAssistant,
+					Content: `{"summary":"All clear","verdict":"APPROVE","findings":[]}`,
+				},
+			}, nil
+		}
+		tc := llm.ToolCall{
+			ID:        "tc_submit_" + role,
+			Name:      "submit_output",
+			Arguments: json.RawMessage(`{"summary":"ok","findings":[]}`),
+		}
+		return &llm.ChatResponse{
+			Message:   llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{tc}},
+			ToolCalls: []llm.ToolCall{tc},
+		}, nil
+	})
+
+	runner := &Runner{
+		Store:              st,
+		SandboxProvider:    sbProvider,
+		DefaultLLMProvider: llmProvider,
+		PromptEngine:       config.NewPromptEngine(repoRoot),
+		RepoOverrideLoader: func(_ context.Context, _ *domain.TaskContext, _ sandbox.Sandbox, _ string) (*RepoOverrideBundle, error) {
+			return &RepoOverrideBundle{
+				ConfigYAML: []byte(`
+sandbox:
+  default_snapshot: "acme-rust-toolchain"
+`),
+			}, nil
+		},
+	}
+
+	task := &domain.TaskContext{
+		RunID:        "run-override-sandbox",
+		WorkflowName: wf.Name,
+		TriggerType:  "cli",
+		DedupKey:     "repo:pr:4",
+		Changeset: &domain.ChangesetSpec{
+			RepoOwner: "shohei-yamagiwa",
+			RepoName:  "mochi",
+			PRNumber:  4,
+			BaseSHA:   "1111111",
+			HeadSHA:   "2222222",
+		},
+	}
+
+	if _, err := runner.Execute(ctx, task, wf); err != nil {
+		t.Fatalf("Runner.Execute: %v", err)
+	}
+	if len(sbProvider.createdOpts) != 1 {
+		t.Fatalf("createdBase count = %d, want 1", len(sbProvider.createdOpts))
+	}
+	if sbProvider.createdOpts[0].Workspace.Snapshot != "acme-rust-toolchain" {
+		t.Fatalf("base sandbox Snapshot = %q, want %q", sbProvider.createdOpts[0].Workspace.Snapshot, "acme-rust-toolchain")
+	}
+}
+
+func TestRunner_SingleSpecialistForkFailureContinuesWithFailFastFalse(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer st.Close()
+
+	repoRoot := filepath.Join("..", "..")
+	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, "configs", "workflows", "pr-review.yaml"), repoRoot)
+	if err != nil {
+		t.Fatalf("LoadWorkflowFile: %v", err)
+	}
+
+	sbProvider := newTrackingSandboxProvider(nil)
+	sbProvider.forkErrByName["-security"] = errors.New("daytona fork transient 502")
+
+	llmProvider := newRoutingLLMProvider("mock", func(_ context.Context, role string, _ int, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+		if role == "synthesizer" {
+			return &llm.ChatResponse{
+				Message: llm.Message{
+					Role:    llm.RoleAssistant,
+					Content: `{"summary":"Completed with 3 of 4 specialists","verdict":"APPROVE","findings":[]}`,
+				},
+			}, nil
+		}
+		tc := llm.ToolCall{
+			ID:        "tc_ok_" + role,
+			Name:      "submit_output",
+			Arguments: json.RawMessage(`{"summary":"ok","findings":[]}`),
+		}
+		return &llm.ChatResponse{
+			Message:   llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{tc}},
+			ToolCalls: []llm.ToolCall{tc},
+		}, nil
+	})
+
+	runner := &Runner{
+		Store:              st,
+		SandboxProvider:    sbProvider,
+		DefaultLLMProvider: llmProvider,
+		PromptEngine:       config.NewPromptEngine(repoRoot),
+	}
+
+	task := &domain.TaskContext{
+		RunID:        "run-fork-partial",
+		WorkflowName: wf.Name,
+		TriggerType:  "cli",
+		DedupKey:     "repo:pr:22",
+		Changeset: &domain.ChangesetSpec{
+			RepoOwner: "shohei-yamagiwa",
+			RepoName:  "mochi",
+			PRNumber:  22,
+			BaseSHA:   "1111111",
+			HeadSHA:   "2222222",
+		},
+	}
+
+	res, err := runner.Execute(ctx, task, wf)
+	if err != nil {
+		t.Fatalf("Runner.Execute error = %v, want nil when 3 of 4 specialists succeed", err)
+	}
+	if res.Run.Status != domain.RunStatusCompleted {
+		t.Fatalf("res.Run.Status = %q, want %q", res.Run.Status, domain.RunStatusCompleted)
+	}
+	if res.Report.Verdict != output.VerdictComment {
+		t.Fatalf("Report.Verdict = %q, want %q when a specialist failed fork", res.Report.Verdict, output.VerdictComment)
+	}
+	if len(res.Report.FailedAgents) != 1 || res.Report.FailedAgents[0] != "security" {
+		t.Fatalf("Report.FailedAgents = %v, want [security]", res.Report.FailedAgents)
+	}
+	if res.Report.AgentSummaries["security"] != "failed (sandbox error)" {
+		t.Fatalf("Report.AgentSummaries[security] = %q, want %q", res.Report.AgentSummaries["security"], "failed (sandbox error)")
+	}
+}
+
+func TestRunner_CleansUpRepoOverridePromptDir(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer st.Close()
+
+	repoRoot := filepath.Join("..", "..")
+	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, "configs", "workflows", "pr-review.yaml"), repoRoot)
+	if err != nil {
+		t.Fatalf("LoadWorkflowFile: %v", err)
+	}
+
+	makePromptDir := func(t *testing.T, content string) string {
+		t.Helper()
+		dir, err := os.MkdirTemp("", "mochi-repo-prompts-test-*")
+		if err != nil {
+			t.Fatalf("MkdirTemp: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Join(dir, ".mochi"), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".mochi", "review.md"), []byte(content), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		return dir
+	}
+
+	llmProvider := newRoutingLLMProvider("mock", func(_ context.Context, role string, _ int, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+		if role == "synthesizer" {
+			return &llm.ChatResponse{
+				Message: llm.Message{
+					Role:    llm.RoleAssistant,
+					Content: `{"summary":"All clear","verdict":"APPROVE","findings":[]}`,
+				},
+			}, nil
+		}
+		tc := llm.ToolCall{
+			ID:        "tc_submit_" + role,
+			Name:      "submit_output",
+			Arguments: json.RawMessage(`{"summary":"ok","findings":[]}`),
+		}
+		return &llm.ChatResponse{
+			Message:   llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{tc}},
+			ToolCalls: []llm.ToolCall{tc},
+		}, nil
+	})
+
+	// 1. Success path removes PromptDir
+	successDir := makePromptDir(t, "Custom prompt")
+	runnerOK := &Runner{
+		Store:              st,
+		SandboxProvider:    newTrackingSandboxProvider(nil),
+		DefaultLLMProvider: llmProvider,
+		PromptEngine:       config.NewPromptEngine(repoRoot),
+		RepoOverrideLoader: func(_ context.Context, _ *domain.TaskContext, _ sandbox.Sandbox, _ string) (*RepoOverrideBundle, error) {
+			return &RepoOverrideBundle{
+				PromptDir: successDir,
+				ConfigYAML: []byte(`
+agents:
+  - role: correctness
+    prompt_file: ".mochi/review.md"
+`),
+			}, nil
+		},
+	}
+	if _, err := runnerOK.Execute(ctx, &domain.TaskContext{
+		RunID:        "run-cleanup-ok",
+		WorkflowName: wf.Name,
+		TriggerType:  "cli",
+		DedupKey:     "repo:pr:30",
+		Changeset:    &domain.ChangesetSpec{RepoOwner: "shohei-yamagiwa", RepoName: "mochi", PRNumber: 30, BaseSHA: "111", HeadSHA: "222"},
+	}, wf); err != nil {
+		t.Fatalf("runnerOK.Execute: %v", err)
+	}
+	if _, statErr := os.Stat(successDir); !os.IsNotExist(statErr) {
+		t.Fatalf("expected %q to be removed after run completion, stat err=%v", successDir, statErr)
+	}
+
+	// 2. Merge-error path also removes PromptDir
+	errDir := makePromptDir(t, "Unused prompt")
+	runnerErr := &Runner{
+		Store:              st,
+		SandboxProvider:    newTrackingSandboxProvider(nil),
+		DefaultLLMProvider: llmProvider,
+		PromptEngine:       config.NewPromptEngine(repoRoot),
+		RepoOverrideLoader: func(_ context.Context, _ *domain.TaskContext, _ sandbox.Sandbox, _ string) (*RepoOverrideBundle, error) {
+			return &RepoOverrideBundle{
+				PromptDir:  errDir,
+				ConfigYAML: []byte("agents:\n  - role: nonexistent-role\n"),
+			}, nil
+		},
+	}
+	if _, err := runnerErr.Execute(ctx, &domain.TaskContext{
+		RunID:        "run-cleanup-err",
+		WorkflowName: wf.Name,
+		TriggerType:  "cli",
+		DedupKey:     "repo:pr:31",
+		Changeset:    &domain.ChangesetSpec{RepoOwner: "shohei-yamagiwa", RepoName: "mochi", PRNumber: 31, BaseSHA: "111", HeadSHA: "222"},
+	}, wf); err == nil {
+		t.Fatal("expected merge error for unknown role, got nil")
+	}
+	if _, statErr := os.Stat(errDir); !os.IsNotExist(statErr) {
+		t.Fatalf("expected %q to be removed on merge error, stat err=%v", errDir, statErr)
+	}
+}
+

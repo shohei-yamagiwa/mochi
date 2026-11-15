@@ -277,3 +277,51 @@ func TestOpenAICompatProvider_BaseURLAndTools(t *testing.T) {
 		t.Fatalf("unexpected usage: %+v", resp.Usage)
 	}
 }
+
+func TestOpenAI_ReasoningEffortMapping(t *testing.T) {
+	var efforts []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		effort := ""
+		if rm, ok := body["reasoning"].(map[string]any); ok {
+			effort, _ = rm["effort"].(string)
+		}
+		efforts = append(efforts, effort)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"r1","model":"gpt-6.1-sol","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	p, err := NewProvider(WithAPIKey("test-key"), WithBaseURL(srv.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"minimal", "minimal"},
+		{"low", "low"},
+		{"medium", "medium"},
+		{"high", "high"},
+		{"xhigh", "xhigh"},
+		{"max", "max"},
+		{"none", ""},
+	}
+	for _, tc := range cases {
+		if _, err := p.Generate(context.Background(), llm.ChatRequest{
+			Config:   llm.ModelConfig{Provider: "openai", Model: "gpt-6.1-sol", ReasoningEffort: tc.in},
+			Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
+		}); err != nil {
+			t.Fatalf("Generate(%q): %v", tc.in, err)
+		}
+	}
+	for i, tc := range cases {
+		if efforts[i] != tc.want {
+			t.Fatalf("reasoning_effort %q mapped to %q, want %q", tc.in, efforts[i], tc.want)
+		}
+	}
+}
+

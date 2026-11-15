@@ -50,6 +50,11 @@ type Config struct {
 	Logger              *slog.Logger
 }
 
+type hydrationInFlight struct {
+	seq    uint64
+	cancel context.CancelFunc
+}
+
 // Server exposes Mochi's HTTP endpoints over chi/v5.
 type Server struct {
 	cfg      Config
@@ -58,6 +63,11 @@ type Server struct {
 	bgWG     sync.WaitGroup
 	bgCtx    context.Context
 	bgCancel context.CancelFunc
+
+	hydrationMu      sync.Mutex
+	webhookSeq       uint64
+	latestSeqByDedup map[string]uint64
+	hydratingByDedup map[string]hydrationInFlight
 }
 
 // New constructs a Server with all health, webhook, trigger, and run-inspection routes registered.
@@ -81,10 +91,12 @@ func New(cfg Config) (*Server, error) {
 
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 	s := &Server{
-		cfg:      cfg,
-		logger:   logger,
-		bgCtx:    bgCtx,
-		bgCancel: bgCancel,
+		cfg:              cfg,
+		logger:           logger,
+		bgCtx:            bgCtx,
+		bgCancel:         bgCancel,
+		latestSeqByDedup: make(map[string]uint64),
+		hydratingByDedup: make(map[string]hydrationInFlight),
 	}
 
 	r := chi.NewRouter()
@@ -227,28 +239,48 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	target.Triggers = triggers
 	runID := newRunID()
 
+	dedupKey := ""
+	if target.Owner != "" && target.Repo != "" && target.PRNumber > 0 {
+		dedupKey = fmt.Sprintf("github:%s/%s:pr:%d", target.Owner, target.Repo, target.PRNumber)
+	}
+	hydrateCtx, hydrateCancel := context.WithTimeout(s.bgCtx, s.cfg.EnqueueTimeout)
+	seq := s.registerWebhookHydration(dedupKey, hydrateCancel)
+
 	// Acknowledge immediately with 202 Accepted and asynchronously fetch PR metadata/diff + enqueue.
 	s.bgWG.Add(1)
 	go func() {
 		defer s.bgWG.Done()
-		ctx, cancel := context.WithTimeout(s.bgCtx, s.cfg.EnqueueTimeout)
-		defer cancel()
+		defer hydrateCancel()
+		defer s.finishWebhookHydration(dedupKey, seq)
 
-		task, buildErr := s.cfg.GitHubAdapter.BuildTaskContext(ctx, target)
+		task, buildErr := s.cfg.GitHubAdapter.BuildTaskContext(hydrateCtx, target)
 		if buildErr != nil {
 			if errors.Is(buildErr, ghinput.ErrIgnoredEvent) {
 				s.logger.Info("ignored github pr event after hydration", "delivery_id", deliveryID, "pr", target.PRNumber, "reason", buildErr)
 				return
 			}
+			if s.isWebhookSuperseded(dedupKey, seq) && errors.Is(buildErr, context.Canceled) {
+				s.logger.Info("cancelled superseded github pr webhook hydration", "run_id", runID, "delivery_id", deliveryID, "pr", target.PRNumber, "seq", seq)
+				return
+			}
 			s.logger.Error("failed to hydrate github pr task context", "delivery_id", deliveryID, "pr", target.PRNumber, "error", buildErr)
 			return
 		}
+		if s.isWebhookSuperseded(dedupKey, seq) {
+			s.logger.Info("skipping enqueue for superseded github pr webhook", "run_id", runID, "delivery_id", deliveryID, "pr", target.PRNumber, "seq", seq)
+			return
+		}
 		task.RunID = runID
+		task.DedupSequence = seq
 		if task.WorkflowName == "" {
 			task.WorkflowName = wf.Name
 		}
 
-		if _, enqErr := s.cfg.Scheduler.Enqueue(ctx, task, wf); enqErr != nil {
+		if _, enqErr := s.cfg.Scheduler.Enqueue(hydrateCtx, task, wf); enqErr != nil {
+			if errors.Is(enqErr, orchestrator.ErrRunSuperseded) {
+				s.logger.Info("github pr webhook superseded before enqueue", "run_id", runID, "delivery_id", deliveryID, "pr", target.PRNumber, "seq", seq)
+				return
+			}
 			s.logger.Error("failed to enqueue github pr workflow run", "run_id", runID, "pr", target.PRNumber, "error", enqErr)
 		}
 	}()
@@ -260,6 +292,46 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		"pr_number":   target.PRNumber,
 		"delivery_id": deliveryID,
 	})
+}
+
+func (s *Server) registerWebhookHydration(dedupKey string, cancel context.CancelFunc) uint64 {
+	s.hydrationMu.Lock()
+	s.webhookSeq++
+	seq := s.webhookSeq
+	var prevCancel context.CancelFunc
+	if dedupKey != "" {
+		if prev, ok := s.hydratingByDedup[dedupKey]; ok && prev.cancel != nil {
+			prevCancel = prev.cancel
+		}
+		s.latestSeqByDedup[dedupKey] = seq
+		s.hydratingByDedup[dedupKey] = hydrationInFlight{seq: seq, cancel: cancel}
+	}
+	s.hydrationMu.Unlock()
+	if prevCancel != nil {
+		prevCancel()
+	}
+	return seq
+}
+
+func (s *Server) finishWebhookHydration(dedupKey string, seq uint64) {
+	if dedupKey == "" {
+		return
+	}
+	s.hydrationMu.Lock()
+	if cur, ok := s.hydratingByDedup[dedupKey]; ok && cur.seq == seq {
+		delete(s.hydratingByDedup, dedupKey)
+	}
+	s.hydrationMu.Unlock()
+}
+
+func (s *Server) isWebhookSuperseded(dedupKey string, seq uint64) bool {
+	if dedupKey == "" || seq == 0 {
+		return false
+	}
+	s.hydrationMu.Lock()
+	latest := s.latestSeqByDedup[dedupKey]
+	s.hydrationMu.Unlock()
+	return seq < latest
 }
 
 func (s *Server) handleTriggerWorkflow(w http.ResponseWriter, r *http.Request) {

@@ -75,14 +75,14 @@ func TestVerifySignatureAndParseWebhookEvents(t *testing.T) {
 		t.Fatalf("draft PR error = %v, want ErrIgnoredEvent", err)
 	}
 
-	// /mochi review issue_comment on a PR should trigger.
+	// /mochi review issue_comment on an open PR by an authorized commenter should trigger.
 	commentPayload := []byte(`{
 		"action": "created",
 		"installation": {"id": 9001},
 		"repository": {"name": "mochi", "owner": {"login": "shohei-yamagiwa"}},
 		"sender": {"login": "alice", "type": "User"},
-		"issue": {"number": 42, "pull_request": {"url": "https://api.github.com/repos/shohei-yamagiwa/mochi/pulls/42"}},
-		"comment": {"body": "Please check this\n/mochi review"}
+		"issue": {"number": 42, "state": "open", "pull_request": {"url": "https://api.github.com/repos/shohei-yamagiwa/mochi/pulls/42"}},
+		"comment": {"body": "Please check this\n/mochi review", "author_association": "OWNER"}
 	}`)
 	commentTarget, err := adapter.ParseWebhookEvent("issue_comment", commentPayload, nil)
 	if err != nil {
@@ -90,6 +90,36 @@ func TestVerifySignatureAndParseWebhookEvents(t *testing.T) {
 	}
 	if commentTarget.PRNumber != 42 || commentTarget.TriggerEvent != "issue_comment.command" {
 		t.Fatalf("unexpected commentTarget: %+v", commentTarget)
+	}
+
+	// Unauthorized commenter associations should be ignored.
+	for _, assoc := range []string{"NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", ""} {
+		var unauthPayload string
+		if assoc == "" {
+			unauthPayload = strings.ReplaceAll(string(commentPayload), `, "author_association": "OWNER"`, ``)
+		} else {
+			unauthPayload = strings.ReplaceAll(string(commentPayload), `"OWNER"`, `"`+assoc+`"`)
+		}
+		if _, err := adapter.ParseWebhookEvent("issue_comment", []byte(unauthPayload), nil); !errors.Is(err, ghinput.ErrIgnoredEvent) {
+			t.Fatalf("association %q error = %v, want ErrIgnoredEvent", assoc, err)
+		}
+	}
+
+	// Custom AllowedCommentAssociations override allows MEMBER or CONTRIBUTOR when configured.
+	customTriggers := &domain.TriggerConfig{
+		CommentCommand:             "/mochi review",
+		AllowedCommentAssociations: []string{"CONTRIBUTOR"},
+		IgnoreDrafts:               true,
+	}
+	contribPayload := strings.ReplaceAll(string(commentPayload), `"OWNER"`, `"CONTRIBUTOR"`)
+	if _, err := adapter.ParseWebhookEvent("issue_comment", []byte(contribPayload), customTriggers); err != nil {
+		t.Fatalf("custom AllowedCommentAssociations failed: %v", err)
+	}
+
+	// Comment on a closed PR should be ignored.
+	closedCommentPayload := strings.ReplaceAll(string(commentPayload), `"state": "open"`, `"state": "closed"`)
+	if _, err := adapter.ParseWebhookEvent("issue_comment", []byte(closedCommentPayload), nil); !errors.Is(err, ghinput.ErrIgnoredEvent) {
+		t.Fatalf("closed PR comment error = %v, want ErrIgnoredEvent", err)
 	}
 
 	// Bot comment should be ignored.
@@ -221,7 +251,9 @@ index 1111111..2222222 100644
 	if task.DedupKey != "github:shohei-yamagiwa/mochi:pr:42" {
 		t.Fatalf("DedupKey = %q, want github:shohei-yamagiwa/mochi:pr:42", task.DedupKey)
 	}
-	if task.Workspace.Ref != "head2222222" || task.Workspace.BaseRef != "base1111111" {
+	if task.Workspace.Ref != "head2222222" || task.Workspace.BaseRef != "base1111111" ||
+		task.Workspace.BaseBranch != "main" || task.Workspace.HeadBranch != "fix/auth" ||
+		!slices.Equal(task.Workspace.FetchRefs, []string{"refs/pull/42/head"}) {
 		t.Fatalf("unexpected Workspace: %+v", task.Workspace)
 	}
 	if task.Workspace.CloneToken != "ghs_ephemeral_read_only" {
@@ -284,5 +316,74 @@ func TestVerifySignature_FailClosedByDefault(t *testing.T) {
 	}
 	if err := insecureAdapter.VerifySignature([]byte(`{"ok":true}`), ""); err != nil {
 		t.Fatalf("VerifySignature(insecure opt-in) failed: %v", err)
+	}
+}
+
+func TestBuildTaskContext_IgnoresClosedMergedAndDraftPR(t *testing.T) {
+	tests := []struct {
+		name string
+		pr   map[string]any
+	}{
+		{
+			name: "closed PR",
+			pr: map[string]any{
+				"number": 10,
+				"state":  "closed",
+				"draft":  false,
+				"merged": false,
+			},
+		},
+		{
+			name: "merged PR",
+			pr: map[string]any{
+				"number": 11,
+				"state":  "open",
+				"draft":  false,
+				"merged": true,
+			},
+		},
+		{
+			name: "draft PR via issue_comment with nil triggers",
+			pr: map[string]any{
+				"number": 12,
+				"state":  "open",
+				"draft":  true,
+				"merged": false,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/shohei-yamagiwa/mochi/pulls/") {
+					_ = json.NewEncoder(w).Encode(tc.pr)
+					return
+				}
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+			}))
+			defer srv.Close()
+
+			baseURL := srv.URL + "/"
+			ghClient, err := github.NewClient(github.WithHTTPClient(srv.Client()), github.WithURLs(&baseURL, &baseURL))
+			if err != nil {
+				t.Fatal(err)
+			}
+			adapter, err := ghinput.NewAdapter(ghinput.NewStaticClientFactory(ghClient, "tok"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			num := tc.pr["number"].(int)
+			_, err = adapter.BuildTaskContext(context.Background(), &ghinput.PRTarget{
+				Owner:        "shohei-yamagiwa",
+				Repo:         "mochi",
+				PRNumber:     num,
+				TriggerEvent: "issue_comment.command",
+			})
+			if !errors.Is(err, ghinput.ErrIgnoredEvent) {
+				t.Fatalf("%s: got err=%v, want ErrIgnoredEvent", tc.name, err)
+			}
+		})
 	}
 }

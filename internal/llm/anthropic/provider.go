@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -305,7 +306,10 @@ func toToolInputSchema(schemaMap map[string]any) anthropicsdk.ToolInputSchemaPar
 
 func mapEffort(effort string) anthropicsdk.OutputConfigEffort {
 	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "minimal", "low":
+	case "minimal":
+		slog.Warn("anthropic: reasoning_effort level clamped to low", "requested", effort, "applied", "low")
+		return anthropicsdk.OutputConfigEffortLow
+	case "low":
 		return anthropicsdk.OutputConfigEffortLow
 	case "medium":
 		return anthropicsdk.OutputConfigEffortMedium

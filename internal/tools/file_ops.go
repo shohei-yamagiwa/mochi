@@ -73,12 +73,15 @@ func (t *readFileTool) Execute(ctx context.Context, execCtx ExecutionContext, ra
 	if startLine <= 0 {
 		startLine = 1
 	}
-	if endLine <= 0 {
-		lineCount := countLines(content)
-		if lineCount == 0 {
+	lineCount := countLines(content)
+	if lineCount == 0 {
+		if endLine <= 0 || endLine > startLine {
 			endLine = startLine
-		} else {
-			endLine = startLine + lineCount - 1
+		}
+	} else {
+		effectiveEnd := startLine + lineCount - 1
+		if endLine <= 0 || endLine > effectiveEnd {
+			endLine = effectiveEnd
 		}
 	}
 

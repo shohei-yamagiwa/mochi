@@ -199,14 +199,31 @@ func (a *Adapter) buildFromLocalGit(ctx context.Context, req RunRequest) (*domai
 
 	dedupKey := fmt.Sprintf("cli:%s/%s:%s..%s", owner, name, shortSHA(baseSHA), shortSHA(headSHA))
 
+	var workspaceHeadBranch string
+	if headBranch != "" && headBranch != "HEAD" {
+		workspaceHeadBranch = headBranch
+	}
+	var workspaceBaseBranch string
+	if baseRef != "" && baseRef != "HEAD" {
+		if _, err := runGit(ctx, absRepo, "show-ref", "--verify", "--quiet", "refs/heads/"+baseRef); err == nil {
+			workspaceBaseBranch = baseRef
+		} else if trimmed, ok := strings.CutPrefix(baseRef, "origin/"); ok && trimmed != "" {
+			if _, err := runGit(ctx, absRepo, "show-ref", "--verify", "--quiet", "refs/remotes/"+baseRef); err == nil {
+				workspaceBaseBranch = trimmed
+			}
+		}
+	}
+
 	return &domain.TaskContext{
 		WorkflowName: strings.TrimSpace(req.WorkflowName),
 		TriggerType:  adapterName,
 		DedupKey:     dedupKey,
 		Workspace: domain.WorkspaceSpec{
-			RepoURL: repoURL,
-			Ref:     headSHA,
-			BaseRef: baseSHA,
+			RepoURL:    repoURL,
+			Ref:        headSHA,
+			BaseRef:    baseSHA,
+			BaseBranch: workspaceBaseBranch,
+			HeadBranch: workspaceHeadBranch,
 		},
 		Changeset: &domain.ChangesetSpec{
 			Provider:     "git_local",

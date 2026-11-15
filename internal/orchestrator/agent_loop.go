@@ -173,8 +173,23 @@ func (l *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 		nextToolChoice = "auto"
 	}
 
+	var submitOnlyDefs []llm.ToolDefinition
+	for _, td := range toolDefs {
+		if td.Name == "submit_output" {
+			submitOnlyDefs = append(submitOnlyDefs, td)
+			break
+		}
+	}
+	canSubmit := requireSubmit && len(submitOnlyDefs) > 0
+
 	maxTurns := req.Role.Budgets.MaxTurns
 	maxTokens := req.Role.Budgets.MaxTokens
+
+	lastTurnInput := 0
+	lastTurnOutput := 0
+	lastMsgCount := len(messages)
+	windDownAttempted := false
+	forceWindDownNext := false
 
 	for turnIdx := 0; ; turnIdx++ {
 		if err := runCtx.Err(); err != nil {
@@ -183,13 +198,37 @@ func (l *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 		if maxTurns > 0 && agentRun.TurnsUsed >= maxTurns {
 			return finalize(domain.AgentRunStatusFailed, nil, fmt.Errorf("%w (%d)", ErrMaxTurnsExceeded, maxTurns))
 		}
-		if maxTokens > 0 && (agentRun.InputTokens+agentRun.OutputTokens) >= maxTokens {
-			return finalize(domain.AgentRunStatusFailed, nil, fmt.Errorf("%w (%d/%d)", ErrMaxTokensExceeded, agentRun.InputTokens+agentRun.OutputTokens, maxTokens))
+
+		usedTokens := agentRun.InputTokens + agentRun.OutputTokens
+		if maxTokens > 0 && usedTokens >= maxTokens && !forceWindDownNext {
+			return finalize(domain.AgentRunStatusFailed, nil, fmt.Errorf("%w (%d/%d)", ErrMaxTokensExceeded, usedTokens, maxTokens))
 		}
 
+		approachingMaxTokens := false
+		if maxTokens > 0 && turnIdx > 0 && !windDownAttempted && canSubmit {
+			estNextInput := lastTurnInput + estimateMessageTokens(messages[lastMsgCount:])
+			estNextTurn := estNextInput + lastTurnOutput
+			if usedTokens+estNextTurn >= maxTokens {
+				approachingMaxTokens = true
+			}
+		}
+
+		isLastTurn := maxTurns > 0 && agentRun.TurnsUsed == maxTurns-1
+		tokenWindDown := (approachingMaxTokens || forceWindDownNext) && canSubmit && !windDownAttempted
+		forceWindDownNext = false
+
+		activeTools := toolDefs
 		toolChoice := nextToolChoice
-		if maxTurns > 0 && agentRun.TurnsUsed == maxTurns-1 && requireSubmit && toolSet != nil && toolSet.HasTool("submit_output") {
+		if canSubmit && (isLastTurn || tokenWindDown) {
 			toolChoice = "submit_output"
+			activeTools = submitOnlyDefs
+		}
+		if tokenWindDown {
+			windDownAttempted = true
+			messages = append(messages, llm.Message{
+				Role:    llm.RoleSystem,
+				Content: "Token budget is nearly exhausted. Do not call any further exploration tools. Immediately call submit_output with all validated findings gathered so far.",
+			})
 		}
 
 		reqMsgsSnapshot := make([]llm.Message, len(messages))
@@ -199,7 +238,7 @@ func (l *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 			Config:         req.Role.LLM,
 			SystemPrompt:   req.SystemPrompt,
 			Messages:       messages,
-			Tools:          toolDefs,
+			Tools:          activeTools,
 			ToolChoice:     toolChoice,
 			ResponseSchema: req.ResponseSchema,
 		}
@@ -221,6 +260,8 @@ func (l *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 		agentRun.InputTokens += resp.Usage.InputTokens
 		agentRun.OutputTokens += resp.Usage.OutputTokens
 		agentRun.CachedTokens += resp.Usage.CachedTokens
+		lastTurnInput = resp.Usage.InputTokens
+		lastTurnOutput = resp.Usage.OutputTokens
 
 		turnID := newID()
 		if l.Store != nil {
@@ -263,16 +304,23 @@ func (l *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 		}
 
 		messages = append(messages, resp.Message)
+		lastMsgCount = len(messages)
 
-		// Enforce strict token ceiling immediately if we exceeded max_tokens.
-		if maxTokens > 0 && (agentRun.InputTokens+agentRun.OutputTokens) > maxTokens {
-			return finalize(domain.AgentRunStatusFailed, nil, fmt.Errorf("%w (%d > %d)", ErrMaxTokensExceeded, agentRun.InputTokens+agentRun.OutputTokens, maxTokens))
-		}
+		usedTokens = agentRun.InputTokens + agentRun.OutputTokens
+		overMaxTokens := maxTokens > 0 && usedTokens > maxTokens
 
 		if len(resp.ToolCalls) == 0 {
 			if !requireSubmit {
 				submitted := normalizeFinalTextOutput(resp.Message.Content)
 				return finalize(domain.AgentRunStatusCompleted, submitted, nil)
+			}
+			if overMaxTokens {
+				if turnIdx == 0 || windDownAttempted || !canSubmit || (maxTurns > 0 && agentRun.TurnsUsed >= maxTurns) {
+					return finalize(domain.AgentRunStatusFailed, nil, fmt.Errorf("%w (%d > %d)", ErrMaxTokensExceeded, usedTokens, maxTokens))
+				}
+				forceWindDownNext = true
+				nextToolChoice = "submit_output"
+				continue
 			}
 			if maxTurns > 0 && agentRun.TurnsUsed >= maxTurns {
 				return finalize(domain.AgentRunStatusFailed, nil, fmt.Errorf("%w (%d) without submit_output", ErrMaxTurnsExceeded, maxTurns))
@@ -287,6 +335,18 @@ func (l *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 
 		if toolSet == nil {
 			return finalize(domain.AgentRunStatusFailed, nil, fmt.Errorf("agent emitted tool calls but no ToolSet was provided"))
+		}
+
+		hasSubmitCall := false
+		for _, tc := range resp.ToolCalls {
+			if tc.Name == "submit_output" {
+				hasSubmitCall = true
+				break
+			}
+		}
+		canWindDownAfterTurn := turnIdx > 0 && !windDownAttempted && canSubmit && (maxTurns <= 0 || agentRun.TurnsUsed < maxTurns)
+		if overMaxTokens && !hasSubmitCall && !canWindDownAfterTurn {
+			return finalize(domain.AgentRunStatusFailed, nil, fmt.Errorf("%w (%d > %d)", ErrMaxTokensExceeded, usedTokens, maxTokens))
 		}
 
 		var submittedOutput json.RawMessage
@@ -363,8 +423,30 @@ func (l *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 		if submitted {
 			return finalize(domain.AgentRunStatusCompleted, submittedOutput, nil)
 		}
+		if overMaxTokens {
+			if canWindDownAfterTurn {
+				forceWindDownNext = true
+				nextToolChoice = "submit_output"
+				continue
+			}
+			return finalize(domain.AgentRunStatusFailed, nil, fmt.Errorf("%w (%d > %d)", ErrMaxTokensExceeded, usedTokens, maxTokens))
+		}
 		nextToolChoice = "auto"
 	}
+}
+
+func estimateMessageTokens(msgs []llm.Message) int {
+	totalChars := 0
+	for _, m := range msgs {
+		totalChars += len(m.Content) + len(m.Thinking) + 16
+		for _, tc := range m.ToolCalls {
+			totalChars += len(tc.Name) + len(tc.Arguments) + 16
+		}
+	}
+	if totalChars == 0 {
+		return 0
+	}
+	return (totalChars + 3) / 4
 }
 
 func statusFromContextErr(err error) domain.AgentRunStatus {

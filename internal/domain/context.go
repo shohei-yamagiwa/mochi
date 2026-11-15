@@ -4,25 +4,29 @@ import "context"
 
 // TaskContext is the canonical, platform-neutral input to any workflow.
 type TaskContext struct {
-	RunID        string         `json:"run_id"`
-	WorkflowName string         `json:"workflow_name"`
-	TriggerType  string         `json:"trigger_type"`  // e.g. "github_pr", "cli", "webhook"
-	DedupKey     string         `json:"dedup_key"`     // e.g. "github:owner/repo:pr:42"
-	Workspace    WorkspaceSpec  `json:"workspace"`     // How Daytona should prepare the codebase
-	Changeset    *ChangesetSpec `json:"changeset"`     // Structured PR/commit metadata, diff, and changed files
-	Variables    map[string]any `json:"variables"`     // Exposed to Go text/template prompts
-	SinkMetadata map[string]any `json:"sink_metadata"` // Routing metadata for the OutputSink
+	RunID         string         `json:"run_id"`
+	WorkflowName  string         `json:"workflow_name"`
+	TriggerType   string         `json:"trigger_type"`  // e.g. "github_pr", "cli", "webhook"
+	DedupKey      string         `json:"dedup_key"`     // e.g. "github:owner/repo:pr:42"
+	DedupSequence uint64         `json:"-"`             // Monotonic per-DedupKey ingress order to reject late hydration
+	Workspace     WorkspaceSpec  `json:"workspace"`     // How Daytona should prepare the codebase
+	Changeset     *ChangesetSpec `json:"changeset"`     // Structured PR/commit metadata, diff, and changed files
+	Variables     map[string]any `json:"variables"`     // Exposed to Go text/template prompts
+	SinkMetadata  map[string]any `json:"sink_metadata"` // Routing metadata for the OutputSink
 }
 
 // WorkspaceSpec describes how the sandbox provider prepares the repository workspace.
 type WorkspaceSpec struct {
-	RepoURL    string `json:"repo_url"`
-	Ref        string `json:"ref"`                  // Head Commit SHA or branch
-	BaseRef    string `json:"base_ref"`             // Base branch/SHA for diffs
-	CloneToken string `json:"-"`                    // Ephemeral read-only token (never logged or persisted)
-	Snapshot   string `json:"snapshot,omitempty"`   // Daytona Snapshot name/ID (fastest ~90ms boot)
-	Image      string `json:"image,omitempty"`      // Optional Docker image override
-	Dockerfile string `json:"dockerfile,omitempty"` // Optional path to Dockerfile in repo
+	RepoURL    string   `json:"repo_url"`
+	Ref        string   `json:"ref"`                   // Head Commit SHA or branch
+	BaseRef    string   `json:"base_ref"`              // Base branch/SHA for diffs
+	BaseBranch string   `json:"base_branch,omitempty"` // Optional base branch name for clone/fetch
+	HeadBranch string   `json:"head_branch,omitempty"` // Optional head branch name for same-repo PRs
+	FetchRefs  []string `json:"fetch_refs,omitempty"`  // Optional git refs to fetch (e.g. refs/pull/42/head)
+	CloneToken string   `json:"-"`                     // Ephemeral read-only token (never logged or persisted)
+	Snapshot   string   `json:"snapshot,omitempty"`    // Daytona Snapshot name/ID (fastest ~90ms boot)
+	Image      string   `json:"image,omitempty"`       // Optional Docker image override
+	Dockerfile string   `json:"dockerfile,omitempty"`  // Optional path to Dockerfile in repo
 }
 
 // ChangesetSpec records the exact VCS / Pull Request state at trigger time.

@@ -60,12 +60,13 @@ type Scheduler struct {
 	senders    sync.WaitGroup
 	wg         sync.WaitGroup
 
-	mu              sync.Mutex
-	closed          bool
-	activeByRunID   map[string]*scheduledJob
-	activeByDedup   map[string]*scheduledJob
-	jobsByRunID     map[string]*scheduledJob
-	completedRunIDs []string
+	mu               sync.Mutex
+	closed           bool
+	activeByRunID    map[string]*scheduledJob
+	activeByDedup    map[string]*scheduledJob
+	latestSeqByDedup map[string]uint64
+	jobsByRunID      map[string]*scheduledJob
+	completedRunIDs  []string
 }
 
 // NewScheduler constructs and starts a Scheduler backed by runner.
@@ -82,15 +83,16 @@ func NewScheduler(runner *Runner, cfg SchedulerConfig) *Scheduler {
 
 	baseCtx, baseCancel := context.WithCancelCause(context.Background())
 	s := &Scheduler{
-		runner:        runner,
-		cfg:           cfg,
-		baseCtx:       baseCtx,
-		baseCancel:    baseCancel,
-		closing:       make(chan struct{}),
-		queue:         make(chan *scheduledJob, cfg.QueueSize),
-		activeByRunID: make(map[string]*scheduledJob),
-		activeByDedup: make(map[string]*scheduledJob),
-		jobsByRunID:   make(map[string]*scheduledJob),
+		runner:           runner,
+		cfg:              cfg,
+		baseCtx:          baseCtx,
+		baseCancel:       baseCancel,
+		closing:          make(chan struct{}),
+		queue:            make(chan *scheduledJob, cfg.QueueSize),
+		activeByRunID:    make(map[string]*scheduledJob),
+		activeByDedup:    make(map[string]*scheduledJob),
+		latestSeqByDedup: make(map[string]uint64),
+		jobsByRunID:      make(map[string]*scheduledJob),
 	}
 
 	for range cfg.MaxWorkers {
@@ -125,10 +127,18 @@ func (s *Scheduler) Enqueue(ctx context.Context, task *domain.TaskContext, wf *d
 		return "", fmt.Errorf("scheduler marshal workflow yaml: %w", err)
 	}
 
+	dedupKey := strings.TrimSpace(task.DedupKey)
+
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return "", ErrSchedulerClosed
+	}
+	if dedupKey != "" && task.DedupSequence > 0 {
+		if latest, exists := s.latestSeqByDedup[dedupKey]; exists && task.DedupSequence <= latest {
+			s.mu.Unlock()
+			return "", fmt.Errorf("%w: sequence %d superseded by %d", ErrRunSuperseded, task.DedupSequence, latest)
+		}
 	}
 	s.senders.Add(1)
 	s.mu.Unlock()
@@ -162,7 +172,6 @@ func (s *Scheduler) Enqueue(ctx context.Context, task *domain.TaskContext, wf *d
 	}
 
 	jobCtx, jobCancel := context.WithCancelCause(s.baseCtx)
-	dedupKey := strings.TrimSpace(task.DedupKey)
 	job := &scheduledJob{
 		runID:    task.RunID,
 		dedupKey: dedupKey,
@@ -190,6 +199,18 @@ func (s *Scheduler) Enqueue(ctx context.Context, task *domain.TaskContext, wf *d
 	case s.queue <- job:
 		s.mu.Lock()
 		if dedupKey != "" {
+			if task.DedupSequence > 0 {
+				if latest, exists := s.latestSeqByDedup[dedupKey]; exists && task.DedupSequence <= latest {
+					supersededErr := fmt.Errorf("%w: sequence %d superseded by %d", ErrRunSuperseded, task.DedupSequence, latest)
+					job.cancel(supersededErr)
+					s.activeByRunID[job.runID] = job
+					s.jobsByRunID[job.runID] = job
+					s.mu.Unlock()
+					close(job.ready)
+					return "", supersededErr
+				}
+				s.latestSeqByDedup[dedupKey] = task.DedupSequence
+			}
 			if prev, exists := s.activeByDedup[dedupKey]; exists && prev.runID != job.runID {
 				prev.cancel(fmt.Errorf("%w: superseded by %s", ErrRunSuperseded, job.runID))
 			}
