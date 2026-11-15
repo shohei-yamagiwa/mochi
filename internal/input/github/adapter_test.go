@@ -221,7 +221,9 @@ index 1111111..2222222 100644
 	if task.DedupKey != "github:shohei-yamagiwa/mochi:pr:42" {
 		t.Fatalf("DedupKey = %q, want github:shohei-yamagiwa/mochi:pr:42", task.DedupKey)
 	}
-	if task.Workspace.Ref != "head2222222" || task.Workspace.BaseRef != "base1111111" {
+	if task.Workspace.Ref != "head2222222" || task.Workspace.BaseRef != "base1111111" ||
+		task.Workspace.BaseBranch != "main" || task.Workspace.HeadBranch != "fix/auth" ||
+		!slices.Equal(task.Workspace.FetchRefs, []string{"refs/pull/42/head"}) {
 		t.Fatalf("unexpected Workspace: %+v", task.Workspace)
 	}
 	if task.Workspace.CloneToken != "ghs_ephemeral_read_only" {

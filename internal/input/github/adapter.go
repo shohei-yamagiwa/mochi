@@ -363,6 +363,11 @@ func (a *Adapter) BuildTaskContext(ctx context.Context, rawEvent any) (*domain.T
 
 	dedupKey := fmt.Sprintf("github:%s/%s:pr:%d", target.Owner, target.Repo, target.PRNumber)
 
+	var fetchRefs []string
+	if target.PRNumber > 0 {
+		fetchRefs = append(fetchRefs, fmt.Sprintf("refs/pull/%d/head", target.PRNumber))
+	}
+
 	return &domain.TaskContext{
 		WorkflowName: wfName,
 		TriggerType:  adapterName,
@@ -371,6 +376,9 @@ func (a *Adapter) BuildTaskContext(ctx context.Context, rawEvent any) (*domain.T
 			RepoURL:    repoURL,
 			Ref:        headSHA,
 			BaseRef:    baseSHA,
+			BaseBranch: baseBranch,
+			HeadBranch: headBranch,
+			FetchRefs:  fetchRefs,
 			CloneToken: cloneToken,
 		},
 		Changeset: &domain.ChangesetSpec{

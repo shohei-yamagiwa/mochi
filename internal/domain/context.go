@@ -16,13 +16,16 @@ type TaskContext struct {
 
 // WorkspaceSpec describes how the sandbox provider prepares the repository workspace.
 type WorkspaceSpec struct {
-	RepoURL    string `json:"repo_url"`
-	Ref        string `json:"ref"`                  // Head Commit SHA or branch
-	BaseRef    string `json:"base_ref"`             // Base branch/SHA for diffs
-	CloneToken string `json:"-"`                    // Ephemeral read-only token (never logged or persisted)
-	Snapshot   string `json:"snapshot,omitempty"`   // Daytona Snapshot name/ID (fastest ~90ms boot)
-	Image      string `json:"image,omitempty"`      // Optional Docker image override
-	Dockerfile string `json:"dockerfile,omitempty"` // Optional path to Dockerfile in repo
+	RepoURL    string   `json:"repo_url"`
+	Ref        string   `json:"ref"`                   // Head Commit SHA or branch
+	BaseRef    string   `json:"base_ref"`              // Base branch/SHA for diffs
+	BaseBranch string   `json:"base_branch,omitempty"` // Optional base branch name for clone/fetch
+	HeadBranch string   `json:"head_branch,omitempty"` // Optional head branch name for same-repo PRs
+	FetchRefs  []string `json:"fetch_refs,omitempty"`  // Optional git refs to fetch (e.g. refs/pull/42/head)
+	CloneToken string   `json:"-"`                     // Ephemeral read-only token (never logged or persisted)
+	Snapshot   string   `json:"snapshot,omitempty"`    // Daytona Snapshot name/ID (fastest ~90ms boot)
+	Image      string   `json:"image,omitempty"`       // Optional Docker image override
+	Dockerfile string   `json:"dockerfile,omitempty"`  // Optional path to Dockerfile in repo
 }
 
 // ChangesetSpec records the exact VCS / Pull Request state at trigger time.

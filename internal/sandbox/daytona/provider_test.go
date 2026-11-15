@@ -1,11 +1,15 @@
 package daytona
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -449,3 +453,297 @@ func TestDaytonaProvider_CreatePrepareForkExecFilesAndDestroy(t *testing.T) {
 		t.Fatalf("expected image create, commit_id clone, and cleanup delete on failure: image=%v commitId=%v delete=%v", sawImageCreate, sawCommitID, sawCleanupDelete)
 	}
 }
+
+func TestDaytonaProvider_PRHeadCommitCloneAndFetch(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		cloneReq map[string]any
+		execReqs []map[string]any
+	)
+	var srvURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/sandbox":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":                  "sb-pr",
+				"organizationId":      "org-1",
+				"name":                "mochi-pr",
+				"user":                "daytona",
+				"env":                 map[string]string{},
+				"labels":              map[string]string{"code-toolbox-language": "python"},
+				"public":              false,
+				"networkBlockAll":     false,
+				"kvm":                 false,
+				"target":              "us",
+				"cpu":                 2,
+				"gpu":                 0,
+				"memory":              4,
+				"disk":                20,
+				"state":               "started",
+				"toolboxProxyUrl":     srvURL + "/toolbox",
+				"autoStopInterval":    15,
+				"autoArchiveInterval": 15,
+				"autoDeleteInterval":  0,
+			})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/work-dir"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"dir": "/home/daytona"})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/git/clone"):
+			var body map[string]any
+			_ = json.Unmarshal(raw, &body)
+			mu.Lock()
+			cloneReq = body
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/process/execute"):
+			var body map[string]any
+			_ = json.Unmarshal(raw, &body)
+			mu.Lock()
+			execReqs = append(execReqs, body)
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"exitCode": 0, "result": ""})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	srvURL = srv.URL
+
+	useDeprecated := true
+	prov, err := NewProvider(Config{
+		APIKey:               "daytona-test-key",
+		APIUrl:               srv.URL,
+		UseDeprecatedPolling: &useDeprecated,
+	})
+	if err != nil {
+		t.Fatalf("NewProvider: %v", err)
+	}
+
+	headSHA := "1111111222222233333334444444555555566666"
+	baseSHA := "aaaaaaaabbbbbbbbccccccccddddddddeeeeeeee"
+	token := "ghs_pr_clone_secret"
+	_, err = prov.CreateAndPrepareBaseSandbox(context.Background(), sandbox.CreateOptions{
+		Name: "mochi-pr",
+		Workspace: domain.WorkspaceSpec{
+			RepoURL:    "https://github.com/shohei-yamagiwa/mochi.git",
+			Ref:        headSHA,
+			BaseRef:    baseSHA,
+			BaseBranch: "main",
+			HeadBranch: "feat/pr-fix",
+			FetchRefs:  []string{"refs/pull/42/head"},
+			CloneToken: token,
+			Snapshot:   "go-1.24",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAndPrepareBaseSandbox: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if cloneReq == nil {
+		t.Fatalf("expected git clone request")
+	}
+	if cloneReq["branch"] != "main" {
+		t.Fatalf("expected clone branch=main for PR base branch, got %v", cloneReq["branch"])
+	}
+	if _, hasCommitID := cloneReq["commit_id"]; hasCommitID && cloneReq["commit_id"] != "" {
+		t.Fatalf("did not expect single-branch commit_id on PR clone, got %v", cloneReq["commit_id"])
+	}
+	if len(execReqs) != 2 {
+		t.Fatalf("expected 2 process/execute calls (fetch+checkout, strip), got %d", len(execReqs))
+	}
+
+	fetchCmd, _ := execReqs[0]["command"].(string)
+	if strings.Contains(fetchCmd, token) {
+		t.Fatalf("clone token must not appear in shell command string")
+	}
+	if !strings.Contains(fetchCmd, "+refs/pull/42/head") || !strings.Contains(fetchCmd, "git checkout --detach '"+headSHA+"'") {
+		t.Fatalf("unexpected fetch/checkout command: %s", fetchCmd)
+	}
+	envsMap, _ := execReqs[0]["envs"].(map[string]any)
+	if envsMap == nil || envsMap["MOCHI_CLONE_TOKEN"] != token || envsMap["GIT_TERMINAL_PROMPT"] != "0" {
+		t.Fatalf("unexpected fetch envs: %v", envsMap)
+	}
+
+	stripCmd, _ := execReqs[1]["command"].(string)
+	if !strings.Contains(stripCmd, "git remote set-url origin 'https://github.com/shohei-yamagiwa/mochi.git'") {
+		t.Fatalf("expected final credential strip command, got: %s", stripCmd)
+	}
+}
+
+func TestDaytonaProvider_LocalGitPRFetchAndCheckout(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary not found")
+	}
+
+	runGit := func(dir string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Mochi Test",
+			"GIT_AUTHOR_EMAIL=mochi@example.com",
+			"GIT_COMMITTER_NAME=Mochi Test",
+			"GIT_COMMITTER_EMAIL=mochi@example.com",
+		)
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Stderr = &out
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("git %v in %s failed: %v\n%s", args, dir, err, out.String())
+		}
+		return strings.TrimSpace(out.String())
+	}
+
+	tmp := t.TempDir()
+	remoteDir := filepath.Join(tmp, "remote.git")
+	workSrc := filepath.Join(tmp, "work-src")
+	sandboxHome := filepath.Join(tmp, "sandbox-home")
+	repoDir := filepath.Join(sandboxHome, "repo")
+	if err := os.MkdirAll(sandboxHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	runGit(tmp, "init", "--bare", remoteDir)
+	runGit(tmp, "clone", remoteDir, workSrc)
+	runGit(workSrc, "checkout", "-b", "main")
+	if err := os.WriteFile(filepath.Join(workSrc, "app.go"), []byte("package app\n\nfunc Version() int { return 1 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(workSrc, "add", "app.go")
+	runGit(workSrc, "commit", "-m", "base commit")
+	baseSHA := runGit(workSrc, "rev-parse", "HEAD")
+	runGit(workSrc, "push", "-u", "origin", "main")
+	runGit(remoteDir, "symbolic-ref", "HEAD", "refs/heads/main")
+
+	// Create PR branch commit (only reachable via refs/pull/7/head, simulating a fork PR).
+	runGit(workSrc, "checkout", "-b", "fork-pr")
+	if err := os.WriteFile(filepath.Join(workSrc, "pr.go"), []byte("package app\n\nfunc PRFeature() bool { return true }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(workSrc, "add", "pr.go")
+	runGit(workSrc, "commit", "-m", "pr commit")
+	prHeadSHA := runGit(workSrc, "rev-parse", "HEAD")
+	runGit(workSrc, "push", "origin", prHeadSHA+":refs/pull/7/head")
+
+	// Advance main so main has a commit PR branch doesn't have.
+	runGit(workSrc, "checkout", "main")
+	if err := os.WriteFile(filepath.Join(workSrc, "main_only.go"), []byte("package app\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(workSrc, "add", "main_only.go")
+	runGit(workSrc, "commit", "-m", "newer main commit")
+	runGit(workSrc, "push", "origin", "main")
+
+	var srvURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/sandbox":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":                  "sb-real-git",
+				"organizationId":      "org-1",
+				"name":                "mochi-real-git",
+				"user":                "daytona",
+				"env":                 map[string]string{},
+				"labels":              map[string]string{"code-toolbox-language": "python"},
+				"public":              false,
+				"networkBlockAll":     false,
+				"kvm":                 false,
+				"target":              "us",
+				"cpu":                 2,
+				"gpu":                 0,
+				"memory":              4,
+				"disk":                20,
+				"state":               "started",
+				"toolboxProxyUrl":     srvURL + "/toolbox",
+				"autoStopInterval":    15,
+				"autoArchiveInterval": 15,
+				"autoDeleteInterval":  0,
+			})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/work-dir"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"dir": sandboxHome})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/git/clone"):
+			var body map[string]any
+			_ = json.Unmarshal(raw, &body)
+			branch, _ := body["branch"].(string)
+			args := []string{"clone", "--single-branch"}
+			if branch != "" {
+				args = append(args, "--branch", branch)
+			}
+			args = append(args, remoteDir, repoDir)
+			runGit(sandboxHome, args...)
+			_ = json.NewEncoder(w).Encode(map[string]any{})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/process/execute"):
+			var body map[string]any
+			_ = json.Unmarshal(raw, &body)
+			cmdStr, _ := body["command"].(string)
+			cwd, _ := body["cwd"].(string)
+			cmd := exec.Command("sh", "-c", cmdStr)
+			cmd.Dir = cwd
+			cmd.Env = os.Environ()
+			if envsRaw, ok := body["envs"].(map[string]any); ok {
+				for k, v := range envsRaw {
+					if s, ok := v.(string); ok {
+						cmd.Env = append(cmd.Env, k+"="+s)
+					}
+				}
+			}
+			out, err := cmd.CombinedOutput()
+			exitCode := 0
+			if err != nil {
+				exitCode = 1
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"exitCode": exitCode,
+				"result":   string(out),
+			})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	srvURL = srv.URL
+
+	useDeprecated := true
+	prov, err := NewProvider(Config{
+		APIKey:               "daytona-test-key",
+		APIUrl:               srv.URL,
+		UseDeprecatedPolling: &useDeprecated,
+	})
+	if err != nil {
+		t.Fatalf("NewProvider: %v", err)
+	}
+
+	_, err = prov.CreateAndPrepareBaseSandbox(context.Background(), sandbox.CreateOptions{
+		Name: "mochi-real-git",
+		Workspace: domain.WorkspaceSpec{
+			RepoURL:    remoteDir,
+			Ref:        prHeadSHA,
+			BaseRef:    baseSHA,
+			BaseBranch: "main",
+			HeadBranch: "fork-pr", // Deliberately NOT pushed as a branch on remote!
+			FetchRefs:  []string{"refs/pull/7/head"},
+			Snapshot:   "go-1.24",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAndPrepareBaseSandbox failed: %v", err)
+	}
+
+	gotHead := runGit(repoDir, "rev-parse", "HEAD")
+	if gotHead != prHeadSHA {
+		t.Fatalf("checked out HEAD = %s, want %s", gotHead, prHeadSHA)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "pr.go")); err != nil {
+		t.Fatalf("expected pr.go in checked out PR workspace: %v", err)
+	}
+	diffOut := runGit(repoDir, "diff", "--name-only", baseSHA+"...HEAD")
+	if diffOut != "pr.go" {
+		t.Fatalf("three-dot diff base...HEAD = %q, want %q", diffOut, "pr.go")
+	}
+}
+

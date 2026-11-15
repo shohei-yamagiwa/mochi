@@ -170,21 +170,51 @@ func (p *Provider) cloneAndSanitizeRepo(ctx context.Context, rawSB *daytonasdk.S
 			options.WithPassword(ws.CloneToken),
 		)
 	}
-	if ref := strings.TrimSpace(ws.Ref); ref != "" {
-		if isLikelyCommitSHA(ref) {
-			cloneOpts = append(cloneOpts, options.WithCommitId(ref))
-		} else {
+
+	ref := strings.TrimSpace(ws.Ref)
+	baseRef := strings.TrimSpace(ws.BaseRef)
+	baseBranch := strings.TrimSpace(ws.BaseBranch)
+	headBranch := strings.TrimSpace(ws.HeadBranch)
+	hasExtraRefs := len(ws.FetchRefs) > 0 || baseRef != "" || baseBranch != "" || headBranch != ""
+
+	needsPostCloneFetch := false
+	isCommitRef := ref != "" && isLikelyCommitSHA(ref)
+
+	if ref != "" {
+		if !isCommitRef {
 			cloneOpts = append(cloneOpts, options.WithBranch(ref))
+			if len(ws.FetchRefs) > 0 || baseRef != "" || baseBranch != "" {
+				needsPostCloneFetch = true
+			}
+		} else if hasExtraRefs {
+			// Daytona clones single-branch only, so a PR head SHA (on a feature branch or fork PR)
+			// is typically unreachable from the default branch. Clone the base/default branch first,
+			// then explicitly fetch PR/base refs and detach HEAD to the target SHA before stripping credentials.
+			if baseBranch != "" {
+				cloneOpts = append(cloneOpts, options.WithBranch(baseBranch))
+			}
+			needsPostCloneFetch = true
+		} else {
+			cloneOpts = append(cloneOpts, options.WithCommitId(ref))
 		}
+	} else if len(ws.FetchRefs) > 0 || baseRef != "" {
+		needsPostCloneFetch = true
 	}
 
 	if err := rawSB.Git.Clone(ctx, ws.RepoURL, repoDir, cloneOpts...); err != nil {
 		return fmt.Errorf("daytona git clone: %s", redactToken(err.Error(), ws.CloneToken))
 	}
 
+	sanitizedURL := sanitizeRepoURL(ws.RepoURL)
+
+	if needsPostCloneFetch {
+		if err := p.fetchAndCheckoutRefs(ctx, rawSB, repoDir, sanitizedURL, ws); err != nil {
+			return err
+		}
+	}
+
 	// Security invariant (§9.2): strip any embedded credentials / credential helpers
 	// from .git/config and sandbox home before Fork() is ever called.
-	sanitizedURL := sanitizeRepoURL(ws.RepoURL)
 	stripCmd := fmt.Sprintf(
 		"git remote set-url origin %s && "+
 			"{ git config --local --unset-all credential.helper || true; } && "+
@@ -202,6 +232,80 @@ func (p *Provider) cloneAndSanitizeRepo(ctx context.Context, rawSB *daytonasdk.S
 		return fmt.Errorf("daytona strip git credentials failed (exit=%d): %s", res.ExitCode, redactToken(res.Result, ws.CloneToken))
 	}
 
+	return nil
+}
+
+func (p *Provider) fetchAndCheckoutRefs(ctx context.Context, rawSB *daytonasdk.Sandbox, repoDir, sanitizedURL string, ws domain.WorkspaceSpec) error {
+	var cmds []string
+	cmds = append(cmds, "set -e")
+	cmds = append(cmds, "git remote set-url origin "+shellQuote(sanitizedURL))
+
+	env := map[string]string{
+		"GIT_TERMINAL_PROMPT": "0",
+	}
+	gitPrefix := "git -c credential.helper="
+	if ws.CloneToken != "" {
+		env["MOCHI_CLONE_TOKEN"] = ws.CloneToken
+		cmds = append(cmds,
+			`askpass=$(mktemp)`,
+			`trap 'rm -f "$askpass"' EXIT`,
+			`printf '%s\n' '#!/bin/sh' 'case "$1" in *Username*|*username*) printf "%s\n" "x-access-token";; *) printf "%s\n" "$MOCHI_CLONE_TOKEN";; esac' > "$askpass"`,
+			`chmod 700 "$askpass"`,
+			`export GIT_ASKPASS="$askpass"`,
+		)
+	}
+
+	if baseBranch := strings.TrimSpace(ws.BaseBranch); baseBranch != "" {
+		cmds = append(cmds, fmt.Sprintf("{ %s fetch --no-tags origin %s || true; }", gitPrefix, shellQuote(baseBranch)))
+	}
+	for _, fref := range ws.FetchRefs {
+		trimmed := strings.TrimSpace(fref)
+		if trimmed == "" {
+			continue
+		}
+		refspec := trimmed
+		if !strings.HasPrefix(refspec, "+") {
+			refspec = "+" + refspec
+		}
+		cmds = append(cmds, fmt.Sprintf("{ %s fetch --no-tags origin %s || true; }", gitPrefix, shellQuote(refspec)))
+	}
+	if baseRef := strings.TrimSpace(ws.BaseRef); baseRef != "" {
+		cmds = append(cmds, fmt.Sprintf(
+			"if ! git rev-parse --verify --quiet %s >/dev/null; then { %s fetch --no-tags origin %s || true; }; fi",
+			shellQuote(baseRef+"^{commit}"),
+			gitPrefix,
+			shellQuote(baseRef),
+		))
+	}
+
+	ref := strings.TrimSpace(ws.Ref)
+	if ref != "" && isLikelyCommitSHA(ref) {
+		headBranch := strings.TrimSpace(ws.HeadBranch)
+		if headBranch != "" {
+			cmds = append(cmds, fmt.Sprintf(
+				"if ! git rev-parse --verify --quiet %s >/dev/null; then { %s fetch --no-tags origin %s || true; }; fi",
+				shellQuote(ref+"^{commit}"),
+				gitPrefix,
+				shellQuote(headBranch),
+			))
+		}
+		cmds = append(cmds, fmt.Sprintf(
+			"if ! git rev-parse --verify --quiet %s >/dev/null; then %s fetch --no-tags origin %s; fi",
+			shellQuote(ref+"^{commit}"),
+			gitPrefix,
+			shellQuote(ref),
+		))
+		cmds = append(cmds, fmt.Sprintf("git checkout --detach %s", shellQuote(ref)))
+	}
+
+	cmd := strings.Join(cmds, " && ")
+	res, err := rawSB.Process.ExecuteCommand(ctx, cmd, options.WithCwd(repoDir), options.WithCommandEnv(env))
+	if err != nil {
+		return fmt.Errorf("daytona fetch/checkout ref %q: %s", ref, redactToken(err.Error(), ws.CloneToken))
+	}
+	if res != nil && res.ExitCode != 0 {
+		return fmt.Errorf("daytona fetch/checkout ref %q failed (exit=%d): %s", ref, res.ExitCode, redactToken(res.Result, ws.CloneToken))
+	}
 	return nil
 }
 
