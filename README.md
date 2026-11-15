@@ -12,8 +12,10 @@ secrets, Daytona snapshot setup, Render deployment, verification, and recovery.
 - [Dockerfile](Dockerfile) and [Compose](compose.yaml) package the existing Go application.
 - [Render Blueprint](render.yaml) runs one paid instance with a persistent disk.
 - [Small preset](configs/workflows/pr-review-small.yaml): one specialist + synthesizer,
-  OpenAI only, one concurrent workflow. Start with `issue_comment` events and
-  invoke `/mochi review` on a non-draft PR as an owner/member/collaborator.
+  OpenAI only, one concurrent workflow. Subscribe to `pull_request` and
+  `issue_comment` events for automatic reviews when a non-draft PR is opened,
+  updated, reopened, or marked ready. Owners/members/collaborators can also
+  invoke `/mochi review` to rerun a review.
 - [Full preset](configs/workflows/pr-review.yaml): four specialists using OpenAI,
   Anthropic, and Gemini. It needs more API keys and a suitable Daytona snapshot.
 

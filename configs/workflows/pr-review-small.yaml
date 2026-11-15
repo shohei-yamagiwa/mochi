@@ -6,9 +6,8 @@ description: Small GitHub App deployment with one correctness specialist
 input:
   adapter: github_pr
   triggers:
-    # Subscribe only to issue_comment in the App for on-demand reviews.
-    # If pull_request is also subscribed, review when a draft becomes ready.
-    events: [ready_for_review]
+    # Subscribe to pull_request and issue_comment in the GitHub App.
+    events: [opened, synchronize, reopened, ready_for_review]
     comment_command: "/mochi review"
     ignore_drafts: true
 repo_overrides:
