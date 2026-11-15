@@ -410,6 +410,7 @@ func MergeRepoOverrides(base *domain.Workflow, overrideYAML []byte) (*domain.Wor
 func cloneWorkflow(wf *domain.Workflow) *domain.Workflow {
 	out := *wf
 	out.Input.Triggers.Events = slices.Clone(wf.Input.Triggers.Events)
+	out.Input.Triggers.AllowedCommentAssociations = slices.Clone(wf.Input.Triggers.AllowedCommentAssociations)
 	out.Agents = make([]domain.RoleConfig, len(wf.Agents))
 	for i, a := range wf.Agents {
 		clonedAgent := a

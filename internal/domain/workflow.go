@@ -114,9 +114,10 @@ type InputConfig struct {
 
 // TriggerConfig defines trigger filtering rules for an input adapter.
 type TriggerConfig struct {
-	Events         []string `yaml:"events,omitempty" json:"events,omitempty"`
-	CommentCommand string   `yaml:"comment_command,omitempty" json:"comment_command,omitempty"`
-	IgnoreDrafts   bool     `yaml:"ignore_drafts,omitempty" json:"ignore_drafts,omitempty"`
+	Events                     []string `yaml:"events,omitempty" json:"events,omitempty"`
+	CommentCommand             string   `yaml:"comment_command,omitempty" json:"comment_command,omitempty"`
+	AllowedCommentAssociations []string `yaml:"allowed_comment_associations,omitempty" json:"allowed_comment_associations,omitempty"`
+	IgnoreDrafts               bool     `yaml:"ignore_drafts,omitempty" json:"ignore_drafts,omitempty"`
 }
 
 // RepoOverridesConfig governs whether target repositories may override workflow behavior via .mochi/.
