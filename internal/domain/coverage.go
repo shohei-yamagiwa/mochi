@@ -50,3 +50,9 @@ type FileCoverageDetail struct {
 	UncoveredHunks    []LineRange            `json:"uncovered_hunks"`      // Changed hunks not overlapped by any read_file / diff
 	FindingsCount     int                    `json:"findings_count"`
 }
+
+// FullyReviewed reports whether every changed file and hunk was inspected
+// by at least one agent during the run.
+func (r CoverageReport) FullyReviewed() bool {
+	return r.FileCoverageRatio >= 1.0 && r.HunkCoverageRatio >= 1.0
+}
