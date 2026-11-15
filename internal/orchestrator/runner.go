@@ -497,7 +497,7 @@ func (r *Runner) runSynthesizer(
 
 	synthData := config.PromptData{
 		Task:           config.NewPromptTaskContext(task),
-		Workflow:       wf,
+		Workflow:       config.NewPromptWorkflow(wf),
 		AgentSummaries: agentSummaries,
 		Coverage:       coverage,
 		Extra: map[string]any{

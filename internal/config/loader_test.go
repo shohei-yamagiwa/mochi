@@ -369,4 +369,33 @@ func TestPromptEngineSecurityAndRendering(t *testing.T) {
 	if _, err := engine.RenderTemplate("strict", "hello {{ .MissingField }}", config.NewPromptData(task, wf, nil)); err == nil {
 		t.Fatal("expected error for missing template field")
 	}
+
+	// Operator sink secrets (URL and Options) must not be readable from PromptData.Workflow.
+	wfWithSecrets := *wf
+	wfWithSecrets.Output.Sinks = []domain.SinkConfig{
+		{
+			Type: "webhook",
+			URL:  "https://hooks.internal.example/secret-token-123",
+			Options: map[string]any{
+				"secret":       "hmac-signing-secret-xyz",
+				"bearer_token": "tok-operator-999",
+			},
+		},
+	}
+	secretData := config.NewPromptData(task, &wfWithSecrets, nil)
+	if _, err := engine.RenderTemplate("sink_url", "{{ (index .Workflow.Output.Sinks 0).URL }}", secretData); err == nil {
+		t.Fatal("expected error accessing sink URL from PromptData.Workflow")
+	}
+	if _, err := engine.RenderTemplate("sink_opts", "{{ (index .Workflow.Output.Sinks 0).Options }}", secretData); err == nil {
+		t.Fatal("expected error accessing sink Options from PromptData.Workflow")
+	}
+	outJSON, err := engine.RenderTemplate("sink_json", "{{ toJSON .Workflow }}", secretData)
+	if err != nil {
+		t.Fatalf("toJSON .Workflow failed: %v", err)
+	}
+	for _, secret := range []string{"secret-token-123", "hmac-signing-secret-xyz", "tok-operator-999"} {
+		if strings.Contains(outJSON, secret) {
+			t.Fatalf("sink secret %q leaked via toJSON .Workflow:\n%s", secret, outJSON)
+		}
+	}
 }
