@@ -239,3 +239,45 @@ func TestCLI_RunDryRunLocalGit(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateServeAuthConfig(t *testing.T) {
+	if err := validateServeAuthConfig(false, "", "", "", false); err == nil {
+		t.Fatalf("expected error when no trigger/API secrets are configured")
+	}
+	if err := validateServeAuthConfig(true, "", "trig", "api", false); err == nil {
+		t.Fatalf("expected error when GitHub is enabled without webhook secret")
+	}
+	if err := validateServeAuthConfig(true, "hook", "trig", "", false); err != nil {
+		t.Fatalf("unexpected error with webhook + trigger secrets: %v", err)
+	}
+	if err := validateServeAuthConfig(false, "", "", "api", false); err != nil {
+		t.Fatalf("unexpected error with API token: %v", err)
+	}
+	if err := validateServeAuthConfig(true, "", "", "", true); err != nil {
+		t.Fatalf("unexpected error with insecureNoAuth=true: %v", err)
+	}
+}
+
+func TestCLI_ServeRefusesStartWithoutSecrets(t *testing.T) {
+	t.Setenv("GITHUB_WEBHOOK_SECRET", "")
+	t.Setenv("MOCHI_TRIGGER_SECRET", "")
+	t.Setenv("MOCHI_API_TOKEN", "")
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "")
+	t.Setenv("MOCHI_GITHUB_APP_ID", "")
+
+	wfPath := filepath.Join("..", "..", "configs", "workflows", "pr-review.yaml")
+	cmd := newRootCmd()
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	cmd.SetArgs([]string{"serve", "--workflow", wfPath, "--db", filepath.Join(t.TempDir(), "mochi.db")})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatalf("expected mochi serve to refuse starting without auth secrets")
+	}
+	if !strings.Contains(err.Error(), "--insecure-no-auth") {
+		t.Fatalf("expected error mentioning --insecure-no-auth, got: %v", err)
+	}
+}

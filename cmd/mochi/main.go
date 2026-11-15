@@ -74,15 +74,16 @@ func newRootCmd() *cobra.Command {
 
 func newServeCmd() *cobra.Command {
 	var (
-		addr          string
-		workflowPaths []string
-		baseDir       string
-		dbPath        string
-		workers       int
-		queueSize     int
-		webhookSecret string
-		triggerSecret string
-		apiToken      string
+		addr           string
+		workflowPaths  []string
+		baseDir        string
+		dbPath         string
+		workers        int
+		queueSize      int
+		webhookSecret  string
+		triggerSecret  string
+		apiToken       string
+		insecureNoAuth bool
 	)
 
 	cmd := &cobra.Command{
@@ -112,6 +113,25 @@ func newServeCmd() *cobra.Command {
 				}
 			}
 
+			ghClients, err := buildGitHubClientFactoryFromEnv(false)
+			if err != nil {
+				return err
+			}
+			if ghClients == nil && strings.TrimSpace(webhookSecret) != "" {
+				return fmt.Errorf("GITHUB_WEBHOOK_SECRET is set, but GitHub App/token credentials (MOCHI_GITHUB_APP_ID or GITHUB_TOKEN) are missing")
+			}
+
+			if err := validateServeAuthConfig(ghClients != nil, webhookSecret, triggerSecret, apiToken, insecureNoAuth); err != nil {
+				return err
+			}
+			if insecureNoAuth {
+				logger.Warn("starting server with --insecure-no-auth enabled; unauthenticated access is permitted when auth secrets are unset",
+					"webhook_secret_set", strings.TrimSpace(webhookSecret) != "",
+					"trigger_secret_set", strings.TrimSpace(triggerSecret) != "",
+					"api_token_set", strings.TrimSpace(apiToken) != "",
+				)
+			}
+
 			st, err := sqlite.Open(ctx, dbPath)
 			if err != nil {
 				return fmt.Errorf("open sqlite store %q: %w", dbPath, err)
@@ -132,25 +152,21 @@ func newServeCmd() *cobra.Command {
 				sbProvider = p
 			}
 
-			ghClients, err := buildGitHubClientFactoryFromEnv(false)
-			if err != nil {
-				return err
-			}
-
 			var ghAdapter *ghinput.Adapter
 			var overrideLoader orchestrator.RepoOverrideLoader
 			if ghClients != nil {
-				ghAdapter, err = ghinput.NewAdapter(
-					ghClients,
+				ghOpts := []ghinput.Option{
 					ghinput.WithWebhookSecret(webhookSecret),
 					ghinput.WithWorkflowName(defaultWorkflow),
-				)
+				}
+				if insecureNoAuth && strings.TrimSpace(webhookSecret) == "" {
+					ghOpts = append(ghOpts, ghinput.WithAllowInsecureNoWebhookSecret(true))
+				}
+				ghAdapter, err = ghinput.NewAdapter(ghClients, ghOpts...)
 				if err != nil {
 					return err
 				}
 				overrideLoader = ghinput.NewRepoOverrideLoader(ghClients, true)
-			} else if webhookSecret != "" {
-				return fmt.Errorf("GITHUB_WEBHOOK_SECRET is set, but GitHub App/token credentials (MOCHI_GITHUB_APP_ID or GITHUB_TOKEN) are missing")
 			}
 
 			sinkReg, err := buildSinkRegistry(ghClients, cmd.OutOrStdout())
@@ -180,15 +196,16 @@ func newServeCmd() *cobra.Command {
 			})
 
 			srv, err := server.New(server.Config{
-				Workflows:       workflows,
-				DefaultWorkflow: defaultWorkflow,
-				GitHubAdapter:   ghAdapter,
-				WebhookAdapter:  whinput.NewAdapter(defaultWorkflow),
-				Scheduler:       sched,
-				Store:           st,
-				TriggerSecret:   triggerSecret,
-				APIToken:        apiToken,
-				Logger:          logger,
+				Workflows:           workflows,
+				DefaultWorkflow:     defaultWorkflow,
+				GitHubAdapter:       ghAdapter,
+				WebhookAdapter:      whinput.NewAdapter(defaultWorkflow),
+				Scheduler:           sched,
+				Store:               st,
+				TriggerSecret:       triggerSecret,
+				APIToken:            apiToken,
+				AllowInsecureNoAuth: insecureNoAuth,
+				Logger:              logger,
 			})
 			if err != nil {
 				_ = sched.Shutdown(context.Background())
@@ -248,7 +265,21 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&webhookSecret, "webhook-secret", os.Getenv("GITHUB_WEBHOOK_SECRET"), "GitHub webhook HMAC-SHA256 secret")
 	cmd.Flags().StringVar(&triggerSecret, "trigger-secret", os.Getenv("MOCHI_TRIGGER_SECRET"), "Bearer/HMAC secret for /api/v1/triggers")
 	cmd.Flags().StringVar(&apiToken, "api-token", os.Getenv("MOCHI_API_TOKEN"), "Bearer token for /api/v1/runs endpoints")
+	cmd.Flags().BoolVar(&insecureNoAuth, "insecure-no-auth", false, "Allow starting the server without webhook/trigger/API auth secrets (unsafe for production)")
 	return cmd
+}
+
+func validateServeAuthConfig(ghEnabled bool, webhookSecret, triggerSecret, apiToken string, insecureNoAuth bool) error {
+	if insecureNoAuth {
+		return nil
+	}
+	if ghEnabled && strings.TrimSpace(webhookSecret) == "" {
+		return fmt.Errorf("refusing to start with GitHub webhooks enabled and empty webhook secret: set GITHUB_WEBHOOK_SECRET/--webhook-secret or pass --insecure-no-auth")
+	}
+	if strings.TrimSpace(triggerSecret) == "" && strings.TrimSpace(apiToken) == "" {
+		return fmt.Errorf("refusing to start without trigger or API authentication secrets: set MOCHI_TRIGGER_SECRET/--trigger-secret and/or MOCHI_API_TOKEN/--api-token, or pass --insecure-no-auth")
+	}
+	return nil
 }
 
 func newRunCmd() *cobra.Command {

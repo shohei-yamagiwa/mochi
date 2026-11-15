@@ -52,6 +52,8 @@ func ValidDiffLines(patch string) map[int]bool {
 
 	inHunk := false
 	newLine := 0
+	oldRem := 0
+	newRem := 0
 
 	for rawLine := range strings.SplitSeq(patch, "\n") {
 		line := strings.TrimSuffix(rawLine, "\r")
@@ -61,8 +63,10 @@ func ValidDiffLines(patch string) map[int]bool {
 				inHunk = false
 				continue
 			}
+			oldRem = parseHunkCount(m[2])
+			newRem = parseHunkCount(m[4])
 			newLine = start
-			inHunk = true
+			inHunk = oldRem > 0 || newRem > 0
 			continue
 		}
 		if !inHunk {
@@ -75,25 +79,66 @@ func ValidDiffLines(patch string) map[int]bool {
 		if line == `\ No newline at end of file` {
 			continue
 		}
+		if oldRem == 0 && newRem == 0 {
+			inHunk = false
+			continue
+		}
 		if len(line) == 0 {
-			// Blank context line inside a diff hunk (e.g. if trailing space stripped).
-			if newLine > 0 {
-				lines[newLine] = true
-				newLine++
+			// Blank context line inside a diff hunk (e.g. if trailing space was stripped).
+			if oldRem > 0 && newRem > 0 {
+				if newLine > 0 {
+					lines[newLine] = true
+					newLine++
+				}
+				oldRem--
+				newRem--
+				if oldRem == 0 && newRem == 0 {
+					inHunk = false
+				}
 			}
 			continue
 		}
 		switch line[0] {
-		case ' ', '+':
+		case ' ':
 			if newLine > 0 {
 				lines[newLine] = true
 				newLine++
 			}
+			if oldRem > 0 {
+				oldRem--
+			}
+			if newRem > 0 {
+				newRem--
+			}
+		case '+':
+			if newLine > 0 {
+				lines[newLine] = true
+				newLine++
+			}
+			if newRem > 0 {
+				newRem--
+			}
 		case '-':
-			// Deleted line only advances old-file line numbers.
+			if oldRem > 0 {
+				oldRem--
+			}
+		}
+		if oldRem == 0 && newRem == 0 {
+			inHunk = false
 		}
 	}
 	return lines
+}
+
+func parseHunkCount(raw string) int {
+	if raw == "" {
+		return 1
+	}
+	c, err := strconv.Atoi(raw)
+	if err != nil || c < 0 {
+		return 1
+	}
+	return c
 }
 
 // ParseUnifiedDiff parses a full git unified diff string into structured ChangedFile entries

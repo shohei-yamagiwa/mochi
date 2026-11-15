@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/google/go-github/v93/github"
 	"github.com/shohei-yamagiwa/mochi/internal/domain"
@@ -414,5 +416,132 @@ func TestGitHubSink_HTTP422InlineRetryAndCommentOnlyAndOnRunFailed(t *testing.T)
 	}
 	if updatedChecks[1].Conclusion != "cancelled" {
 		t.Fatalf("OnRunFailed Conclusion = %q, want cancelled", updatedChecks[1].Conclusion)
+	}
+}
+
+func TestGitHubSink_LargeReviewBodyCapAndTrackerCleanup(t *testing.T) {
+	var (
+		mu             sync.Mutex
+		reviewAttempts int
+		reviewBodies   []string
+		checkUpdates   int
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/shohei-yamagiwa/mochi/check-runs":
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 909})
+		case r.Method == http.MethodPatch && r.URL.Path == "/repos/shohei-yamagiwa/mochi/check-runs/909":
+			checkUpdates++
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 909})
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/shohei-yamagiwa/mochi/pulls/42/reviews":
+			reviewAttempts++
+			var req capturedReviewReq
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			reviewBodies = append(reviewBodies, req.Body)
+			if reviewAttempts == 1 {
+				// Force 422 inline fallback to also test fallback body capping.
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				_ = json.NewEncoder(w).Encode(map[string]any{"message": "stale diff"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 2001})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	baseURL := srv.URL + "/"
+	ghClient, err := github.NewClient(github.WithHTTPClient(srv.Client()), github.WithURLs(&baseURL, &baseURL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink, err := ghoutput.NewSink(ghinput.NewStaticClientFactory(ghClient, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	configured := sink.WithConfig(domain.SinkConfig{
+		Type:                   "github_pr_review",
+		PostInlineComments:     true,
+		IncludeCoverageSummary: true,
+		VerdictMode:            "comment_only",
+	})
+
+	fileDetails := make([]domain.FileCoverageDetail, 0, 1200)
+	unreviewed := make([]string, 0, 1200)
+	for i := range 1200 {
+		p := fmt.Sprintf("pkg/service/module_%04d/handler_implementation.go", i)
+		fileDetails = append(fileDetails, domain.FileCoverageDetail{
+			Path:              p,
+			ChangeStatus:      "modified",
+			ChangedHunks:      []domain.LineRange{{StartLine: 1, EndLine: 5}},
+			InspectedByAgents: []string{"correctness"},
+		})
+		unreviewed = append(unreviewed, p)
+	}
+
+	// Include multi-byte UTF-8 text in summary to ensure truncation never breaks runes.
+	multiByteSummary := strings.Repeat("レビュー結果の確認が必要です。", 3000) // ~117 KB UTF-8
+
+	task := testTaskContext()
+	task.RunID = "run-large-1"
+	if err := configured.OnRunStarted(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+
+	report := output.ReviewReport{
+		Summary: multiByteSummary,
+		Verdict: output.VerdictComment,
+		Findings: []output.Finding{
+			{
+				FilePath:     "internal/auth/service.go",
+				StartLine:    11,
+				Severity:     output.SeverityHigh,
+				Category:     "correctness",
+				Title:        "Inline finding merged in 422 fallback",
+				Description:  strings.Repeat("日本語説明テスト", 200),
+				Confidence:   0.95,
+				SourceAgents: []string{"correctness"},
+			},
+		},
+		Coverage: &domain.CoverageReport{
+			TotalChangedFiles:    1200,
+			ReviewedChangedFiles: 0,
+			HunkCoverageRatio:    0,
+			UnreviewedFiles:      unreviewed,
+			FileDetails:          fileDetails,
+		},
+	}
+	raw, _ := json.Marshal(report)
+	if err := configured.Publish(context.Background(), task, raw); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	// Calling OnRunFailed after Publish completed must be a no-op because tracker deleted the entry.
+	if err := configured.OnRunFailed(context.Background(), task, errors.New("late error")); err != nil {
+		t.Fatalf("OnRunFailed after Publish: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reviewBodies) != 2 {
+		t.Fatalf("expected 2 review attempts (primary + 422 fallback), got %d", len(reviewBodies))
+	}
+	for i, body := range reviewBodies {
+		if len(body) > 65536 {
+			t.Fatalf("reviewBodies[%d] length %d exceeds GitHub's 65536 limit", i, len(body))
+		}
+		if !utf8.ValidString(body) {
+			t.Fatalf("reviewBodies[%d] contains invalid UTF-8 after truncation", i)
+		}
+	}
+	if checkUpdates != 1 {
+		t.Fatalf("expected exactly 1 check run update (tracker cleaned up), got %d", checkUpdates)
 	}
 }

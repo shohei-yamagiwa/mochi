@@ -29,13 +29,13 @@ type AppConfig struct {
 }
 
 type appClientFactory struct {
-	appID        int64
-	appsTr       *ghinstallation.AppsTransport
-	baseURL      string
-	uploadURL    string
+	appID         int64
+	appsTr        *ghinstallation.AppsTransport
+	baseURL       string
+	uploadURL     string
 	baseTransport http.RoundTripper
-	httpClient   *http.Client
-	staticToken  string
+	httpClient    *http.Client
+	staticToken   string
 }
 
 type staticClientFactory struct {

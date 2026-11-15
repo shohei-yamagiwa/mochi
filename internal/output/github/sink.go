@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/go-github/v93/github"
 	"github.com/shohei-yamagiwa/mochi/internal/domain"
@@ -19,10 +20,11 @@ import (
 )
 
 const (
-	sinkName          = "github_pr_review"
-	defaultCheckName  = "Mochi Code Review"
-	maxCheckTextBytes = 60000
-	maxInlineComments = 50
+	sinkName           = "github_pr_review"
+	defaultCheckName   = "Mochi Code Review"
+	maxCheckTextBytes  = 60000
+	maxReviewBodyBytes = 60000 // Comfortably below GitHub's 65,536-character PR review body limit.
+	maxInlineComments  = 50
 )
 
 // Option configures a GitHub PR Review OutputSink.
@@ -66,6 +68,28 @@ func (t *checkRunTracker) get(runID string) (int64, bool) {
 	defer t.mu.Unlock()
 	id, ok := t.ids[runID]
 	return id, ok
+}
+
+func (t *checkRunTracker) take(runID string) (int64, bool) {
+	if t == nil || runID == "" {
+		return 0, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	id, ok := t.ids[runID]
+	if ok {
+		delete(t.ids, runID)
+	}
+	return id, ok
+}
+
+func (t *checkRunTracker) delete(runID string) {
+	if t == nil || runID == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.ids, runID)
 }
 
 // Sink implements output.OutputSink (and output.ConfigurableSink) by publishing
@@ -202,7 +226,7 @@ func (s *Sink) Publish(ctx context.Context, task *domain.TaskContext, artifact j
 		summaryFindings = append(summaryFindings, f)
 	}
 
-	body := renderReviewBody(&report, summaryFindings, droppedCount, target.headSHA, s.cfg.IncludeCoverageSummary, false)
+	body := renderCappedReviewBody(&report, summaryFindings, droppedCount, target.headSHA, s.cfg.IncludeCoverageSummary, false, maxReviewBodyBytes)
 	event := s.resolveReviewEvent(report.Verdict)
 
 	if target.prNumber > 0 {
@@ -213,8 +237,8 @@ func (s *Sink) Publish(ctx context.Context, task *domain.TaskContext, artifact j
 
 	if checkRunID, ok := s.tracker.get(task.RunID); ok && checkRunID > 0 {
 		conclusion := s.resolveCheckConclusion(report.Verdict)
-		checkSummary := renderCheckSummary(&report, len(filtered), droppedCount, target.headSHA, s.cfg.IncludeCoverageSummary)
-		checkText := truncateBytes(renderReviewBody(&report, filtered, droppedCount, target.headSHA, s.cfg.IncludeCoverageSummary, true), maxCheckTextBytes)
+		checkSummary := truncateUTF8(renderCheckSummary(&report, len(filtered), droppedCount, target.headSHA, s.cfg.IncludeCoverageSummary), maxCheckTextBytes)
+		checkText := renderCappedReviewBody(&report, filtered, droppedCount, target.headSHA, s.cfg.IncludeCoverageSummary, true, maxCheckTextBytes)
 		title := fmt.Sprintf("Mochi Review: %s (%d findings)", report.Verdict, len(filtered))
 
 		_, _, err := client.Checks.UpdateCheckRun(ctx, target.owner, target.repo, checkRunID, github.UpdateCheckRunOptions{
@@ -231,6 +255,7 @@ func (s *Sink) Publish(ctx context.Context, task *domain.TaskContext, artifact j
 		if err != nil {
 			return fmt.Errorf("update github check run %d: %w", checkRunID, err)
 		}
+		s.tracker.delete(task.RunID)
 	}
 
 	return nil
@@ -241,7 +266,7 @@ func (s *Sink) OnRunFailed(ctx context.Context, task *domain.TaskContext, runErr
 	if task == nil {
 		return nil
 	}
-	checkRunID, ok := s.tracker.get(task.RunID)
+	checkRunID, ok := s.tracker.take(task.RunID)
 	if !ok || checkRunID <= 0 {
 		return nil
 	}
@@ -278,7 +303,7 @@ func (s *Sink) OnRunFailed(ctx context.Context, task *domain.TaskContext, runErr
 		CompletedAt: &github.Timestamp{Time: time.Now().UTC()},
 		Output: &github.CheckRunOutput{
 			Title:   github.Ptr(title),
-			Summary: github.Ptr(fmt.Sprintf("Run `%s` ended with status `%s`.\n\n```\n%s\n```", task.RunID, conclusion, truncateBytes(errText, 4000))),
+			Summary: github.Ptr(fmt.Sprintf("Run `%s` ended with status `%s`.\n\n```\n%s\n```", task.RunID, conclusion, truncateUTF8(errText, 4000))),
 		},
 	})
 	if updateErr != nil {
@@ -319,7 +344,7 @@ func (s *Sink) createPRReviewWithFallbacks(
 		combined := make([]output.Finding, 0, len(inlineFindings)+len(summaryFindings))
 		combined = append(combined, inlineFindings...)
 		combined = append(combined, summaryFindings...)
-		fallbackBody := renderReviewBody(report, combined, droppedCount, target.headSHA, s.cfg.IncludeCoverageSummary, true)
+		fallbackBody := renderCappedReviewBody(report, combined, droppedCount, target.headSHA, s.cfg.IncludeCoverageSummary, true, maxReviewBodyBytes)
 		fallbackReq := &github.PullRequestReviewRequest{
 			Body:  github.Ptr(fallbackBody),
 			Event: github.Ptr(event),
@@ -474,6 +499,28 @@ func formatInlineFindingBody(f output.Finding) string {
 	return b.String()
 }
 
+func renderCappedReviewBody(
+	report *output.ReviewReport,
+	findings []output.Finding,
+	droppedCount int,
+	headSHA string,
+	includeCoverage bool,
+	noteFallback bool,
+	maxBytes int,
+) string {
+	body := renderReviewBody(report, findings, droppedCount, headSHA, includeCoverage, noteFallback, false)
+	if maxBytes <= 0 || len(body) <= maxBytes {
+		return body
+	}
+	if includeCoverage && report.Coverage != nil {
+		body = renderReviewBody(report, findings, droppedCount, headSHA, includeCoverage, noteFallback, true)
+		if len(body) <= maxBytes {
+			return body
+		}
+	}
+	return truncateUTF8(body, maxBytes)
+}
+
 func renderReviewBody(
 	report *output.ReviewReport,
 	findings []output.Finding,
@@ -481,6 +528,7 @@ func renderReviewBody(
 	headSHA string,
 	includeCoverage bool,
 	noteFallback bool,
+	compactCoverage bool,
 ) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "## Mochi Code Review — `%s`\n\n", report.Verdict)
@@ -552,7 +600,7 @@ func renderReviewBody(
 	}
 
 	if includeCoverage && report.Coverage != nil {
-		b.WriteString(renderCoverageDetails(report.Coverage, headSHA))
+		b.WriteString(renderCoverageDetails(report.Coverage, headSHA, compactCoverage))
 	}
 
 	return strings.TrimSpace(b.String())
@@ -573,12 +621,16 @@ func renderCheckSummary(report *output.ReviewReport, keptCount, droppedCount int
 		fmt.Fprintf(&b, "**Failed agents:** `%s`\n\n", strings.Join(report.FailedAgents, "`, `"))
 	}
 	if includeCoverage && report.Coverage != nil {
-		b.WriteString(renderCoverageDetails(report.Coverage, headSHA))
+		details := renderCoverageDetails(report.Coverage, headSHA, false)
+		if b.Len()+len(details) > maxCheckTextBytes {
+			details = renderCoverageDetails(report.Coverage, headSHA, true)
+		}
+		b.WriteString(details)
 	}
 	return strings.TrimSpace(b.String())
 }
 
-func renderCoverageDetails(cov *domain.CoverageReport, headSHA string) string {
+func renderCoverageDetails(cov *domain.CoverageReport, headSHA string, compact bool) string {
 	sha := cov.HeadSHA
 	if sha == "" {
 		sha = headSHA
@@ -599,7 +651,21 @@ func renderCoverageDetails(cov *domain.CoverageReport, headSHA string) string {
 	)
 
 	if len(cov.UnreviewedFiles) > 0 {
-		fmt.Fprintf(&b, "**Unreviewed changed files:** `%s`\n\n", strings.Join(cov.UnreviewedFiles, "`, `"))
+		const maxUnreviewedListed = 50
+		if compact && len(cov.UnreviewedFiles) > maxUnreviewedListed {
+			fmt.Fprintf(&b, "**Unreviewed changed files (%d total, showing first %d):** `%s`, ... (see Check Run for full list)\n\n",
+				len(cov.UnreviewedFiles), maxUnreviewedListed, strings.Join(cov.UnreviewedFiles[:maxUnreviewedListed], "`, `"))
+		} else {
+			fmt.Fprintf(&b, "**Unreviewed changed files:** `%s`\n\n", strings.Join(cov.UnreviewedFiles, "`, `"))
+		}
+	}
+
+	if compact {
+		if len(cov.FileDetails) > 0 {
+			fmt.Fprintf(&b, "_Per-file coverage table (%d files) omitted to fit GitHub's size limit; see Check Run for full details._\n\n", len(cov.FileDetails))
+		}
+		b.WriteString("</details>\n")
+		return b.String()
 	}
 
 	if len(cov.FileDetails) > 0 {
@@ -718,9 +784,21 @@ func isUnprocessableEntity(resp *github.Response, err error) bool {
 	return false
 }
 
-func truncateBytes(s string, max int) string {
-	if max <= 0 || len(s) <= max {
+func truncateUTF8(s string, maxBytes int) string {
+	if maxBytes <= 0 || len(s) <= maxBytes {
 		return s
 	}
-	return s[:max] + "\n... [truncated]"
+	const suffix = "\n... [truncated]"
+	limit := maxBytes - len(suffix)
+	if limit <= 0 {
+		limit = maxBytes
+		for limit > 0 && !utf8.RuneStart(s[limit]) {
+			limit--
+		}
+		return s[:limit]
+	}
+	for limit > 0 && !utf8.RuneStart(s[limit]) {
+		limit--
+	}
+	return s[:limit] + suffix
 }

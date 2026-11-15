@@ -67,6 +67,14 @@ func WithWebhookSecret(secret string) Option {
 	}
 }
 
+// WithAllowInsecureNoWebhookSecret permits skipping webhook signature verification when no secret is configured.
+// Only enable this explicitly for local development/testing.
+func WithAllowInsecureNoWebhookSecret(allow bool) Option {
+	return func(a *Adapter) {
+		a.allowInsecureNoSecret = allow
+	}
+}
+
 // WithDefaultTriggers configures default PR event and comment-command trigger rules.
 func WithDefaultTriggers(triggers domain.TriggerConfig) Option {
 	return func(a *Adapter) {
@@ -83,10 +91,11 @@ func WithWorkflowName(name string) Option {
 
 // Adapter implements domain.InputAdapter for GitHub App webhooks and Pull Request events.
 type Adapter struct {
-	clients         ClientFactory
-	webhookSecret   string
-	defaultTriggers domain.TriggerConfig
-	workflowName    string
+	clients               ClientFactory
+	webhookSecret         string
+	allowInsecureNoSecret bool
+	defaultTriggers       domain.TriggerConfig
+	workflowName          string
 }
 
 var _ domain.InputAdapter = (*Adapter)(nil)
@@ -119,9 +128,14 @@ func (a *Adapter) Name() string {
 }
 
 // VerifySignature validates GitHub's X-Hub-Signature-256 header against payload using constant-time comparison.
+// When no webhook secret is configured, verification fails closed with ErrInvalidSignature unless
+// WithAllowInsecureNoWebhookSecret(true) is explicitly set.
 func (a *Adapter) VerifySignature(payload []byte, signature256 string) error {
 	if a.webhookSecret == "" {
-		return nil
+		if a.allowInsecureNoSecret {
+			return nil
+		}
+		return fmt.Errorf("%w: webhook secret is not configured", ErrInvalidSignature)
 	}
 	sigHeader := strings.TrimSpace(signature256)
 	if !strings.HasPrefix(sigHeader, "sha256=") {

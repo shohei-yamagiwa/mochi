@@ -46,8 +46,8 @@ func (s *stubLLM) Generate(ctx context.Context, req llm.ChatRequest) (*llm.ChatR
 
 	if req.ResponseSchema != nil {
 		rep := output.ReviewReport{
-			Summary: "Clean change.",
-			Verdict: output.VerdictApprove,
+			Summary:  "Clean change.",
+			Verdict:  output.VerdictApprove,
 			Findings: []output.Finding{},
 		}
 		raw, _ := json.Marshal(rep)
@@ -350,9 +350,11 @@ func TestServer_CancelActiveRun(t *testing.T) {
 	}()
 
 	srv, err := server.New(server.Config{
-		Workflows: map[string]*domain.Workflow{wf.Name: wf},
-		Scheduler: sched,
-		Store:     st,
+		Workflows:     map[string]*domain.Workflow{wf.Name: wf},
+		Scheduler:     sched,
+		Store:         st,
+		TriggerSecret: "trig-secret",
+		APIToken:      "api-secret",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -361,7 +363,10 @@ func TestServer_CancelActiveRun(t *testing.T) {
 	defer ts.Close()
 
 	trigBody := []byte(`{"repo_url":"https://github.com/shohei-yamagiwa/mochi.git","ref":"main"}`)
-	resp, err := http.Post(ts.URL+"/api/v1/triggers/pr-review", "application/json", bytes.NewReader(trigBody))
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/triggers/pr-review", bytes.NewReader(trigBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer trig-secret")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil || resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("POST trigger = %v err=%v", resp, err)
 	}
@@ -374,7 +379,10 @@ func TestServer_CancelActiveRun(t *testing.T) {
 	// Wait briefly until run enters scheduler, then cancel via API.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		cancelResp, err := http.Post(ts.URL+"/api/v1/runs/"+accepted.RunID+"/cancel", "application/json", strings.NewReader(`{"reason":"user aborted"}`))
+		cancelReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/runs/"+accepted.RunID+"/cancel", strings.NewReader(`{"reason":"user aborted"}`))
+		cancelReq.Header.Set("Content-Type", "application/json")
+		cancelReq.Header.Set("Authorization", "Bearer api-secret")
+		cancelResp, err := http.DefaultClient.Do(cancelReq)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -388,5 +396,152 @@ func TestServer_CancelActiveRun(t *testing.T) {
 	_, waitErr := sched.WaitForRun(context.Background(), accepted.RunID)
 	if waitErr == nil {
 		t.Fatalf("expected cancelled run to return error from WaitForRun")
+	}
+}
+
+func TestServer_FailClosedWhenSecretsMissing(t *testing.T) {
+	st, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "mochi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	wf, promptDir := setupTestWorkflow(t)
+	runner := &orchestrator.Runner{
+		Store:              st,
+		DefaultLLMProvider: &stubLLM{name: "openai"},
+		PromptEngine:       config.NewPromptEngine(promptDir),
+	}
+	sched := orchestrator.NewScheduler(runner, orchestrator.SchedulerConfig{MaxWorkers: 1})
+	defer func() {
+		_ = sched.Shutdown(context.Background())
+	}()
+
+	ghClient, err := github.NewClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clients := ghinput.NewStaticClientFactory(ghClient, "tok")
+	ghAdapterFailClosed, err := ghinput.NewAdapter(clients)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := server.New(server.Config{
+		Workflows:       map[string]*domain.Workflow{wf.Name: wf},
+		DefaultWorkflow: wf.Name,
+		GitHubAdapter:   ghAdapterFailClosed,
+		Scheduler:       sched,
+		Store:           st,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// Without secrets and without AllowInsecureNoAuth, all protected endpoints must return 401.
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		header map[string]string
+	}{
+		{
+			name:   "github webhook",
+			method: http.MethodPost,
+			path:   "/webhooks/github",
+			body:   `{"action":"opened","number":43,"repository":{"name":"mochi","owner":{"login":"shohei-yamagiwa"}},"pull_request":{"number":43,"draft":true}}`,
+			header: map[string]string{"X-GitHub-Event": "pull_request"},
+		},
+		{
+			name:   "trigger endpoint",
+			method: http.MethodPost,
+			path:   "/api/v1/triggers/pr-review",
+			body:   `{"repo_url":"https://github.com/shohei-yamagiwa/mochi.git","ref":"main"}`,
+		},
+		{
+			name:   "list runs",
+			method: http.MethodGet,
+			path:   "/api/v1/runs",
+		},
+		{
+			name:   "cancel run",
+			method: http.MethodPost,
+			path:   "/api/v1/runs/run-missing/cancel",
+			body:   `{}`,
+		},
+	} {
+		req, _ := http.NewRequest(tc.method, ts.URL+tc.path, strings.NewReader(tc.body))
+		for k, v := range tc.header {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s request failed: %v", tc.name, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("%s status = %d, want 401", tc.name, resp.StatusCode)
+		}
+	}
+
+	// Explicit opt-in allows unauthenticated requests for local development.
+	ghAdapterInsecure, err := ghinput.NewAdapter(clients, ghinput.WithAllowInsecureNoWebhookSecret(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	insecureSrv, err := server.New(server.Config{
+		Workflows:           map[string]*domain.Workflow{wf.Name: wf},
+		DefaultWorkflow:     wf.Name,
+		GitHubAdapter:       ghAdapterInsecure,
+		Scheduler:           sched,
+		Store:               st,
+		AllowInsecureNoAuth: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	insecureTS := httptest.NewServer(insecureSrv.Handler())
+	defer insecureTS.Close()
+
+	resp, err := http.Get(insecureTS.URL + "/api/v1/runs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("insecure GET /api/v1/runs status = %d, want 200", resp.StatusCode)
+	}
+
+	trigReq, _ := http.NewRequest(http.MethodPost, insecureTS.URL+"/api/v1/triggers/pr-review",
+		strings.NewReader(`{"repo_url":"https://github.com/shohei-yamagiwa/mochi.git","ref":"main"}`))
+	trigResp, err := http.DefaultClient.Do(trigReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var trigAccepted struct {
+		RunID string `json:"run_id"`
+	}
+	_ = json.NewDecoder(trigResp.Body).Decode(&trigAccepted)
+	_ = trigResp.Body.Close()
+	if trigResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("insecure POST trigger status = %d, want 202", trigResp.StatusCode)
+	}
+	if _, err := sched.WaitForRun(context.Background(), trigAccepted.RunID); err != nil {
+		t.Fatalf("WaitForRun(insecure trigger): %v", err)
+	}
+
+	whReq, _ := http.NewRequest(http.MethodPost, insecureTS.URL+"/webhooks/github",
+		strings.NewReader(`{"action":"opened","number":43,"repository":{"name":"mochi","owner":{"login":"shohei-yamagiwa"}},"pull_request":{"number":43,"draft":true}}`))
+	whReq.Header.Set("X-GitHub-Event", "pull_request")
+	whResp, err := http.DefaultClient.Do(whReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = whResp.Body.Close()
+	if whResp.StatusCode != http.StatusOK {
+		t.Fatalf("insecure webhook draft PR status = %d, want 200", whResp.StatusCode)
 	}
 }

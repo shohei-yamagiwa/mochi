@@ -101,4 +101,23 @@ index 5555555..6666666 100644
 	if !byFile["new_name.go"][2] {
 		t.Fatalf("expected line 2 in new_name.go diff lines")
 	}
+	if byFile["new_name.go"][3] {
+		t.Fatalf("unexpected phantom line 3 past end of hunk in new_name.go: %v", byFile["new_name.go"])
+	}
+}
+
+func TestValidDiffLines_TrailingNewlineAndBlankContext(t *testing.T) {
+	d := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1,2 +1,3 @@\n x\n+y\n z\n"
+	byFile := ParseDiffLinesByFile(d)
+	got := byFile["a.go"]
+	if len(got) != 3 || !got[1] || !got[2] || !got[3] || got[4] {
+		t.Fatalf("ParseDiffLinesByFile = %v, want lines {1,2,3} only", got)
+	}
+
+	// Blank context line inside hunk with stripped space should still count as line 2.
+	patchWithBlank := "@@ -1,3 +1,3 @@\n a\n\n-b\n+c\n"
+	gotBlank := ValidDiffLines(patchWithBlank)
+	if len(gotBlank) != 3 || !gotBlank[1] || !gotBlank[2] || !gotBlank[3] || gotBlank[4] {
+		t.Fatalf("ValidDiffLines(blank context) = %v, want {1,2,3}", gotBlank)
+	}
 }

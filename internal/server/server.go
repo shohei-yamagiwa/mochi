@@ -36,17 +36,18 @@ const (
 
 // Config configures the HTTP server for webhooks, triggers, health probes, and run inspection.
 type Config struct {
-	Workflows       map[string]*domain.Workflow
-	DefaultWorkflow string
-	GitHubAdapter   *ghinput.Adapter
-	WebhookAdapter  *whinput.Adapter
-	Scheduler       *orchestrator.Scheduler
-	Store           store.Store
-	TriggerSecret   string
-	APIToken        string
-	MaxBodyBytes    int64
-	EnqueueTimeout  time.Duration
-	Logger          *slog.Logger
+	Workflows           map[string]*domain.Workflow
+	DefaultWorkflow     string
+	GitHubAdapter       *ghinput.Adapter
+	WebhookAdapter      *whinput.Adapter
+	Scheduler           *orchestrator.Scheduler
+	Store               store.Store
+	TriggerSecret       string
+	APIToken            string
+	AllowInsecureNoAuth bool
+	MaxBodyBytes        int64
+	EnqueueTimeout      time.Duration
+	Logger              *slog.Logger
 }
 
 // Server exposes Mochi's HTTP endpoints over chi/v5.
@@ -467,7 +468,11 @@ func (s *Server) lookupWorkflow(name string) (*domain.Workflow, bool) {
 func (s *Server) requireAPIToken(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.APIToken == "" {
-			next.ServeHTTP(w, r)
+			if s.cfg.AllowInsecureNoAuth {
+				next.ServeHTTP(w, r)
+				return
+			}
+			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
 		if !checkBearerToken(r.Header.Get("Authorization"), s.cfg.APIToken) {
@@ -491,7 +496,7 @@ func (s *Server) authorizeTrigger(r *http.Request, body []byte) bool {
 	if s.cfg.APIToken != "" {
 		return checkBearerToken(r.Header.Get("Authorization"), s.cfg.APIToken)
 	}
-	return true
+	return s.cfg.AllowInsecureNoAuth
 }
 
 func checkBearerToken(header, expected string) bool {

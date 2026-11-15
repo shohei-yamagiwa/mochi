@@ -259,3 +259,30 @@ index 1111111..2222222 100644
 		t.Fatalf("unexpected prompt content: %q", string(promptBytes))
 	}
 }
+
+func TestVerifySignature_FailClosedByDefault(t *testing.T) {
+	client, err := github.NewClient()
+	if err != nil {
+		t.Fatalf("github.NewClient: %v", err)
+	}
+	clients := ghinput.NewStaticClientFactory(client, "tok")
+
+	adapter, err := ghinput.NewAdapter(clients)
+	if err != nil {
+		t.Fatalf("NewAdapter: %v", err)
+	}
+	if err := adapter.VerifySignature([]byte(`{"ok":true}`), ""); !errors.Is(err, ghinput.ErrInvalidSignature) {
+		t.Fatalf("VerifySignature(empty secret, default) = %v, want ErrInvalidSignature", err)
+	}
+	if err := adapter.VerifySignature([]byte(`{"ok":true}`), "sha256=deadbeef"); !errors.Is(err, ghinput.ErrInvalidSignature) {
+		t.Fatalf("VerifySignature(empty secret, forged sig) = %v, want ErrInvalidSignature", err)
+	}
+
+	insecureAdapter, err := ghinput.NewAdapter(clients, ghinput.WithAllowInsecureNoWebhookSecret(true))
+	if err != nil {
+		t.Fatalf("NewAdapter insecure: %v", err)
+	}
+	if err := insecureAdapter.VerifySignature([]byte(`{"ok":true}`), ""); err != nil {
+		t.Fatalf("VerifySignature(insecure opt-in) failed: %v", err)
+	}
+}
