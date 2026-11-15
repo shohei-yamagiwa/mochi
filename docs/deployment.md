@@ -52,6 +52,13 @@ create it from `deploy/sandbox/Dockerfile` instead. Add the target repository's
 language runtimes and build tools when needed. If you change a snapshot name,
 update `sandbox.default_snapshot` in the workflow too.
 
+Changing a Dockerfile under `deploy/sandbox/` does not update an existing
+snapshot. Delete the snapshot and create it again under the same name — the
+workflow references snapshots by name, so no configuration change is needed.
+Wait until the recreated snapshot is active, then smoke-test it once by
+starting a sandbox from it and checking the toolchain (for example
+`go version`) before relying on it for reviews.
+
 The full preset creates four independent sandboxes per concurrent workflow; the
 small preset creates one. Ensure your Daytona quota permits this concurrency and
 allocated resources. Both presets disable forking and work with container
