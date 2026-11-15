@@ -665,15 +665,14 @@ func (r *Runner) runSynthesizer(
 
 		messages = append(messages, resp.Message)
 
-		if maxTokens > 0 && (agentRun.InputTokens+agentRun.OutputTokens) > maxTokens {
-			err := fmt.Errorf("synthesizer: %w (%d > %d)", ErrMaxTokensExceeded, agentRun.InputTokens+agentRun.OutputTokens, maxTokens)
-			ar, _ := finalizeSynth(domain.AgentRunStatusFailed, nil, err)
-			return ar, nil, nil, err
-		}
-
 		rawCandidate := extractSynthesizerJSON(resp)
 		report, valErr := validator.ValidateJSON(rawCandidate)
 		if valErr != nil {
+			if maxTokens > 0 && (agentRun.InputTokens+agentRun.OutputTokens) > maxTokens {
+				err := fmt.Errorf("synthesizer: %w (%d > %d)", ErrMaxTokensExceeded, agentRun.InputTokens+agentRun.OutputTokens, maxTokens)
+				ar, _ := finalizeSynth(domain.AgentRunStatusFailed, nil, err)
+				return ar, nil, nil, err
+			}
 			if agentRun.TurnsUsed >= maxTurns {
 				runErr := fmt.Errorf("synthesizer output validation failed after %d turns: %w", agentRun.TurnsUsed, valErr)
 				ar, _ := finalizeSynth(domain.AgentRunStatusFailed, nil, runErr)

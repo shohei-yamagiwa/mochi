@@ -155,7 +155,10 @@ type AgentSandboxConfig struct {
 
 // BudgetConfig defines execution guardrails for an agent or synthesizer run.
 type BudgetConfig struct {
-	MaxTurns       int      `yaml:"max_turns,omitempty" json:"max_turns,omitempty"`
+	MaxTurns int `yaml:"max_turns,omitempty" json:"max_turns,omitempty"`
+	// MaxTokens is the cumulative per-agent budget across all turns (sum of per-turn InputTokens + OutputTokens,
+	// including cached input tokens). When a multi-turn agent approaches or first crosses MaxTokens, one final
+	// wind-down turn scoped to submit_output is attempted so findings gathered so far are preserved.
 	MaxTokens      int      `yaml:"max_tokens,omitempty" json:"max_tokens,omitempty"`
 	CommandTimeout Duration `yaml:"command_timeout,omitempty" json:"command_timeout,omitempty"`
 	RunTimeout     Duration `yaml:"run_timeout,omitempty" json:"run_timeout,omitempty"`
