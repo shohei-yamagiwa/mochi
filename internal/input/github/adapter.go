@@ -294,14 +294,16 @@ func (a *Adapter) BuildTaskContext(ctx context.Context, rawEvent any) (*domain.T
 		return nil, fmt.Errorf("get pull request %s/%s#%d: %w", target.Owner, target.Repo, target.PRNumber, err)
 	}
 
-	triggers := a.effectiveTriggers(target.Triggers)
-	if target.TriggerEvent != "pull_request.closed" {
-		if (pr.GetState() != "" && !strings.EqualFold(pr.GetState(), "open")) || pr.GetMerged() {
-			return nil, fmt.Errorf("%w: pull_request #%d is closed/merged (state=%q merged=%v)", ErrIgnoredEvent, target.PRNumber, pr.GetState(), pr.GetMerged())
+	if shouldApplyWebhookFilters(target) {
+		triggers := a.effectiveTriggers(target.Triggers)
+		if target.TriggerEvent != "pull_request.closed" {
+			if (pr.GetState() != "" && !strings.EqualFold(pr.GetState(), "open")) || pr.GetMerged() {
+				return nil, fmt.Errorf("%w: pull_request #%d is closed/merged (state=%q merged=%v)", ErrIgnoredEvent, target.PRNumber, pr.GetState(), pr.GetMerged())
+			}
 		}
-	}
-	if triggers.IgnoreDrafts && pr.GetDraft() {
-		return nil, fmt.Errorf("%w: pull_request #%d is a draft", ErrIgnoredEvent, target.PRNumber)
+		if triggers.IgnoreDrafts && pr.GetDraft() {
+			return nil, fmt.Errorf("%w: pull_request #%d is a draft", ErrIgnoredEvent, target.PRNumber)
+		}
 	}
 
 	unifiedDiff, _, err := client.PullRequests.GetRaw(ctx, target.Owner, target.Repo, target.PRNumber, github.RawOptions{
@@ -561,6 +563,17 @@ func extractRepoPromptPaths(overrideYAML []byte) []string {
 func isSafeMochiPath(p string) bool {
 	cleaned := filepath.ToSlash(filepath.Clean(filepath.FromSlash(strings.TrimSpace(p))))
 	return strings.HasPrefix(cleaned, ".mochi/") && len(cleaned) > len(".mochi/") && !strings.Contains(cleaned, "..")
+}
+
+func shouldApplyWebhookFilters(target *PRTarget) bool {
+	if target == nil {
+		return false
+	}
+	if target.Triggers != nil {
+		return true
+	}
+	return strings.HasPrefix(target.TriggerEvent, "pull_request.") ||
+		strings.HasPrefix(target.TriggerEvent, "issue_comment.")
 }
 
 func (a *Adapter) effectiveTriggers(override *domain.TriggerConfig) domain.TriggerConfig {

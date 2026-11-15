@@ -387,3 +387,71 @@ func TestBuildTaskContext_IgnoresClosedMergedAndDraftPR(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildTaskContext_AllowsNonWebhookDraftAndClosedMergedPR(t *testing.T) {
+	tests := []struct {
+		name  string
+		state string
+		draft bool
+		merge bool
+	}{
+		{name: "draft open PR", state: "open", draft: true, merge: false},
+		{name: "closed merged PR", state: "closed", draft: false, merge: true},
+		{name: "closed unmerged PR", state: "closed", draft: false, merge: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/repos/shohei-yamagiwa/mochi/pulls/12":
+					if strings.Contains(r.Header.Get("Accept"), "application/vnd.github.v3.diff") {
+						_, _ = w.Write([]byte("diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1,2 @@\n package a\n+var x = 1\n"))
+						return
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"number":   12,
+						"title":    "Non-webhook PR",
+						"state":    tc.state,
+						"draft":    tc.draft,
+						"merged":   tc.merge,
+						"html_url": "https://github.com/shohei-yamagiwa/mochi/pull/12",
+						"user":     map[string]any{"login": "shohei"},
+						"base":     map[string]any{"ref": "main", "sha": "base123", "repo": map[string]any{"clone_url": "https://github.com/shohei-yamagiwa/mochi.git"}},
+						"head":     map[string]any{"ref": "feat", "sha": "head456"},
+					})
+				case "/repos/shohei-yamagiwa/mochi/pulls/12/files":
+					_ = json.NewEncoder(w).Encode([]map[string]any{
+						{"filename": "a.go", "status": "modified", "additions": 1, "patch": "@@ -1 +1,2 @@\n package a\n+var x = 1"},
+					})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+
+			baseURL := srv.URL + "/"
+			ghClient, err := github.NewClient(github.WithHTTPClient(srv.Client()), github.WithURLs(&baseURL, &baseURL))
+			if err != nil {
+				t.Fatal(err)
+			}
+			adapter, err := ghinput.NewAdapter(ghinput.NewStaticClientFactory(ghClient, "tok"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			task, err := adapter.BuildTaskContext(context.Background(), &ghinput.PRTarget{
+				Owner:        "shohei-yamagiwa",
+				Repo:         "mochi",
+				PRNumber:     12,
+				TriggerEvent: "cli.pr",
+			})
+			if err != nil {
+				t.Fatalf("%s: BuildTaskContext unexpected error: %v", tc.name, err)
+			}
+			if task.Changeset == nil || task.Changeset.PRNumber != 12 {
+				t.Fatalf("%s: unexpected Changeset: %+v", tc.name, task.Changeset)
+			}
+		})
+	}
+}
