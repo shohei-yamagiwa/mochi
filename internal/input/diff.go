@@ -152,6 +152,8 @@ func ParseUnifiedDiff(unifiedDiff string) []domain.ChangedFile {
 		file       domain.ChangedFile
 		patchLines []string
 		inHunks    bool
+		oldRem     int
+		newRem     int
 	}
 
 	var files []domain.ChangedFile
@@ -232,20 +234,59 @@ func ParseUnifiedDiff(unifiedDiff string) []domain.ChangedFile {
 					cur.file.Path = p
 				}
 				continue
-			case strings.HasPrefix(line, "@@ "):
-				cur.inHunks = true
-				cur.patchLines = append(cur.patchLines, line)
-				continue
 			default:
+				if m := hunkHeaderRegex.FindStringSubmatch(line); len(m) > 0 {
+					cur.inHunks = true
+					cur.oldRem = parseHunkCount(m[2])
+					cur.newRem = parseHunkCount(m[4])
+					cur.patchLines = append(cur.patchLines, line)
+				}
 				continue
 			}
 		}
 
+		if cur.oldRem == 0 && cur.newRem == 0 {
+			if m := hunkHeaderRegex.FindStringSubmatch(line); len(m) > 0 {
+				cur.oldRem = parseHunkCount(m[2])
+				cur.newRem = parseHunkCount(m[4])
+				cur.patchLines = append(cur.patchLines, line)
+			} else if line == `\ No newline at end of file` {
+				cur.patchLines = append(cur.patchLines, line)
+			}
+			continue
+		}
+
 		cur.patchLines = append(cur.patchLines, line)
-		if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++ ") {
+		if line == `\ No newline at end of file` {
+			continue
+		}
+		if len(line) == 0 {
+			if cur.oldRem > 0 {
+				cur.oldRem--
+			}
+			if cur.newRem > 0 {
+				cur.newRem--
+			}
+			continue
+		}
+		switch line[0] {
+		case '+':
 			cur.file.Additions++
-		} else if strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "--- ") {
+			if cur.newRem > 0 {
+				cur.newRem--
+			}
+		case '-':
 			cur.file.Deletions++
+			if cur.oldRem > 0 {
+				cur.oldRem--
+			}
+		case ' ':
+			if cur.oldRem > 0 {
+				cur.oldRem--
+			}
+			if cur.newRem > 0 {
+				cur.newRem--
+			}
 		}
 	}
 

@@ -121,3 +121,34 @@ func TestValidDiffLines_TrailingNewlineAndBlankContext(t *testing.T) {
 		t.Fatalf("ValidDiffLines(blank context) = %v, want {1,2,3}", gotBlank)
 	}
 }
+
+func TestParseUnifiedDiff_CountsPlusPlusAndMinusMinusContentLines(t *testing.T) {
+	diff := `diff --git a/q.sql b/q.sql
+index 1111111..2222222 100644
+--- a/q.sql
++++ b/q.sql
+@@ -1,3 +1,1 @@
+ SELECT 1;
+--- old comment 1
+--- old comment 2
+diff --git a/notes.md b/notes.md
+index 3333333..4444444 100644
+--- a/notes.md
++++ b/notes.md
+@@ -1,1 +1,2 @@
+ header
++++ added line
+`
+
+	files := ParseUnifiedDiff(diff)
+	if len(files) != 2 {
+		t.Fatalf("len(files) = %d, want 2", len(files))
+	}
+	if files[0].Path != "q.sql" || files[0].Additions != 0 || files[0].Deletions != 2 {
+		t.Fatalf("q.sql counts = +%d/-%d, want +0/-2", files[0].Additions, files[0].Deletions)
+	}
+	if files[1].Path != "notes.md" || files[1].Additions != 1 || files[1].Deletions != 0 {
+		t.Fatalf("notes.md counts = +%d/-%d, want +1/-0", files[1].Additions, files[1].Deletions)
+	}
+}
+
