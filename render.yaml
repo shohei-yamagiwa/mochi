@@ -9,7 +9,6 @@ services:
     numInstances: 1
     healthCheckPath: /readyz
     autoDeployTrigger: 'off'
-    maxShutdownDelaySeconds: 40
     disk:
       name: mochi-data
       mountPath: /data
