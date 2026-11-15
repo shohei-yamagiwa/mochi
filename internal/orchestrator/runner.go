@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -153,6 +154,10 @@ func (r *Runner) Execute(ctx context.Context, task *domain.TaskContext, wf *doma
 			overridePath = ".mochi/config.yaml"
 		}
 		bundle, err := r.RepoOverrideLoader(ctx, task, nil, overridePath)
+		if bundle != nil && strings.TrimSpace(bundle.PromptDir) != "" {
+			promptDir := bundle.PromptDir
+			defer func() { _ = os.RemoveAll(promptDir) }()
+		}
 		if err != nil {
 			r.markRunFailedOrCancelled(ctx, task, runRec, startedSinks, err)
 			return nil, fmt.Errorf("load repo overrides: %w", err)

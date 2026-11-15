@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1083,3 +1084,112 @@ func TestRunner_SingleSpecialistForkFailureContinuesWithFailFastFalse(t *testing
 		t.Fatalf("Report.AgentSummaries[security] = %q, want %q", res.Report.AgentSummaries["security"], "failed (sandbox error)")
 	}
 }
+
+func TestRunner_CleansUpRepoOverridePromptDir(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer st.Close()
+
+	repoRoot := filepath.Join("..", "..")
+	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, "configs", "workflows", "pr-review.yaml"), repoRoot)
+	if err != nil {
+		t.Fatalf("LoadWorkflowFile: %v", err)
+	}
+
+	makePromptDir := func(t *testing.T, content string) string {
+		t.Helper()
+		dir, err := os.MkdirTemp("", "mochi-repo-prompts-test-*")
+		if err != nil {
+			t.Fatalf("MkdirTemp: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Join(dir, ".mochi"), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".mochi", "review.md"), []byte(content), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		return dir
+	}
+
+	llmProvider := newRoutingLLMProvider("mock", func(_ context.Context, role string, _ int, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+		if role == "synthesizer" {
+			return &llm.ChatResponse{
+				Message: llm.Message{
+					Role:    llm.RoleAssistant,
+					Content: `{"summary":"All clear","verdict":"APPROVE","findings":[]}`,
+				},
+			}, nil
+		}
+		tc := llm.ToolCall{
+			ID:        "tc_submit_" + role,
+			Name:      "submit_output",
+			Arguments: json.RawMessage(`{"summary":"ok","findings":[]}`),
+		}
+		return &llm.ChatResponse{
+			Message:   llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{tc}},
+			ToolCalls: []llm.ToolCall{tc},
+		}, nil
+	})
+
+	// 1. Success path removes PromptDir
+	successDir := makePromptDir(t, "Custom prompt")
+	runnerOK := &Runner{
+		Store:              st,
+		SandboxProvider:    newTrackingSandboxProvider(nil),
+		DefaultLLMProvider: llmProvider,
+		PromptEngine:       config.NewPromptEngine(repoRoot),
+		RepoOverrideLoader: func(_ context.Context, _ *domain.TaskContext, _ sandbox.Sandbox, _ string) (*RepoOverrideBundle, error) {
+			return &RepoOverrideBundle{
+				PromptDir: successDir,
+				ConfigYAML: []byte(`
+agents:
+  - role: correctness
+    prompt_file: ".mochi/review.md"
+`),
+			}, nil
+		},
+	}
+	if _, err := runnerOK.Execute(ctx, &domain.TaskContext{
+		RunID:        "run-cleanup-ok",
+		WorkflowName: wf.Name,
+		TriggerType:  "cli",
+		DedupKey:     "repo:pr:30",
+		Changeset:    &domain.ChangesetSpec{RepoOwner: "shohei-yamagiwa", RepoName: "mochi", PRNumber: 30, BaseSHA: "111", HeadSHA: "222"},
+	}, wf); err != nil {
+		t.Fatalf("runnerOK.Execute: %v", err)
+	}
+	if _, statErr := os.Stat(successDir); !os.IsNotExist(statErr) {
+		t.Fatalf("expected %q to be removed after run completion, stat err=%v", successDir, statErr)
+	}
+
+	// 2. Merge-error path also removes PromptDir
+	errDir := makePromptDir(t, "Unused prompt")
+	runnerErr := &Runner{
+		Store:              st,
+		SandboxProvider:    newTrackingSandboxProvider(nil),
+		DefaultLLMProvider: llmProvider,
+		PromptEngine:       config.NewPromptEngine(repoRoot),
+		RepoOverrideLoader: func(_ context.Context, _ *domain.TaskContext, _ sandbox.Sandbox, _ string) (*RepoOverrideBundle, error) {
+			return &RepoOverrideBundle{
+				PromptDir:  errDir,
+				ConfigYAML: []byte("agents:\n  - role: nonexistent-role\n"),
+			}, nil
+		},
+	}
+	if _, err := runnerErr.Execute(ctx, &domain.TaskContext{
+		RunID:        "run-cleanup-err",
+		WorkflowName: wf.Name,
+		TriggerType:  "cli",
+		DedupKey:     "repo:pr:31",
+		Changeset:    &domain.ChangesetSpec{RepoOwner: "shohei-yamagiwa", RepoName: "mochi", PRNumber: 31, BaseSHA: "111", HeadSHA: "222"},
+	}, wf); err == nil {
+		t.Fatal("expected merge error for unknown role, got nil")
+	}
+	if _, statErr := os.Stat(errDir); !os.IsNotExist(statErr) {
+		t.Fatalf("expected %q to be removed on merge error, stat err=%v", errDir, statErr)
+	}
+}
+
