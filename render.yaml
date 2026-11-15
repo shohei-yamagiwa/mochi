@@ -19,7 +19,7 @@ services:
       - key: MOCHI_DB_PATH
         value: /data/mochi.db
       - key: MOCHI_WORKFLOW
-        value: configs/workflows/pr-review-small.yaml
+        value: configs/workflows/pr-review.yaml
       - key: MOCHI_WORKERS
         value: "1"
       - key: MOCHI_QUEUE_SIZE

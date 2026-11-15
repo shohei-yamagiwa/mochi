@@ -77,11 +77,22 @@ func TestRuntimeWorkflowChecksAllDependencies(t *testing.T) {
 	}
 }
 
-func TestCLI_ValidateSmallDeploymentPreset(t *testing.T) {
+func TestCLI_ValidateDeploymentPresets(t *testing.T) {
+	for _, tc := range []struct{ file, expected string }{
+		{"pr-review-small.yaml", "1 agents, 1 sinks"},
+		{"pr-review.yaml", "4 agents, 1 sinks"},
+	} {
+		t.Run(tc.file, func(t *testing.T) { testValidateDeploymentPreset(t, tc.file, tc.expected) })
+	}
+}
+
+func testValidateDeploymentPreset(t *testing.T, file, expected string) {
+	t.Helper()
 	runtimeTestEnv(t)
 	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
 	t.Setenv("GEMINI_API_KEY", "test-gemini-key")
-	path := filepath.Join("..", "..", "configs", "workflows", "pr-review-small.yaml")
+	path := filepath.Join("..", "..", "configs", "workflows", file)
 	for _, runtime := range []bool{false, true} {
 		cmd := newRootCmd()
 		var out bytes.Buffer
@@ -94,7 +105,7 @@ func TestCLI_ValidateSmallDeploymentPreset(t *testing.T) {
 		if err := cmd.Execute(); err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(out.String(), "1 agents, 1 sinks") {
+		if !strings.Contains(out.String(), expected) {
 			t.Fatalf("unexpected output: %s", out.String())
 		}
 	}

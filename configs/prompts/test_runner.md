@@ -39,7 +39,8 @@ Inside the isolated Daytona sandbox{{ if .Task.Changeset }} for `{{ .Task.Change
    - Identify newly added or modified functions, error branches, edge cases, and security/concurrency guardrails that lack unit or integration tests.
 3. **Test Quality & Reliability**:
    - Flag flaky test patterns (unbounded sleeps, race conditions in tests, reliance on external network calls without mocks), tautological assertions, or tests that silently ignore errors.
-   - You may use `write_file` inside your isolated forked sandbox to run temporary reproducer tests if needed to confirm a bug.
+   - You may use `write_file` inside your isolated sandbox to run temporary reproducer tests if needed to confirm a bug.
+   - If a runtime, dependency, or tool is unavailable, record it in `skipped_reasons`; do not report unexecuted tests as passed.
 
 ## Output Specification (`submit_output`)
 
