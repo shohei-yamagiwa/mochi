@@ -409,3 +409,37 @@ func TestPromptEngineSecurityAndRendering(t *testing.T) {
 		}
 	}
 }
+
+func TestReasoningEffortValidation(t *testing.T) {
+	root := repoRoot(t)
+	wf, err := config.LoadWorkflowFile(filepath.Join(root, "configs", "workflows", "pr-review.yaml"), root)
+	if err != nil {
+		t.Fatalf("LoadWorkflowFile: %v", err)
+	}
+
+	for _, valid := range []string{"minimal", "low", "medium", "high", "xhigh", "max"} {
+		override := []byte("agents:\n  - role: correctness\n    llm:\n      reasoning_effort: " + valid + "\n")
+		merged, err := config.MergeRepoOverrides(wf, override)
+		if err != nil {
+			t.Fatalf("expected reasoning_effort %q to be valid, got error: %v", valid, err)
+		}
+		if merged.Agents[0].LLM.ReasoningEffort != valid {
+			t.Fatalf("got ReasoningEffort = %q, want %q", merged.Agents[0].LLM.ReasoningEffort, valid)
+		}
+		resolvedYAML, err := config.MarshalWorkflowYAML(merged)
+		if err != nil {
+			t.Fatalf("MarshalWorkflowYAML(%q): %v", valid, err)
+		}
+		if _, err := config.ParseWorkflow([]byte(resolvedYAML)); err != nil {
+			t.Fatalf("ParseWorkflow(%q): %v", valid, err)
+		}
+	}
+
+	for _, invalid := range []string{"none", "ultra"} {
+		override := []byte("agents:\n  - role: correctness\n    llm:\n      reasoning_effort: " + invalid + "\n")
+		if _, err := config.MergeRepoOverrides(wf, override); err == nil {
+			t.Fatalf("expected reasoning_effort %q to be rejected by MergeRepoOverrides", invalid)
+		}
+	}
+}
+

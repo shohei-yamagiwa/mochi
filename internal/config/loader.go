@@ -446,6 +446,10 @@ func reasoningEffortRank(effort string) (int, bool) {
 		return 3, true
 	case "high":
 		return 4, true
+	case "xhigh":
+		return 5, true
+	case "max":
+		return 6, true
 	default:
 		return 0, false
 	}

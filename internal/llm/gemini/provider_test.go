@@ -155,3 +155,53 @@ func TestGeminiProvider_ThinkingToolSignatureAndStructuredOutput(t *testing.T) {
 		t.Fatalf("expected responseMimeType/responseJsonSchema, got %v", genCfg)
 	}
 }
+
+func TestGemini_ReasoningEffortMappingAndClamping(t *testing.T) {
+	var levels []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		level := ""
+		if gc, ok := body["generationConfig"].(map[string]any); ok {
+			if tc, ok := gc["thinkingConfig"].(map[string]any); ok {
+				level, _ = tc["thinkingLevel"].(string)
+			}
+		}
+		levels = append(levels, level)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"candidates":[{"finishReason":"STOP","content":{"role":"model","parts":[{"text":"ok"}]}}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1}}`))
+	}))
+	defer srv.Close()
+
+	p, err := NewProvider(WithAPIKey("test-key"), WithBaseURL(srv.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"minimal", "MINIMAL"},
+		{"low", "LOW"},
+		{"medium", "MEDIUM"},
+		{"high", "HIGH"},
+		{"xhigh", "HIGH"},
+		{"max", "HIGH"},
+		{"none", ""},
+	}
+	for _, tc := range cases {
+		if _, err := p.Generate(context.Background(), llm.ChatRequest{
+			Config:   llm.ModelConfig{Provider: "gemini", Model: "gemini-3.8-flash", ReasoningEffort: tc.in},
+			Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
+		}); err != nil {
+			t.Fatalf("Generate(%q): %v", tc.in, err)
+		}
+	}
+	for i, tc := range cases {
+		if levels[i] != tc.want {
+			t.Fatalf("reasoning_effort %q mapped to %q, want %q", tc.in, levels[i], tc.want)
+		}
+	}
+}
+

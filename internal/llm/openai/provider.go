@@ -328,8 +328,6 @@ func mapResponsesToolChoice(choice string) responses.ResponseNewParamsToolChoice
 
 func mapReasoningEffort(effort string) shared.ReasoningEffort {
 	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "none":
-		return shared.ReasoningEffortNone
 	case "minimal":
 		return shared.ReasoningEffortMinimal
 	case "low":

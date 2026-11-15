@@ -326,7 +326,7 @@ type ModelConfig struct {
     Model           string   `yaml:"model"`                      // e.g. "claude-sonnet-5-5", "gpt-6.1-sol", "gemini-3.8-flash"
     Temperature     *float64 `yaml:"temperature,omitempty"`
     MaxOutputTokens int      `yaml:"max_output_tokens,omitempty"`
-    ReasoningEffort string   `yaml:"reasoning_effort,omitempty"` // "minimal", "low", "medium", "high"
+    ReasoningEffort string   `yaml:"reasoning_effort,omitempty"` // "minimal", "low", "medium", "high", "xhigh", "max" (Anthropic clamps "minimal"->"low"; Gemini clamps "xhigh"/"max"->"high")
 }
 
 type ChatRequest struct {

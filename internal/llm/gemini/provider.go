@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -266,6 +267,9 @@ func mapThinkingLevel(effort string) genai.ThinkingLevel {
 	case "medium":
 		return genai.ThinkingLevelMedium
 	case "high":
+		return genai.ThinkingLevelHigh
+	case "xhigh", "max":
+		slog.Warn("gemini: reasoning_effort level clamped to ThinkingLevelHigh", "requested", effort, "applied", "high")
 		return genai.ThinkingLevelHigh
 	default:
 		return ""

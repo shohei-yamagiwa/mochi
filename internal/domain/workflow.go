@@ -90,7 +90,7 @@ type ModelConfig struct {
 	BaseURL         string   `yaml:"base_url,omitempty" json:"base_url,omitempty"` // Optional base URL for openai_compat endpoints
 	Temperature     *float64 `yaml:"temperature,omitempty" json:"temperature,omitempty"`
 	MaxOutputTokens int      `yaml:"max_output_tokens,omitempty" json:"max_output_tokens,omitempty"`
-	ReasoningEffort string   `yaml:"reasoning_effort,omitempty" json:"reasoning_effort,omitempty"` // "minimal", "low", "medium", "high"
+	ReasoningEffort string `yaml:"reasoning_effort,omitempty" json:"reasoning_effort,omitempty"` // "minimal", "low", "medium", "high", "xhigh", "max" (Anthropic clamps "minimal"->"low"; Gemini clamps "xhigh"/"max"->"high")
 }
 
 // Workflow represents a complete declarative workflow definition (e.g. pr-review.yaml).
