@@ -33,13 +33,14 @@ OpenAI のキーだけで LLM を設定でき、サーバーの同時実行数�
 Daytona では通常、ベースと専門エージェント用の計 2 サンドボックスが必要になる。
 監査データや PR の大きさによって 512 MB RAM が不足する場合はプランを上げる。
 
-最初は GitHub App の購読を **Issue comment のみ**にし、許可したリポジトリの PR で
-`/mochi review` をコメントして実行する。PR は open かつ draft でないことが必要。
-コメント投稿者は OWNER / MEMBER / COLLABORATOR に限定される。
-
-自動実行も必要になったら Pull request を購読する。small プリセットは
-`ready_for_review` のみ自動実行する。`opened` / `synchronize` などを追加すると
-実行回数と費用が増える。**空の `events: []` は無効化ではなく既定イベントに戻る**。
+GitHub App は **Pull request と Issue comment の両方**を購読する。
+small プリセットは PR の作成（`opened`）、コミット追加（`synchronize`）、
+再オープン（`reopened`）、Draft 解除（`ready_for_review`）で自動実行する。
+Draft 中は実行せず、PR は open であることが必要。
+`/mochi review` のコメントでも再実行できる。コメント投稿者は
+OWNER / MEMBER / COLLABORATOR に限定される。
+手動実行だけにする場合は App の Pull request 購読を外す。
+**空の `events: []` は無効化ではなく既定イベントに戻る**。
 モデル `gpt-6.1-sol` は既存プリセットと合わせてある。アカウントで使用可能な
 Responses API 対応モデルか確認し、必要なら YAML の specialist と synthesizer の両方を変更する。
 トークン予算は呼び出し後の計数なので、厳密な金額上限ではない。
@@ -72,8 +73,8 @@ Repository permissions:
 | Checks | Read and write | Check Run の作成と更新 |
 | Issues | Read | Issue comment イベントの購読 |
 
-初期のイベント購読は **Issue comment** のみ。自動レビューが必要な場合に
-**Pull request** も追加する。Actions、Administration、Contents write は不要。
+イベント購読は **Pull request と Issue comment の両方**を有効にする。
+Actions、Administration、Contents write は不要。
 App ID（Client ID とは別）を控え、Private keys から RSA 秘密鍵を生成・ダウンロードする。
 App の **Install App** から、まずテスト対象の 1 リポジトリだけにインストールする。
 Installation ID は Webhook から取得するためサーバー環境変数には不要。
@@ -163,8 +164,11 @@ LLM キーは Daytona の実行環境には渡さない。
 最初に GitHub App の Advanced → Recent deliveries で ping を再配信し、200 の
 `ignored` 応答を確認する。ping はレビュー実行を開始しない。
 
-次に、小さな変更を含む non-draft のテスト PR で、リポジトリ所有者などが
-`/mochi review` とコメントする。これは実際に LLM / Daytona を利用し、PR に書き込む。
+次に、小さな変更を含む non-draft のテスト PR を作成し、コメントなしで自動レビューが
+始まることを確認する。コミット追加でも再実行され、Draft 中は実行されず、Draft を
+解除すると実行されることを確認する。必要に応じてリポジトリ所有者などが
+`/mochi review` とコメントして手動でも再実行できる。
+これらの確認は実際に LLM / Daytona を利用し、PR に書き込む。
 
 - Webhook が 202 を返すこと。
 - PR に Mochi の Check Run とレビューが作られること。
