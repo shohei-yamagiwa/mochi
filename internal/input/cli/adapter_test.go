@@ -144,3 +144,73 @@ func TestCLIAdapter_GitHubPRRef(t *testing.T) {
 		t.Fatalf("unexpected task: trigger=%q pr=%d", task.TriggerType, task.Changeset.PRNumber)
 	}
 }
+
+func TestCLIAdapter_GitHubPRRef_AllowsDraftAndMergedPRs(t *testing.T) {
+	cases := []struct {
+		name   string
+		state  string
+		draft  bool
+		merged bool
+	}{
+		{name: "draft PR", state: "open", draft: true, merged: false},
+		{name: "merged PR", state: "closed", draft: false, merged: true},
+		{name: "closed unmerged PR", state: "closed", draft: false, merged: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/repos/acme/app/pulls/12":
+					if r.Header.Get("Accept") == "application/vnd.github.v3.diff" {
+						_, _ = w.Write([]byte("diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1,2 @@\n package a\n+var x = 1\n"))
+						return
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"number":   12,
+						"title":    "PR from CLI",
+						"state":    tc.state,
+						"draft":    tc.draft,
+						"merged":   tc.merged,
+						"html_url": "https://github.com/acme/app/pull/12",
+						"user":     map[string]any{"login": "octo"},
+						"base":     map[string]any{"ref": "main", "sha": "base123", "repo": map[string]any{"clone_url": "https://github.com/acme/app.git"}},
+						"head":     map[string]any{"ref": "feat", "sha": "head456"},
+					})
+				case "/repos/acme/app/pulls/12/files":
+					_ = json.NewEncoder(w).Encode([]map[string]any{
+						{"filename": "a.go", "status": "modified", "additions": 1, "patch": "@@ -1 +1,2 @@\n package a\n+var x = 1"},
+					})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+
+			baseURL := srv.URL + "/"
+			ghClient, err := github.NewClient(
+				github.WithHTTPClient(srv.Client()),
+				github.WithURLs(&baseURL, &baseURL),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			adapter := cli.NewAdapter()
+			task, err := adapter.BuildTaskContext(context.Background(), &cli.RunRequest{
+				WorkflowName:  "pr-review",
+				PRRef:         "acme/app#12",
+				GitHubClients: ghinput.NewStaticClientFactory(ghClient, "cli-tok"),
+			})
+			if err != nil {
+				t.Fatalf("%s: BuildTaskContext(PRRef) unexpected error: %v", tc.name, err)
+			}
+			if task.TriggerType != "cli" || task.Changeset == nil || task.Changeset.PRNumber != 12 {
+				t.Fatalf("%s: unexpected task: %+v", tc.name, task)
+			}
+			if task.Changeset.TriggerEvent != "cli.pr" {
+				t.Fatalf("%s: TriggerEvent = %q, want cli.pr", tc.name, task.Changeset.TriggerEvent)
+			}
+		})
+	}
+}
