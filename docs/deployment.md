@@ -5,7 +5,7 @@
 
 ## 推奨する初期構成
 
-**Render Starter 1 台 + 永続ディスク 1 GB + SQLite + Daytona + OpenAI** を推奨する。
+**Render Starter 1 台 + 永続ディスク 1 GB + SQLite + Daytona + Gemini** を推奨する。
 独自ドメインは不要で、Render の HTTPS URL を GitHub の Webhook に設定できる。
 サーバー上では Go のオーケストレーターを常駐させ、コードの実行は Daytona が受け持つ。
 
@@ -18,7 +18,7 @@
 2026-11-15 に確認した [Render 料金](https://render.com/pricing)では、Starter は
 **7 USD/月、ディスクは 0.25 USD/GB/月**。1 GB なら基礎費用は約 **7.25 USD/月**。
 税・為替・転送量などは別。契約時に現在の料金を確認する。
-**OpenAI と Daytona の利用料は含まれない**。レビュー頻度、PR サイズ、ターン数、
+**Gemini と Daytona の利用料は含まれない**。レビュー頻度、PR サイズ、ターン数、
 VM 稼働時間によって増えるため、各サービスの使用量と予算通知も設定する。
 
 無料のスリープするサービスやリクエストの間だけ動く関数は、このままの構成には適さない。
@@ -29,7 +29,7 @@ Webhook の応答後に非同期レビューを続け、SQLite とメモリー�
 
 同梱の `configs/workflows/pr-review-small.yaml` は、既存の correctness プロンプトを
 使う専門エージェント 1 つと synthesizer に絞る。4 専門分野のフルレビューではない。
-OpenAI のキーだけで LLM を設定でき、サーバーの同時実行数は 1、待ち行列は 16。
+Gemini のキーだけで LLM を設定でき、サーバーの同時実行数は 1、待ち行列は 16。
 Daytona では通常、ベースと専門エージェント用の計 2 サンドボックスが必要になる。
 監査データや PR の大きさによって 512 MB RAM が不足する場合はプランを上げる。
 
@@ -41,8 +41,9 @@ Draft 中は実行せず、PR は open であることが必要。
 OWNER / MEMBER / COLLABORATOR に限定される。
 手動実行だけにする場合は App の Pull request 購読を外す。
 **空の `events: []` は無効化ではなく既定イベントに戻る**。
-モデル `gpt-6.1-sol` は既存プリセットと合わせてある。アカウントで使用可能な
-Responses API 対応モデルか確認し、必要なら YAML の specialist と synthesizer の両方を変更する。
+専門エージェントと synthesizer はどちらも `gemini-3.8-flash` を使用する。
+Gemini API のプロジェクトでモデルの利用権限とクォータを確認する。
+別のモデルに変更する場合は YAML の specialist と synthesizer の両方を変更する。
 トークン予算は呼び出し後の計数なので、厳密な金額上限ではない。
 
 ## 1. GitHub App を作る
@@ -108,7 +109,7 @@ GitHub・LLM・Daytona の秘密情報を Snapshot に埋め込まない。
 | `GITHUB_WEBHOOK_SECRET` | GitHub App と同じランダムな secret |
 | `MOCHI_API_TOKEN` | 検査 API と汎用 trigger API 用の別のランダム値 |
 | `DAYTONA_API_KEY` | Daytona キー |
-| `OPENAI_API_KEY` | small プリセットの LLM キー |
+| `GEMINI_API_KEY` | small プリセットの Gemini API キー（`GOOGLE_API_KEY` でも可） |
 | `PORT` | コンテナの待受ポート（既定 8080、入口スクリプトが反映） |
 | `MOCHI_DB_PATH` | `/data/mochi.db`（永続ディスク内） |
 | `MOCHI_WORKFLOW` | `configs/workflows/pr-review-small.yaml` |
@@ -120,9 +121,12 @@ Render へ PEM を貼る際は `.env` 用の外側の引用符を含めない。
 ファイル方式なら `MOCHI_GITHUB_PRIVATE_KEY_PATH` を使用できるが、
 初期構成では inline PEM に統一する。両方式を同時に設定しない。
 GitHub App 運用では `GITHUB_TOKEN` / `GH_TOKEN` は設定不要。
+小規模プリセットでは `OPENAI_API_KEY` は不要。
+既存の Render サービスに `GEMINI_API_KEY` を登録済みなら、その値を引き続き使う。
+両方の Gemini 用変数を登録した場合は `GEMINI_API_KEY` を優先する。
 
-4 専門エージェント版に切り替える場合は `ANTHROPIC_API_KEY` と `GEMINI_API_KEY`
-（または `GOOGLE_API_KEY`）も登録し、フルプリセットが指定する Daytona Snapshot を作成する。
+4 専門エージェント版に切り替える場合は `OPENAI_API_KEY` と `ANTHROPIC_API_KEY`
+も登録し、フルプリセットが指定する Daytona Snapshot を作成する。
 
 ## 4. ローカルでコンテナを確認
 
