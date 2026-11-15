@@ -4,14 +4,15 @@ import "context"
 
 // TaskContext is the canonical, platform-neutral input to any workflow.
 type TaskContext struct {
-	RunID        string         `json:"run_id"`
-	WorkflowName string         `json:"workflow_name"`
-	TriggerType  string         `json:"trigger_type"`  // e.g. "github_pr", "cli", "webhook"
-	DedupKey     string         `json:"dedup_key"`     // e.g. "github:owner/repo:pr:42"
-	Workspace    WorkspaceSpec  `json:"workspace"`     // How Daytona should prepare the codebase
-	Changeset    *ChangesetSpec `json:"changeset"`     // Structured PR/commit metadata, diff, and changed files
-	Variables    map[string]any `json:"variables"`     // Exposed to Go text/template prompts
-	SinkMetadata map[string]any `json:"sink_metadata"` // Routing metadata for the OutputSink
+	RunID         string         `json:"run_id"`
+	WorkflowName  string         `json:"workflow_name"`
+	TriggerType   string         `json:"trigger_type"`  // e.g. "github_pr", "cli", "webhook"
+	DedupKey      string         `json:"dedup_key"`     // e.g. "github:owner/repo:pr:42"
+	DedupSequence uint64         `json:"-"`             // Monotonic per-DedupKey ingress order to reject late hydration
+	Workspace     WorkspaceSpec  `json:"workspace"`     // How Daytona should prepare the codebase
+	Changeset     *ChangesetSpec `json:"changeset"`     // Structured PR/commit metadata, diff, and changed files
+	Variables     map[string]any `json:"variables"`     // Exposed to Go text/template prompts
+	SinkMetadata  map[string]any `json:"sink_metadata"` // Routing metadata for the OutputSink
 }
 
 // WorkspaceSpec describes how the sandbox provider prepares the repository workspace.

@@ -545,3 +545,187 @@ func TestServer_FailClosedWhenSecretsMissing(t *testing.T) {
 		t.Fatalf("insecure webhook draft PR status = %d, want 200", whResp.StatusCode)
 	}
 }
+
+type recordedLLM struct {
+	mu       sync.Mutex
+	contents []string
+}
+
+func (r *recordedLLM) Name() string { return "openai" }
+
+func (r *recordedLLM) Generate(_ context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+	if req.ResponseSchema != nil {
+		raw, _ := json.Marshal(output.ReviewReport{Summary: "Clean.", Verdict: output.VerdictApprove})
+		return &llm.ChatResponse{
+			Message:      llm.Message{Role: llm.RoleAssistant, Content: string(raw)},
+			FinishReason: "stop",
+		}, nil
+	}
+	r.mu.Lock()
+	for _, m := range req.Messages {
+		r.contents = append(r.contents, m.Content)
+	}
+	r.mu.Unlock()
+	args := json.RawMessage(`{"findings":[],"summary":"Clean."}`)
+	return &llm.ChatResponse{
+		Message:   llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{{ID: "call-1", Name: "submit_output", Arguments: args}}},
+		ToolCalls: []llm.ToolCall{{ID: "call-1", Name: "submit_output", Arguments: args}},
+	}, nil
+}
+
+func TestServer_OutOfOrderWebhookHydration(t *testing.T) {
+	st, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "mochi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	firstHydrating := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var firstOnce sync.Once
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseFirst) })
+	var reqMu sync.Mutex
+	prCalls := 0
+
+	ghMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/shohei-yamagiwa/mochi/pulls/42":
+			if strings.Contains(r.Header.Get("Accept"), "application/vnd.github.v3.diff") {
+				_, _ = w.Write([]byte("diff --git a/app.go b/app.go\n--- a/app.go\n+++ b/app.go\n@@ -1 +1,2 @@\n package main\n+var ok = true\n"))
+				return
+			}
+			reqMu.Lock()
+			prCalls++
+			callNum := prCalls
+			reqMu.Unlock()
+
+			headSHA := "head_newer_2"
+			title := "Newer push"
+			if callNum == 1 {
+				headSHA = "head_older_1"
+				title = "Older push"
+				firstOnce.Do(func() { close(firstHydrating) })
+				<-releaseFirst
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number":   42,
+				"state":    "open",
+				"title":    title,
+				"html_url": "https://github.com/shohei-yamagiwa/mochi/pull/42",
+				"user":     map[string]any{"login": "shohei"},
+				"base":     map[string]any{"ref": "main", "sha": "base1", "repo": map[string]any{"clone_url": "https://github.com/shohei-yamagiwa/mochi.git"}},
+				"head":     map[string]any{"ref": "feat", "sha": headSHA},
+			})
+		case "/repos/shohei-yamagiwa/mochi/pulls/42/files":
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"filename": "app.go", "status": "modified", "additions": 1, "patch": "@@ -1 +1,2 @@\n package main\n+var ok = true"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghMock.Close()
+
+	baseURL := ghMock.URL + "/"
+	ghClient, err := github.NewClient(github.WithHTTPClient(ghMock.Client()), github.WithURLs(&baseURL, &baseURL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hookSecret := "hook-secret"
+	ghAdapter, err := ghinput.NewAdapter(ghinput.NewStaticClientFactory(ghClient, "tok"), ghinput.WithWebhookSecret(hookSecret))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wf, promptDir := setupTestWorkflow(t)
+	if err := os.WriteFile(filepath.Join(promptDir, "spec.md"), []byte("Head={{ .Task.Changeset.HeadSHA }}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	recLLM := &recordedLLM{}
+	runner := &orchestrator.Runner{
+		Store:              st,
+		DefaultLLMProvider: recLLM,
+		PromptEngine:       config.NewPromptEngine(promptDir),
+	}
+	sched := orchestrator.NewScheduler(runner, orchestrator.SchedulerConfig{MaxWorkers: 2})
+	defer func() { _ = sched.Shutdown(context.Background()) }()
+
+	srv, err := server.New(server.Config{
+		Workflows:       map[string]*domain.Workflow{wf.Name: wf},
+		DefaultWorkflow: wf.Name,
+		GitHubAdapter:   ghAdapter,
+		Scheduler:       sched,
+		Store:           st,
+		EnqueueTimeout:  5 * time.Second,
+		APIToken:        "api-secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	sendHook := func(deliv string) string {
+		body := []byte(`{"action":"synchronize","number":42,"installation":{"id":1},"repository":{"name":"mochi","owner":{"login":"shohei-yamagiwa"}},"pull_request":{"number":42,"draft":false}}`)
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/webhooks/github", bytes.NewReader(body))
+		req.Header.Set("X-GitHub-Event", "pull_request")
+		req.Header.Set("X-GitHub-Delivery", deliv)
+		req.Header.Set("X-Hub-Signature-256", signHMAC(hookSecret, body))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var accepted struct {
+			RunID string `json:"run_id"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&accepted)
+		return accepted.RunID
+	}
+
+	run1 := sendHook("deliv-1")
+	<-firstHydrating
+
+	// Send second (newer) webhook while first is still blocked in hydration.
+	run2 := sendHook("deliv-2")
+	var res2 *orchestrator.RunResult
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		res2, err = sched.WaitForRun(context.Background(), run2)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("WaitForRun(run2) timed out: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if res2.Run.Status != domain.RunStatusCompleted {
+		t.Fatalf("run2 status = %q, want completed", res2.Run.Status)
+	}
+
+	// Now unblock first hydration and drain all background goroutines.
+	releaseOnce.Do(func() { close(releaseFirst) })
+	if err := srv.Drain(context.Background()); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+
+	// Newer run must remain Completed and stale run1 must never execute.
+	got2, err := st.GetRun(context.Background(), run2)
+	if err != nil {
+		t.Fatalf("GetRun(run2): %v", err)
+	}
+	if got2.Status != domain.RunStatusCompleted {
+		t.Fatalf("run2 status after late hydration = %q, want completed", got2.Status)
+	}
+	if _, err := st.GetRun(context.Background(), run1); err == nil {
+		t.Fatalf("stale run1 should not have been enqueued/persisted after run2 arrived")
+	}
+	recLLM.mu.Lock()
+	joined := strings.Join(recLLM.contents, "\n")
+	recLLM.mu.Unlock()
+	if strings.Contains(joined, "Older push") || !strings.Contains(joined, "Newer push") {
+		t.Fatalf("expected only Newer push to run, got LLM prompts: %s", joined)
+	}
+}
