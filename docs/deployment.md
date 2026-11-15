@@ -1,218 +1,184 @@
-# GitHub App としてのデプロイ
+# Deployment and operations
 
-`render.yaml` のデプロイ対象は `main`。変更をマージしてから公開する。
-動作済みの小規模構成から切り替える場合は、[4 専門エージェントへの移行手順](multi-agent-rollout.md)
-に従い、Snapshot を用意してから使用する workflow を変更する。
+Mochi needs a continuously running server, persistent SQLite storage, a Daytona
+account, and credentials for the configured LLM providers. The supplied image
+works with [Compose](../compose.yaml) or the [Render Blueprint](../render.yaml).
+Use one server instance: the queue and cancellation state live in memory.
 
-## 推奨する初期構成
+## Configure a GitHub App
 
-**Render Starter 1 台 + 永続ディスク 1 GB + SQLite + Daytona + Gemini** を推奨する。
-独自ドメインは不要で、Render の HTTPS URL を GitHub の Webhook に設定できる。
-サーバー上では Go のオーケストレーターを常駐させ、コードの実行は Daytona が受け持つ。
+Create an App under GitHub **Settings → Developer settings → GitHub Apps**.
+Set its webhook URL to `https://<your-host>/webhooks/github`, enable SSL
+verification, and set a secret generated with `openssl rand -hex 32`.
+If the server is not deployed yet, leave delivery inactive until its HTTPS
+endpoint is available. User OAuth and a callback URL are not needed.
 
-| 候補 | 向いている場合 | このアプリで必要なこと |
+Grant these repository permissions:
+
+| Permission | Access | Purpose |
 | --- | --- | --- |
-| **Render（推奨）** | 月々の基礎費用を把握しやすく、設定を Git 管理したい | 同梱 Blueprint、Starter、永続ディスク、1 インスタンス |
-| Railway | 既に Railway を使っている、従量課金が好み | Docker、Volume を `/data` に接続、スリープ無効、1 インスタンス、同じ秘密情報 |
-| 小さい VPS | 自前サーバーを保守できる | Compose に加え、HTTPS、OS 更新、バックアップ、監視を自分で運用 |
+| Metadata | Read | Repository metadata |
+| Contents | Read | Source files and read-only clone tokens |
+| Pull requests | Read and write | PR metadata, reviews, and inline comments |
+| Checks | Read and write | Check Runs |
+| Issues | Read | Issue comment event subscription |
 
-2026-11-15 に確認した [Render 料金](https://render.com/pricing)では、Starter は
-**7 USD/月、ディスクは 0.25 USD/GB/月**。1 GB なら基礎費用は約 **7.25 USD/月**。
-税・為替・転送量などは別。契約時に現在の料金を確認する。
-**Gemini と Daytona の利用料は含まれない**。レビュー頻度、PR サイズ、ターン数、
-Sandbox 稼働時間によって増えるため、各サービスの使用量と予算通知も設定する。
+Subscribe to **Pull request** and **Issue comment** events. Record the numeric
+App ID, download a generated private key, and install the App on the repositories
+to review. Mochi obtains the installation ID from webhook events. After changing
+App permissions, approve the updated permissions at the installation.
 
-無料のスリープするサービスやリクエストの間だけ動く関数は、このままの構成には適さない。
-Webhook の応答後に非同期レビューを続け、SQLite とメモリー内キューを使うためである。
-複数インスタンスやスケールゼロへの対応には、外部 DB・永続ジョブキューなどへの変更が必要。
+Both presets review open, non-draft PRs on `opened`, `synchronize`, `reopened`,
+and `ready_for_review`. An owner, member, or collaborator can comment
+`/mochi review` to rerun a review. For comment-only triggering, disable the App's
+Pull request event subscription. `events: []` restores the default events rather
+than disabling them.
 
-## 最初の利用範囲と費用
+## Prepare Daytona snapshots
 
-既定の `configs/workflows/pr-review.yaml` は、correctness、security、performance-architecture、
-test-runner の 4 専門エージェントと synthesizer 1 つを Gemini で実行する。
-Daytona では専門エージェントごとに 1 台、最大 4 台の独立したコンテナ型 Sandbox を直接作成する。
-synthesizer は専門エージェントの結果を統合し、Sandbox は作成しない。
-`fork_from_base: false` のため、共有ベースの Sandbox や VM の fork は不要。
-サーバーの同時 workflow 数は 1、待ち行列は 16。専門エージェント 4 つは並列に実行する。
-動作済みの `configs/workflows/pr-review-small.yaml` は correctness 1 つと synthesizer の構成で、
-切り戻し先として残す。4 専門エージェント版では LLM と Sandbox の利用量が増える。
-監査データや PR の大きさによって 512 MB RAM が不足する場合はプランを上げる。
+Create a Daytona API key, then use the Daytona CLI from the repository root:
 
-GitHub App は **Pull request と Issue comment の両方**を購読する。
-両プリセットとも PR の作成（`opened`）、コミット追加（`synchronize`）、
-再オープン（`reopened`）、Draft 解除（`ready_for_review`）で自動実行する。
-Draft 中は実行せず、PR は open であることが必要。
-`/mochi review` のコメントでも再実行できる。コメント投稿者は
-OWNER / MEMBER / COLLABORATOR に限定される。
-手動実行だけにする場合は App の Pull request 購読を外す。
-**空の `events: []` は無効化ではなく既定イベントに戻る**。
-専門エージェントと synthesizer はどちらも `gemini-3.8-flash` を使用する。
-Gemini API のプロジェクトでモデルの利用権限とクォータを確認する。
-別のモデルに変更する場合は YAML の specialist と synthesizer の両方を変更する。
-トークン予算は呼び出し後の計数なので、厳密な金額上限ではない。
+```sh
+daytona login
+daytona snapshot create mochi-review-go \
+  --dockerfile deploy/sandbox/go.Dockerfile \
+  --cpu 1 --memory 2
+daytona snapshot list
+```
 
-## 1. GitHub App を作る
+Wait until the snapshot is available. The full preset uses `mochi-review-go`,
+which includes Go and basic review tools. The small preset uses `mochi-review`;
+create it from `deploy/sandbox/Dockerfile` instead. Add the target repository's
+language runtimes and build tools when needed. If you change a snapshot name,
+update `sandbox.default_snapshot` in the workflow too.
 
-GitHub の個人または Organization の **Settings → Developer settings → GitHub Apps → New GitHub App**
-から作成する。名前は GitHub 全体で一意なものにする。
+The full preset creates four independent sandboxes per concurrent workflow; the
+small preset creates one. Ensure your Daytona quota permits this concurrency and
+allocated resources. Both presets disable forking and work with container
+snapshots. Enabling `fork_from_base` requires a compatible VM snapshot; see
+[Daytona's sandbox documentation](https://www.daytona.io/docs/en/sandboxes/).
 
-| 設定 | 値 |
+Use the Dockerfiles under `deploy/sandbox/` for snapshots; the root `Dockerfile`
+builds the Mochi server. Keep secrets out of snapshots. Choose a Daytona target
+near the server where available.
+
+## Set environment variables
+
+Use hosting secrets or, for Compose, copy [`.env.example`](../.env.example) to
+`.env`, run `chmod 600 .env`, and replace all placeholders.
+
+| Variable | Purpose |
 | --- | --- |
-| Homepage URL | `https://github.com/shohei-yamagiwa/mochi` |
-| Webhook URL | 最終的に `https://<service>.onrender.com/webhooks/github` |
-| Webhook secret | `openssl rand -hex 32` で生成した値 |
-| SSL verification | 有効 |
-| Callback URL / OAuth | 不要（ユーザー OAuth は実装していない） |
-| Where can this GitHub App be installed? | 初回は Only on this account |
+| `MOCHI_GITHUB_APP_ID` | Numeric GitHub App ID, not the Client ID |
+| `MOCHI_GITHUB_PRIVATE_KEY` | Full PEM private key with actual line breaks |
+| `GITHUB_WEBHOOK_SECRET` | Same secret as the GitHub App webhook |
+| `MOCHI_API_TOKEN` | Separate random token for inspection, cancellation, and generic triggers |
+| `DAYTONA_API_KEY` | Daytona API key |
+| `GEMINI_API_KEY` | Gemini key for both presets; `GOOGLE_API_KEY` is an alternative |
+| `DAYTONA_TARGET` | Optional Daytona target |
+| `PORT` | Container HTTP port; defaults to `8080` |
+| `MOCHI_DB_PATH` | SQLite path; container default is `/data/mochi.db` |
+| `MOCHI_WORKFLOW` | Container workflow path; defaults to `configs/workflows/pr-review.yaml` |
+| `MOCHI_WORKERS` | Container workflow concurrency; defaults to `1` |
+| `MOCHI_QUEUE_SIZE` | Container scheduler queue capacity; defaults to `16` |
 
-まだサービス URL がなければ Webhook の Active を一時的に外して App を作成し、
-URL 入力が必要なら `https://example.com/webhooks/github` を一時値にする。
-デプロイ後に本物の URL に更新して Active を有効にする。
+Generate the webhook secret and API token separately with `openssl rand -hex 32`.
+The Render Blueprint generates the API token and requests the remaining required
+secrets. For Compose, retain the single quotes around the multiline PEM shown in
+`.env.example`; in a hosting secret field, paste the PEM without the outer quotes.
+Alternatively, set `MOCHI_GITHUB_PRIVATE_KEY_PATH` to a mounted PEM file instead of
+setting `MOCHI_GITHUB_PRIVATE_KEY`.
 
-Repository permissions:
+GitHub App deployments do not need `GITHUB_TOKEN` or `GH_TOKEN`. Both presets use
+Gemini only; other provider credentials are described in
+[configuration](configuration.md#llm-providers). `GEMINI_API_KEY` takes precedence
+over `GOOGLE_API_KEY` when both are set.
 
-| 権限 | 必要なレベル | 用途 |
-| --- | --- | --- |
-| Metadata | Read（自動付与） | リポジトリ情報 |
-| Contents | Read | PR ソースの取得、読み取り専用 clone token |
-| Pull requests | Read and write | PR 情報とレビュー・インラインコメント投稿 |
-| Checks | Read and write | Check Run の作成と更新 |
-| Issues | Read | Issue comment イベントの購読 |
+`MOCHI_WORKFLOW`, `MOCHI_WORKERS`, `MOCHI_QUEUE_SIZE`, and `PORT` are interpreted by
+the container entrypoint. For a standalone binary, use the corresponding
+[`serve` flags](usage.md#start-the-server). The binary does not load `.env` files.
 
-イベント購読は **Pull request と Issue comment の両方**を有効にする。
-Actions、Administration、Contents write は不要。
-App ID（Client ID とは別）を控え、Private keys から RSA 秘密鍵を生成・ダウンロードする。
-App の **Install App** から、まずテスト対象の 1 リポジトリだけにインストールする。
-Installation ID は Webhook から取得するためサーバー環境変数には不要。
-権限を後から変更した場合は、インストール先で更新の承認も行う。
+## Start with Docker Compose
 
-## 2. Daytona の準備
-
-Daytona のアカウントと API キーを作成する。フルプリセットでは
-`deploy/sandbox/go.Dockerfile` を元に **`mochi-review-go`** という Snapshot を作る。
-Go 1.27.4 と git、bash、curl、ripgrep、CA 証明書を含み、Mochi のテストを実行できる。
-CLI の具体的な操作は [移行手順](multi-agent-rollout.md) を参照する。
-small プリセット用の **`mochi-review`** は `deploy/sandbox/Dockerfile` から作成する。
-対象サーバーと近いリージョン/target を選び、Snapshot が利用可能な状態になるまで待つ。
-名称を変える場合は該当プリセットの `sandbox.default_snapshot` も変更する。
-
-Dockerfile から作る通常のコンテナ型 Snapshot は fork に対応しないため、
-両プリセットとも fork を使わない。[Daytona の fork の仕様](https://www.daytona.io/docs/en/sandboxes.md#fork-sandboxes)
-では VM 型 Sandbox が必要となる。将来 `fork_from_base: true` を使う場合には、
-fork 対応の Linux VM Snapshot を別途用意する。
-
-Go 以外の対象プロジェクトのテストを実行するには、その言語ランタイムやビルドツールも
-Daytona 用 Dockerfile に追加して Snapshot を作成する。
-**サーバー用のルート Dockerfile と、Daytona 用 Dockerfile は別物**。
-GitHub・LLM・Daytona の秘密情報を Snapshot に埋め込まない。
-
-実装はサンドボックスを削除し、15 分の自動停止も設定する。ただしサーバー異常終了時の
-外部リソースの削除は保証できないため、Daytona 側の使用量と残存サンドボックスも確認する。
-
-## 3. 環境変数
-
-秘密情報はホスティングの環境変数 / Secret に登録する。チャットや Git に貼らない。
-ローカルでは `.env.example` を `.env` にコピーして `chmod 600 .env` を行い、値を埋める。
-`.env`・PEM・DB は Git と Docker ビルドコンテキストから除外している。
-
-| 変数 | 初期構成での用途 |
-| --- | --- |
-| `MOCHI_GITHUB_APP_ID` | GitHub App の数値 App ID |
-| `MOCHI_GITHUB_PRIVATE_KEY` | ダウンロードした PEM 全文、実際の改行を含む |
-| `GITHUB_WEBHOOK_SECRET` | GitHub App と同じランダムな secret |
-| `MOCHI_API_TOKEN` | 検査 API と汎用 trigger API 用の別のランダム値 |
-| `DAYTONA_API_KEY` | Daytona キー |
-| `GEMINI_API_KEY` | 両プリセットの Gemini API キー（`GOOGLE_API_KEY` でも可） |
-| `PORT` | コンテナの待受ポート（既定 8080、入口スクリプトが反映） |
-| `MOCHI_DB_PATH` | `/data/mochi.db`（永続ディスク内） |
-| `MOCHI_WORKFLOW` | `configs/workflows/pr-review.yaml`（切り戻しは `pr-review-small.yaml`） |
-| `MOCHI_WORKERS` / `MOCHI_QUEUE_SIZE` | 初期値 1 / 16 |
-
-`openssl rand -hex 32` を別々に実行して Webhook secret と API token を作る。
-Render の Blueprint では API token を自動生成し、それ以外の秘密情報は入力を求める。
-Render へ PEM を貼る際は `.env` 用の外側の引用符を含めない。
-ファイル方式なら `MOCHI_GITHUB_PRIVATE_KEY_PATH` を使用できるが、
-初期構成では inline PEM に統一する。両方式を同時に設定しない。
-GitHub App 運用では `GITHUB_TOKEN` / `GH_TOKEN` は設定不要。
-両プリセットとも `OPENAI_API_KEY` と `ANTHROPIC_API_KEY` は不要。
-既存の Render サービスに `GEMINI_API_KEY` を登録済みなら、その値を引き続き使う。
-両方の Gemini 用変数を登録した場合は `GEMINI_API_KEY` を優先する。
-
-既存の Render サービスの `MOCHI_WORKFLOW` は Git の変更だけでは切り替わらない。
-Snapshot の準備後、[移行手順](multi-agent-rollout.md) に従って変更する。
-
-## 4. ローカルでコンテナを確認
+After configuring secrets and preparing the snapshot:
 
 ```sh
 docker compose build
 docker compose run --rm mochi validate --runtime configs/workflows/pr-review.yaml
 docker compose up -d
-curl --fail http://localhost:8080/healthz
 curl --fail http://localhost:8080/readyz
 docker compose logs --tail=100 mochi
 ```
 
-`validate --runtime` は YAML・プロンプト・必要な LLM/Daytona の環境変数・GitHub
-認証設定・HTTP 認証設定をローカルに検証する。課金 API は呼ばない。
-キーの失効、モデルの利用権限、Snapshot の存在、GitHub の実権限は確認しない。
-入口スクリプトは serve の前にこの検証を自動実行する。
+`validate --runtime` checks local configuration, provider credential presence,
+GitHub authentication setup, and HTTP authentication settings. It makes no
+external API calls and does not verify key validity, model access, snapshot
+availability, or remote permissions. The entrypoint runs it before serving.
 
-Compose は localhost にのみ公開する。GitHub から受信するには HTTPS のトンネルを
-別途使うか、次の Render デプロイ後に確認する。Go バイナリ単体は `.env` を自動読込しない。
+Compose binds to localhost. Configure a public HTTPS reverse proxy or tunnel to
+receive GitHub webhooks. SQLite is stored in the `mochi-data` volume. The entrypoint
+initializes `/data` ownership as root, then runs validation and the server as
+UID/GID `10001:10001`.
 
-## 5. Render に公開
+## Deploy on Render
 
-1. 準備変更を `main` にマージし、CI のテストとイメージビルドの成功を確認する。
-2. Render で GitHub のこのリポジトリを接続し、**New → Blueprint** で `render.yaml` を選ぶ。
-3. Starter と 1 GB ディスクの料金、配置リージョンを確認し、必要な秘密情報を入力する。
-4. デプロイ後に `/readyz` が 200 であることを確認する。ログの private key / provider
-   不足やディスク権限エラーがないことも確認する。ディスクは `/data`、インスタンスは 1。
-5. GitHub App の Webhook URL を実際の HTTPS URL + `/webhooks/github` に変更し、Active を有効化する。
-6. 次節の実 PR テストを行ってから対象リポジトリを広げる。
+Connect your repository to Render and create a Blueprint using `render.yaml`.
+It targets `main`, runs one paid web service, mounts a persistent disk at `/data`,
+and uses `/readyz` for health checks. Review current
+[Render pricing](https://render.com/pricing), region, and disk capacity before
+creating the service; LLM and Daytona usage are billed separately.
 
-`autoDeployTrigger: off` にしてあるので、以降のリリースは明示的な Manual Deploy で行う。
-新しい Secret を Blueprint に追加した場合、既存サービスには手動登録が必要になることがある。
-サーバーはディスク初期化のために root で入口を起動し、`/data` の所有者を整えてから
-**UID/GID 10001 に落としてアプリを実行**する。秘密情報を持つのはサーバー側であり、
-LLM キーは Daytona の実行環境には渡さない。
+Enter the required secrets, deploy, and verify `/readyz` returns HTTP 200. Update
+the GitHub App webhook URL to the public HTTPS URL plus `/webhooks/github`, and
+activate delivery. Automatic deployment is disabled by the Blueprint; release
+subsequent versions with Manual Deploy.
 
-## 6. 実接続の確認
+To select another preset, first prepare its snapshot, then update
+`MOCHI_WORKFLOW` and redeploy while no reviews are running or queued. Existing
+service environment values take precedence over image defaults. On other hosts,
+provide the same persistent storage and continuously running single instance.
 
-最初に GitHub App の Advanced → Recent deliveries で ping を再配信し、200 の
-`ignored` 応答を確認する。ping はレビュー実行を開始しない。
+## Verify a deployment
 
-次に、小さな変更を含む non-draft のテスト PR を作成し、コメントなしで自動レビューが
-始まることを確認する。コミット追加でも再実行され、Draft 中は実行されず、Draft を
-解除すると実行されることを確認する。必要に応じてリポジトリ所有者などが
-`/mochi review` とコメントして手動でも再実行できる。
-これらの確認は実際に LLM / Daytona を利用し、PR に書き込む。
+Redeliver a GitHub App ping and confirm an HTTP 200 `ignored` response. Then open
+a small non-draft PR and check that a review starts automatically. Add a commit
+to verify reruns; verify drafts are skipped and marking a PR ready starts a review.
+These checks call external APIs and publish to the test PR.
 
-- Webhook が 202 を返すこと。
-- PR に Mochi の Check Run とレビューが作られること。
-- レビュー対象 SHA と coverage、未確認ファイルの表示を確認すること。
-- 4 専門エージェントと synthesizer の結果が揃い、専門エージェントの 4 台の Sandbox が削除されること。
-- 認証なしの `GET /api/v1/runs` が 401、API token を付けたリクエストが 200 になること。
-- 再デプロイ後も過去の run を API / `mochi inspect --db /data/mochi.db` で確認できること。
+Confirm the Check Run and review identify the intended head SHA, all expected
+specialist results are present, and their sandboxes are removed after completion.
+For the test runner, inspect `test_execution` and any `skipped_reasons`; a
+completed report does not prove tests ran. Verify unauthenticated
+`GET /api/v1/runs` returns 401 and an authenticated request succeeds. After a
+redeploy, confirm past runs remain available through the API or `mochi inspect`.
 
-`/readyz` の成功は SQLite への接続を含むサーバーの準備状態であり、外部 API の成功保証ではない。
-`202` は受信承認であり、レビュー完了ではない。GitHub 情報取得や後続実行の失敗は
-ログと Check Run を確認する。通常の重複実行制御は repo + PR 単位で、同じ配信の再送を
-永久に除外する仕組みではない。再配信すると API 利用が再度発生する可能性がある。
+HTTP 202 acknowledges a webhook; it does not mean review completion. Inspect logs,
+Check Runs, and persisted runs for later failures. `/readyz` checks scheduler
+presence and database access, not external API health. See [usage](usage.md) for
+inspection commands.
 
-## 運用・バックアップ・ロールバック
+## Operations and recovery
 
-- **永続キューではない**。Webhook の 202 後の hydration と待ち行列はメモリー内にある。
-  強制停止では承認済みイベントが失われ得る。自動リリースを切り、実行・待機中のレビューが
-  ない時間にデプロイする。強制停止後は GitHub の配信履歴から必要なイベントを選んで再配信する。
-  永続化済みの `pending` / `running` が自動復旧する機能もないので、それらを確認して再実行する。
-- **Render のディスクは 1 インスタンス専用**で、ディスクを持つサービスのデプロイ時には短い停止がある。
-  配信失敗は GitHub の履歴で確認して再配信する。GitHub が自動で再送すると仮定しない。
-- **監査 DB は増える**。PR diff、LLM メッセージ、ツール出力が保存され、削除の自動運用は未実装。
-  初期 1 GB の使用量を監視し、容量拡張またはバックアップ後のデータ保持方針を決める。
-  private リポジトリのコードを含み得るため、API token とバックアップのアクセスも制限する。
-- **SQLite の稼働中バックアップ**は WAL ファイルを無視した単純コピーを避ける。
-  イメージには sqlite3 CLI を含めている。サービスの Shell で次を実行し、生成物を
-  暗号化した外部ストレージ等へ退避する（同じディスクに置いただけでは災害対策にならない）。
+Deploy while the queue is empty and reviews are idle. Webhook context fetching
+and queued jobs are held in memory; a forced stop can lose accepted work. Runs
+left `pending` or `running` are not automatically resumed. Inspect GitHub delivery
+history and persisted runs, then redeliver or retrigger affected reviews.
+Deduplication cancels superseded work for a repository/PR; it does not permanently
+suppress repeated deliveries, so redelivery can incur new API usage.
+
+Services using a Render disk can have deployment downtime; see
+[Render disk constraints](https://render.com/docs/disks). Check failed deliveries
+and redeliver them as needed. Monitor database growth, server memory, provider
+quotas, and remaining Daytona sandboxes. Mochi attempts sandbox deletion and sets
+a 15-minute auto-stop interval, but a server crash can leave external resources.
+Token budgets are checked after model calls and are not exact spending caps.
+
+The database contains diffs, model messages, and tool outputs, potentially
+including private source code. Restrict access to the API and backups. There is no
+automatic data retention cleanup; plan storage capacity and retention accordingly.
+
+For a live SQLite backup, use SQLite's backup operation rather than copying the
+database file without its WAL. The server image includes `sqlite3`:
 
 ```sh
 umask 077
@@ -221,12 +187,9 @@ sqlite3 /data/mochi.db ".backup '/data/backups/mochi-backup.db'"
 sqlite3 /data/backups/mochi-backup.db 'PRAGMA integrity_check;'
 ```
 
-バックアップには監査時点の一貫した DB が入る。Render のディスクスナップショットだけに
-DB の復旧を依存させない。復元はサービス停止中に行い、元 DB と WAL/SHM を別途退避してから
-復元 DB を配置し、所有者 10001:10001、`integrity_check`、過去 run の照会を確認する。
-リリース前にもバックアップを取得し、コードを戻す際はマイグレーション互換性を確認する。
-公開 API の破壊的変更や DB 変更がある場合、コードの Rollback だけで戻るとは限らない。
-
-参考: [Render 永続ディスクの制約](https://render.com/docs/disks)、
-[Blueprint 仕様](https://render.com/docs/blueprint-spec)、
-[Railway](https://railway.com/pricing)。
+Copy the backup to protected storage outside the service disk. To restore, stop
+the server, preserve the existing database and WAL/SHM files separately, and place
+the backup at the configured database path. Set ownership to `10001:10001` for the
+container, run `integrity_check`, restart, and verify historical runs. Before
+reverting an application release, check database migration compatibility; a code
+rollback alone may not restore compatibility.

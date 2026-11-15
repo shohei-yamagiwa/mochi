@@ -1,5 +1,4 @@
 # Optional paid deployment: review pricing before creating a Blueprint.
-# Merge this preparation branch to main before deploying main.
 services:
   - type: web
     name: mochi

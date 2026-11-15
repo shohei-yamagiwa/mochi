@@ -1,4 +1,4 @@
-# Initial small deployment: one specialist + synthesizer, one LLM provider.
+# Small preset: one specialist + synthesizer, one LLM provider.
 # Create the mochi-review snapshot in Daytona before enabling PR events.
 version: "1"
 name: pr-review
