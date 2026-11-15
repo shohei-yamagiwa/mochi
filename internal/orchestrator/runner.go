@@ -24,6 +24,8 @@ import (
 
 const defaultSynthesizerMaxTurns = 3
 
+var errSpecialistSandbox = errors.New("sandbox setup failed")
+
 // SpecialistResult captures the execution record and structured findings from a single specialist role.
 type SpecialistResult struct {
 	Role           string                   `json:"role"`
@@ -346,22 +348,36 @@ func (r *Runner) runSpecialistAgent(
 	promptEngine *config.PromptEngine,
 	toolReg *tools.Registry,
 ) (*SpecialistResult, error) {
+	failOrRecord := func(err error, ar *domain.AgentRunRecord, raw json.RawMessage, execs []*domain.ToolExecRecord) (*SpecialistResult, error) {
+		roleErr := fmt.Errorf("specialist agent %q: %w", role.Role, err)
+		if r.FailFastSpecialists || ctx.Err() != nil {
+			return nil, roleErr
+		}
+		return &SpecialistResult{
+			Role:           role.Role,
+			AgentRun:       ar,
+			RawOutput:      raw,
+			ToolExecutions: execs,
+			Error:          roleErr,
+		}, nil
+	}
+
 	var agentSB sandbox.Sandbox
 	if role.Sandbox.Enabled {
 		if wf.Sandbox.ForkFromBase && baseSandbox != nil {
 			forkName := fmt.Sprintf("mochi-%s-%s", task.RunID, role.Role)
 			forked, err := baseSandbox.Fork(ctx, forkName)
 			if err != nil {
-				return nil, fmt.Errorf("fork sandbox for role %q: %w", role.Role, err)
+				return failOrRecord(fmt.Errorf("%w: fork sandbox: %w", errSpecialistSandbox, err), nil, nil, nil)
 			}
 			agentSB = forked
 		} else {
 			if r.SandboxProvider == nil {
-				return nil, fmt.Errorf("sandbox provider is required for role %q", role.Role)
+				return failOrRecord(fmt.Errorf("%w: sandbox provider is required", errSpecialistSandbox), nil, nil, nil)
 			}
 			created, err := r.createSandbox(ctx, fmt.Sprintf("mochi-%s-%s", task.RunID, role.Role), task.Workspace, wf.Sandbox)
 			if err != nil {
-				return nil, fmt.Errorf("create sandbox for role %q: %w", role.Role, err)
+				return failOrRecord(fmt.Errorf("%w: create sandbox: %w", errSpecialistSandbox, err), nil, nil, nil)
 			}
 			agentSB = created
 		}
@@ -374,7 +390,7 @@ func (r *Runner) runSpecialistAgent(
 	if promptEngine != nil && strings.TrimSpace(role.PromptFile) != "" {
 		rendered, err := promptEngine.RenderRole(role, config.NewPromptData(task, wf, &role))
 		if err != nil {
-			return nil, fmt.Errorf("render prompt for role %q: %w", role.Role, err)
+			return failOrRecord(fmt.Errorf("render prompt: %w", err), nil, nil, nil)
 		}
 		sysPrompt = rendered
 	}
@@ -382,12 +398,12 @@ func (r *Runner) runSpecialistAgent(
 
 	provider, err := r.resolveLLMProvider(role.LLM.Provider)
 	if err != nil {
-		return nil, fmt.Errorf("resolve llm provider for role %q: %w", role.Role, err)
+		return failOrRecord(fmt.Errorf("resolve llm provider: %w", err), nil, nil, nil)
 	}
 
 	toolSet, err := toolReg.ScopeForRole(role.Tools)
 	if err != nil {
-		return nil, fmt.Errorf("scope tools for role %q: %w", role.Role, err)
+		return failOrRecord(fmt.Errorf("scope tools: %w", err), nil, nil, nil)
 	}
 
 	loop := &AgentLoop{
@@ -407,38 +423,19 @@ func (r *Runner) runSpecialistAgent(
 		ToolSet:      toolSet,
 	})
 	if err != nil {
-		roleErr := fmt.Errorf("specialist agent %q: %w", role.Role, err)
-		if r.FailFastSpecialists || ctx.Err() != nil {
-			return nil, roleErr
-		}
 		var ar *domain.AgentRunRecord
 		var execs []*domain.ToolExecRecord
 		if loopRes != nil {
 			ar = loopRes.AgentRun
 			execs = loopRes.ToolExecutions
 		}
-		return &SpecialistResult{
-			Role:           role.Role,
-			AgentRun:       ar,
-			ToolExecutions: execs,
-			Error:          roleErr,
-		}, nil
+		return failOrRecord(err, ar, nil, execs)
 	}
 
 	var findings tools.AgentFindings
 	if len(loopRes.SubmittedOutput) > 0 {
 		if err := json.Unmarshal(loopRes.SubmittedOutput, &findings); err != nil {
-			roleErr := fmt.Errorf("decode findings for role %q: %w", role.Role, err)
-			if r.FailFastSpecialists || ctx.Err() != nil {
-				return nil, roleErr
-			}
-			return &SpecialistResult{
-				Role:           role.Role,
-				AgentRun:       loopRes.AgentRun,
-				RawOutput:      loopRes.SubmittedOutput,
-				ToolExecutions: loopRes.ToolExecutions,
-				Error:          roleErr,
-			}, nil
+			return failOrRecord(fmt.Errorf("decode findings: %w", err), loopRes.AgentRun, loopRes.SubmittedOutput, loopRes.ToolExecutions)
 		}
 	}
 	if findings.Findings == nil {
@@ -737,6 +734,9 @@ func sanitizeSpecialistFailureSummary(sr *SpecialistResult) string {
 	}
 	if errors.Is(sr.Error, ErrMaxTokensExceeded) {
 		return "failed (max_tokens_exceeded)"
+	}
+	if errors.Is(sr.Error, errSpecialistSandbox) {
+		return "failed (sandbox error)"
 	}
 	return "failed (provider error)"
 }

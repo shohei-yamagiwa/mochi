@@ -22,14 +22,16 @@ type trackingSandboxProvider struct {
 	mu            sync.Mutex
 	createdBase   []*trackingSandbox
 	forkedByName  map[string]*trackingSandbox
+	forkErrByName map[string]error
 	files         map[string]string
 	searchMatches []sandbox.SearchMatch
 }
 
 func newTrackingSandboxProvider(files map[string]string) *trackingSandboxProvider {
 	return &trackingSandboxProvider{
-		forkedByName: make(map[string]*trackingSandbox),
-		files:        files,
+		forkedByName:  make(map[string]*trackingSandbox),
+		forkErrByName: make(map[string]error),
+		files:         files,
 	}
 }
 
@@ -66,6 +68,15 @@ type trackingSandbox struct {
 func (s *trackingSandbox) ID() string { return s.id }
 
 func (s *trackingSandbox) Fork(_ context.Context, name string) (sandbox.Sandbox, error) {
+	s.provider.mu.Lock()
+	for pat, err := range s.provider.forkErrByName {
+		if strings.Contains(name, pat) {
+			s.provider.mu.Unlock()
+			return nil, err
+		}
+	}
+	s.provider.mu.Unlock()
+
 	s.mu.Lock()
 	copiedFiles := make(map[string]string, len(s.files))
 	for k, v := range s.files {
@@ -920,4 +931,80 @@ agents:
 		t.Fatalf("expected persisted resolved_config_yaml to reflect merged override (without performance-architecture), got:\n%s", persistedRun.ResolvedConfigYAML)
 	}
 	_ = tools.AgentFinding{}
+}
+
+func TestRunner_SingleSpecialistForkFailureContinuesWithFailFastFalse(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer st.Close()
+
+	repoRoot := filepath.Join("..", "..")
+	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, "configs", "workflows", "pr-review.yaml"), repoRoot)
+	if err != nil {
+		t.Fatalf("LoadWorkflowFile: %v", err)
+	}
+
+	sbProvider := newTrackingSandboxProvider(nil)
+	sbProvider.forkErrByName["-security"] = errors.New("daytona fork transient 502")
+
+	llmProvider := newRoutingLLMProvider("mock", func(_ context.Context, role string, _ int, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+		if role == "synthesizer" {
+			return &llm.ChatResponse{
+				Message: llm.Message{
+					Role:    llm.RoleAssistant,
+					Content: `{"summary":"Completed with 3 of 4 specialists","verdict":"APPROVE","findings":[]}`,
+				},
+			}, nil
+		}
+		tc := llm.ToolCall{
+			ID:        "tc_ok_" + role,
+			Name:      "submit_output",
+			Arguments: json.RawMessage(`{"summary":"ok","findings":[]}`),
+		}
+		return &llm.ChatResponse{
+			Message:   llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{tc}},
+			ToolCalls: []llm.ToolCall{tc},
+		}, nil
+	})
+
+	runner := &Runner{
+		Store:              st,
+		SandboxProvider:    sbProvider,
+		DefaultLLMProvider: llmProvider,
+		PromptEngine:       config.NewPromptEngine(repoRoot),
+	}
+
+	task := &domain.TaskContext{
+		RunID:        "run-fork-partial",
+		WorkflowName: wf.Name,
+		TriggerType:  "cli",
+		DedupKey:     "repo:pr:22",
+		Changeset: &domain.ChangesetSpec{
+			RepoOwner: "shohei-yamagiwa",
+			RepoName:  "mochi",
+			PRNumber:  22,
+			BaseSHA:   "1111111",
+			HeadSHA:   "2222222",
+		},
+	}
+
+	res, err := runner.Execute(ctx, task, wf)
+	if err != nil {
+		t.Fatalf("Runner.Execute error = %v, want nil when 3 of 4 specialists succeed", err)
+	}
+	if res.Run.Status != domain.RunStatusCompleted {
+		t.Fatalf("res.Run.Status = %q, want %q", res.Run.Status, domain.RunStatusCompleted)
+	}
+	if res.Report.Verdict != output.VerdictComment {
+		t.Fatalf("Report.Verdict = %q, want %q when a specialist failed fork", res.Report.Verdict, output.VerdictComment)
+	}
+	if len(res.Report.FailedAgents) != 1 || res.Report.FailedAgents[0] != "security" {
+		t.Fatalf("Report.FailedAgents = %v, want [security]", res.Report.FailedAgents)
+	}
+	if res.Report.AgentSummaries["security"] != "failed (sandbox error)" {
+		t.Fatalf("Report.AgentSummaries[security] = %q, want %q", res.Report.AgentSummaries["security"], "failed (sandbox error)")
+	}
 }
