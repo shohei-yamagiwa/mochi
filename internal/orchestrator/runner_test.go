@@ -247,6 +247,8 @@ func TestRunner_EndToEndPresetWorkflowWithParallelFanOutCoverageAndSynthesizerSe
 	if err != nil {
 		t.Fatalf("LoadWorkflowFile(%q): %v", wfPath, err)
 	}
+	// Keep coverage of the optional VM/fork execution path.
+	wf.Sandbox.ForkFromBase = true
 
 	promptEngine := config.NewPromptEngine(repoRoot)
 	sbProvider := newTrackingSandboxProvider(map[string]string{
@@ -617,19 +619,13 @@ func TestRunner_SpecialistFailureCleansUpSandboxesAndNotifiesSink(t *testing.T) 
 		t.Fatalf("Runner.Execute error = %v, want provider rate limit exceeded", err)
 	}
 
-	// Base sandbox and all forked sandboxes must be destroyed with a non-cancelled context.
-	if len(sbProvider.createdBase) != 1 || sbProvider.createdBase[0].destroyed != 1 {
-		t.Fatalf("base sandbox was not destroyed on failure")
+	// Every directly created sandbox must be cleaned up even when all agents fail.
+	if len(sbProvider.createdBase) != 4 || len(sbProvider.forkedByName) != 0 {
+		t.Fatalf("expected four direct sandboxes, got created=%d forked=%d", len(sbProvider.createdBase), len(sbProvider.forkedByName))
 	}
-	if sbProvider.createdBase[0].lastDestroyEr != nil {
-		t.Fatalf("base sandbox Destroy received cancelled ctx: %v", sbProvider.createdBase[0].lastDestroyEr)
-	}
-	for name, forked := range sbProvider.forkedByName {
-		if forked.destroyed != 1 {
-			t.Errorf("forked sandbox %q destroyed = %d, want 1", name, forked.destroyed)
-		}
-		if forked.lastDestroyEr != nil {
-			t.Errorf("forked sandbox %q Destroy received cancelled ctx: %v", name, forked.lastDestroyEr)
+	for _, created := range sbProvider.createdBase {
+		if created.destroyed != 1 || created.lastDestroyEr != nil {
+			t.Errorf("sandbox %q cleanup: destroyed=%d error=%v", created.name, created.destroyed, created.lastDestroyEr)
 		}
 	}
 
@@ -947,6 +943,7 @@ func TestRunner_RepoOverridesSandboxAppliesToBaseSandbox(t *testing.T) {
 		t.Fatalf("LoadWorkflowFile: %v", err)
 	}
 	wf.RepoOverrides.AllowCustomImages = true
+	wf.Sandbox.ForkFromBase = true
 
 	sbProvider := newTrackingSandboxProvider(nil)
 	llmProvider := newRoutingLLMProvider("mock", func(_ context.Context, role string, _ int, _ llm.ChatRequest) (*llm.ChatResponse, error) {
@@ -1022,6 +1019,7 @@ func TestRunner_SingleSpecialistForkFailureContinuesWithFailFastFalse(t *testing
 	if err != nil {
 		t.Fatalf("LoadWorkflowFile: %v", err)
 	}
+	wf.Sandbox.ForkFromBase = true
 
 	sbProvider := newTrackingSandboxProvider(nil)
 	sbProvider.forkErrByName["-security"] = errors.New("daytona fork transient 502")
@@ -1085,7 +1083,21 @@ func TestRunner_SingleSpecialistForkFailureContinuesWithFailFastFalse(t *testing
 	}
 }
 
-func TestRunner_SmallPresetRunsOnSandboxWithoutForkSupport(t *testing.T) {
+func TestRunner_PresetsRunOnSandboxesWithoutForkSupport(t *testing.T) {
+	for _, tc := range []struct {
+		file     string
+		snapshot string
+		roles    []string
+	}{
+		{"pr-review-small.yaml", "mochi-review", []string{"correctness"}},
+		{"pr-review.yaml", "mochi-review-go", []string{"correctness", "security", "performance-architecture", "test-runner"}},
+	} {
+		t.Run(tc.file, func(t *testing.T) { testPresetWithoutFork(t, tc.file, tc.snapshot, tc.roles) })
+	}
+}
+
+func testPresetWithoutFork(t *testing.T, file, snapshot string, roles []string) {
+	t.Helper()
 	ctx := context.Background()
 	st, err := sqlite.Open(ctx, ":memory:")
 	if err != nil {
@@ -1093,7 +1105,7 @@ func TestRunner_SmallPresetRunsOnSandboxWithoutForkSupport(t *testing.T) {
 	}
 	defer st.Close()
 	repoRoot := filepath.Join("..", "..")
-	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, "configs", "workflows", "pr-review-small.yaml"), repoRoot)
+	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, "configs", "workflows", file), repoRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1106,7 +1118,7 @@ func TestRunner_SmallPresetRunsOnSandboxWithoutForkSupport(t *testing.T) {
 				Role: llm.RoleAssistant, Content: `{"summary":"Review completed","verdict":"COMMENT","findings":[]}`,
 			}}, nil
 		}
-		call := llm.ToolCall{ID: "small-submit", Name: "submit_output", Arguments: json.RawMessage(`{"summary":"Review completed","findings":[]}`)}
+		call := llm.ToolCall{ID: role + "-submit", Name: "submit_output", Arguments: json.RawMessage(`{"summary":"Review completed","findings":[]}`)}
 		return &llm.ChatResponse{Message: llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{call}}, ToolCalls: []llm.ToolCall{call}}, nil
 	})
 	runner := &Runner{Store: st, SandboxProvider: sbProvider, DefaultLLMProvider: provider, PromptEngine: config.NewPromptEngine(repoRoot)}
@@ -1122,15 +1134,28 @@ func TestRunner_SmallPresetRunsOnSandboxWithoutForkSupport(t *testing.T) {
 	if result.Run.Status != domain.RunStatusCompleted || len(result.Report.FailedAgents) != 0 {
 		t.Fatalf("review did not complete successfully: status=%s failed_agents=%v", result.Run.Status, result.Report.FailedAgents)
 	}
-	if len(sbProvider.createdBase) != 1 || len(sbProvider.forkedByName) != 0 {
-		t.Fatalf("expected one directly created sandbox, got created=%d forked=%d", len(sbProvider.createdBase), len(sbProvider.forkedByName))
+	if len(sbProvider.createdBase) != len(roles) || len(sbProvider.forkedByName) != 0 {
+		t.Fatalf("expected %d direct sandboxes, got created=%d forked=%d", len(roles), len(sbProvider.createdBase), len(sbProvider.forkedByName))
 	}
-	created := sbProvider.createdBase[0]
-	if !strings.HasSuffix(created.name, "-correctness") || created.destroyed != 1 {
-		t.Fatalf("specialist sandbox not created/cleaned up as expected: name=%q destroyed=%d", created.name, created.destroyed)
+	seen := make(map[string]bool)
+	for i, created := range sbProvider.createdBase {
+		if created.destroyed != 1 || seen[created.ID()] {
+			t.Fatalf("sandbox not unique/cleaned up: name=%q destroyed=%d", created.name, created.destroyed)
+		}
+		seen[created.ID()] = true
+		if opts := sbProvider.createdOpts[i]; opts.Workspace.Snapshot != snapshot || opts.Workspace.Ref != "head-sha" {
+			t.Fatalf("configured snapshot or target commit lost: %+v", opts.Workspace)
+		}
 	}
-	if opts := sbProvider.createdOpts[0]; opts.Workspace.Snapshot != "mochi-review" || opts.Workspace.Ref != "head-sha" {
-		t.Fatalf("configured snapshot or target commit lost: %+v", opts.Workspace)
+	for _, role := range roles {
+		agent := result.Specialists[role].AgentRun
+		if agent == nil || !seen[agent.SandboxID] {
+			t.Fatalf("role %q did not use its own sandbox", role)
+		}
+		delete(seen, agent.SandboxID)
+	}
+	if len(seen) != 0 || result.SynthesizerRun.SandboxID != "" {
+		t.Fatal("unexpected shared, unused, or synthesizer sandbox")
 	}
 }
 

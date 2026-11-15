@@ -10,7 +10,7 @@ fi
 
 if [ "${1:-}" = serve ]; then
   shift
-  workflow=${MOCHI_WORKFLOW:-configs/workflows/pr-review-small.yaml}
+  workflow=${MOCHI_WORKFLOW:-configs/workflows/pr-review.yaml}
   mochi validate --runtime "$workflow"
   exec mochi serve \
     --addr ":${PORT:-8080}" \

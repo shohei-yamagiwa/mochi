@@ -16,7 +16,7 @@ WORKDIR /app
 COPY --from=build /out/mochi /usr/local/bin/mochi
 COPY --chown=10001:10001 configs ./configs
 COPY --chmod=755 deploy/entrypoint.sh /usr/local/bin/mochi-entrypoint
-ENV PORT=8080 MOCHI_DB_PATH=/data/mochi.db MOCHI_WORKFLOW=configs/workflows/pr-review-small.yaml
+ENV PORT=8080 MOCHI_DB_PATH=/data/mochi.db MOCHI_WORKFLOW=configs/workflows/pr-review.yaml
 EXPOSE 8080
 # The entrypoint owns the mounted data directory, then drops to uid/gid 10001
 # before validation and server startup. This also handles fresh Render disks.

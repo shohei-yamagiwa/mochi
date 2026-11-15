@@ -1,7 +1,8 @@
 # GitHub App としてのデプロイ
 
-この手順は `develop` から `main` にマージされた実装（基点 `28de02c`）に基づく。
-この準備変更も `main` にマージしてから公開する。`render.yaml` のデプロイ対象は `main`。
+`render.yaml` のデプロイ対象は `main`。変更をマージしてから公開する。
+動作済みの小規模構成から切り替える場合は、[4 専門エージェントへの移行手順](multi-agent-rollout.md)
+に従い、Snapshot を用意してから使用する workflow を変更する。
 
 ## 推奨する初期構成
 
@@ -19,7 +20,7 @@
 **7 USD/月、ディスクは 0.25 USD/GB/月**。1 GB なら基礎費用は約 **7.25 USD/月**。
 税・為替・転送量などは別。契約時に現在の料金を確認する。
 **Gemini と Daytona の利用料は含まれない**。レビュー頻度、PR サイズ、ターン数、
-VM 稼働時間によって増えるため、各サービスの使用量と予算通知も設定する。
+Sandbox 稼働時間によって増えるため、各サービスの使用量と予算通知も設定する。
 
 無料のスリープするサービスやリクエストの間だけ動く関数は、このままの構成には適さない。
 Webhook の応答後に非同期レビューを続け、SQLite とメモリー内キューを使うためである。
@@ -27,15 +28,18 @@ Webhook の応答後に非同期レビューを続け、SQLite とメモリー�
 
 ## 最初の利用範囲と費用
 
-同梱の `configs/workflows/pr-review-small.yaml` は、既存の correctness プロンプトを
-使う専門エージェント 1 つと synthesizer に絞る。4 専門分野のフルレビューではない。
-Gemini のキーだけで LLM を設定でき、サーバーの同時実行数は 1、待ち行列は 16。
-Daytona は専門エージェント用の 1 サンドボックスを直接作成する。
-小規模プリセットでは `fork_from_base: false` とし、ベースと fork の 2 台構成を避ける。
+既定の `configs/workflows/pr-review.yaml` は、correctness、security、performance-architecture、
+test-runner の 4 専門エージェントと synthesizer 1 つを Gemini で実行する。
+Daytona では専門エージェントごとに 1 台、最大 4 台の独立したコンテナ型 Sandbox を直接作成する。
+synthesizer は専門エージェントの結果を統合し、Sandbox は作成しない。
+`fork_from_base: false` のため、共有ベースの Sandbox や VM の fork は不要。
+サーバーの同時 workflow 数は 1、待ち行列は 16。専門エージェント 4 つは並列に実行する。
+動作済みの `configs/workflows/pr-review-small.yaml` は correctness 1 つと synthesizer の構成で、
+切り戻し先として残す。4 専門エージェント版では LLM と Sandbox の利用量が増える。
 監査データや PR の大きさによって 512 MB RAM が不足する場合はプランを上げる。
 
 GitHub App は **Pull request と Issue comment の両方**を購読する。
-small プリセットは PR の作成（`opened`）、コミット追加（`synchronize`）、
+両プリセットとも PR の作成（`opened`）、コミット追加（`synchronize`）、
 再オープン（`reopened`）、Draft 解除（`ready_for_review`）で自動実行する。
 Draft 中は実行せず、PR は open であることが必要。
 `/mochi review` のコメントでも再実行できる。コメント投稿者は
@@ -84,19 +88,21 @@ Installation ID は Webhook から取得するためサーバー環境変数に�
 
 ## 2. Daytona の準備
 
-Daytona のアカウントと API キーを作成する。`deploy/sandbox/Dockerfile` を元に
-Daytona の Snapshot 作成画面または CLI で **`mochi-review`** という Snapshot を作る。
+Daytona のアカウントと API キーを作成する。フルプリセットでは
+`deploy/sandbox/go.Dockerfile` を元に **`mochi-review-go`** という Snapshot を作る。
+Go 1.27.4 と git、bash、curl、ripgrep、CA 証明書を含み、Mochi のテストを実行できる。
+CLI の具体的な操作は [移行手順](multi-agent-rollout.md) を参照する。
+small プリセット用の **`mochi-review`** は `deploy/sandbox/Dockerfile` から作成する。
 対象サーバーと近いリージョン/target を選び、Snapshot が利用可能な状態になるまで待つ。
-名称を変える場合は small プリセットの `sandbox.default_snapshot` も変更する。
+名称を変える場合は該当プリセットの `sandbox.default_snapshot` も変更する。
 
 Dockerfile から作る通常のコンテナ型 Snapshot は fork に対応しないため、
-小規模プリセットでは fork を使わない。[Daytona の fork の仕様](https://www.daytona.io/docs/en/sandboxes.md#fork-sandboxes)
-では VM 型 Sandbox が必要となる。フルプリセットなどで `fork_from_base: true` を使う場合は、
-fork 対応の Linux VM Snapshot を用意する。コンテナ型のままなら `false` にして
-エージェントごとに直接作成する。
+両プリセットとも fork を使わない。[Daytona の fork の仕様](https://www.daytona.io/docs/en/sandboxes.md#fork-sandboxes)
+では VM 型 Sandbox が必要となる。将来 `fork_from_base: true` を使う場合には、
+fork 対応の Linux VM Snapshot を別途用意する。
 
-この Snapshot には git、bash、ripgrep、CA 証明書を含む。対象プロジェクトのテストを
-実行するには、その言語ランタイムやビルドツールも Dockerfile に追加して Snapshot を更新する。
+Go 以外の対象プロジェクトのテストを実行するには、その言語ランタイムやビルドツールも
+Daytona 用 Dockerfile に追加して Snapshot を作成する。
 **サーバー用のルート Dockerfile と、Daytona 用 Dockerfile は別物**。
 GitHub・LLM・Daytona の秘密情報を Snapshot に埋め込まない。
 
@@ -116,10 +122,10 @@ GitHub・LLM・Daytona の秘密情報を Snapshot に埋め込まない。
 | `GITHUB_WEBHOOK_SECRET` | GitHub App と同じランダムな secret |
 | `MOCHI_API_TOKEN` | 検査 API と汎用 trigger API 用の別のランダム値 |
 | `DAYTONA_API_KEY` | Daytona キー |
-| `GEMINI_API_KEY` | small プリセットの Gemini API キー（`GOOGLE_API_KEY` でも可） |
+| `GEMINI_API_KEY` | 両プリセットの Gemini API キー（`GOOGLE_API_KEY` でも可） |
 | `PORT` | コンテナの待受ポート（既定 8080、入口スクリプトが反映） |
 | `MOCHI_DB_PATH` | `/data/mochi.db`（永続ディスク内） |
-| `MOCHI_WORKFLOW` | `configs/workflows/pr-review-small.yaml` |
+| `MOCHI_WORKFLOW` | `configs/workflows/pr-review.yaml`（切り戻しは `pr-review-small.yaml`） |
 | `MOCHI_WORKERS` / `MOCHI_QUEUE_SIZE` | 初期値 1 / 16 |
 
 `openssl rand -hex 32` を別々に実行して Webhook secret と API token を作る。
@@ -128,18 +134,18 @@ Render へ PEM を貼る際は `.env` 用の外側の引用符を含めない。
 ファイル方式なら `MOCHI_GITHUB_PRIVATE_KEY_PATH` を使用できるが、
 初期構成では inline PEM に統一する。両方式を同時に設定しない。
 GitHub App 運用では `GITHUB_TOKEN` / `GH_TOKEN` は設定不要。
-小規模プリセットでは `OPENAI_API_KEY` は不要。
+両プリセットとも `OPENAI_API_KEY` と `ANTHROPIC_API_KEY` は不要。
 既存の Render サービスに `GEMINI_API_KEY` を登録済みなら、その値を引き続き使う。
 両方の Gemini 用変数を登録した場合は `GEMINI_API_KEY` を優先する。
 
-4 専門エージェント版に切り替える場合は `OPENAI_API_KEY` と `ANTHROPIC_API_KEY`
-も登録し、フルプリセットが指定する Daytona Snapshot を作成する。
+既存の Render サービスの `MOCHI_WORKFLOW` は Git の変更だけでは切り替わらない。
+Snapshot の準備後、[移行手順](multi-agent-rollout.md) に従って変更する。
 
 ## 4. ローカルでコンテナを確認
 
 ```sh
 docker compose build
-docker compose run --rm mochi validate --runtime configs/workflows/pr-review-small.yaml
+docker compose run --rm mochi validate --runtime configs/workflows/pr-review.yaml
 docker compose up -d
 curl --fail http://localhost:8080/healthz
 curl --fail http://localhost:8080/readyz
@@ -184,7 +190,7 @@ LLM キーは Daytona の実行環境には渡さない。
 - Webhook が 202 を返すこと。
 - PR に Mochi の Check Run とレビューが作られること。
 - レビュー対象 SHA と coverage、未確認ファイルの表示を確認すること。
-- 成功後、Daytona のベース / fork サンドボックスが削除されること。
+- 4 専門エージェントと synthesizer の結果が揃い、専門エージェントの 4 台の Sandbox が削除されること。
 - 認証なしの `GET /api/v1/runs` が 401、API token を付けたリクエストが 200 になること。
 - 再デプロイ後も過去の run を API / `mochi inspect --db /data/mochi.db` で確認できること。
 

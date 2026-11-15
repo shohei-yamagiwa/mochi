@@ -1,6 +1,6 @@
 version: "1"
 name: pr-review
-description: Multi-agent PR code review with isolated Daytona sandbox verification
+description: Four Gemini specialists with separate Daytona sandboxes and one synthesizer
 
 input:
   adapter: github_pr
@@ -17,18 +17,19 @@ repo_overrides:
 
 sandbox:
   provider: daytona
-  default_snapshot: "mochi-default-polyglot"
-  default_image: "ubuntu:24.04"
-  fork_from_base: true # Clone repo once in base sandbox and fork per specialist agent
+  default_snapshot: "mochi-review-go"
+  # Each specialist prepares its own container sandbox at the same PR commit.
+  fork_from_base: false
   setup_timeout: 3m
 
 agents:
   - role: correctness
     prompt_file: "configs/prompts/correctness.md"
     llm:
-      provider: anthropic
-      model: claude-sonnet-5-5
+      provider: gemini
+      model: gemini-3.8-flash
       reasoning_effort: high
+      max_output_tokens: 8192
     sandbox:
       enabled: true
     tools: ["read_file", "list_dir", "search_code", "git_diff", "exec_command", "submit_output"]
@@ -41,9 +42,10 @@ agents:
   - role: security
     prompt_file: "configs/prompts/security.md"
     llm:
-      provider: anthropic
-      model: claude-opus-5-5
+      provider: gemini
+      model: gemini-3.8-flash
       reasoning_effort: high
+      max_output_tokens: 8192
     sandbox:
       enabled: true
     tools: ["read_file", "list_dir", "search_code", "git_diff", "exec_command", "submit_output"]
@@ -59,6 +61,7 @@ agents:
       provider: gemini
       model: gemini-3.8-flash
       reasoning_effort: high
+      max_output_tokens: 8192
     sandbox:
       enabled: true
     tools: ["read_file", "list_dir", "search_code", "git_diff", "exec_command", "submit_output"]
@@ -71,9 +74,10 @@ agents:
   - role: test-runner
     prompt_file: "configs/prompts/test_runner.md"
     llm:
-      provider: openai
-      model: gpt-6.1-sol
+      provider: gemini
+      model: gemini-3.8-flash
       reasoning_effort: medium
+      max_output_tokens: 8192
     sandbox:
       enabled: true
     tools: ["read_file", "write_file", "list_dir", "search_code", "git_diff", "exec_command", "submit_output"]
@@ -86,10 +90,13 @@ agents:
 synthesizer:
   prompt_file: "configs/prompts/synthesizer.md"
   llm:
-    provider: openai
-    model: gpt-6.1-sol
+    provider: gemini
+    model: gemini-3.8-flash
     reasoning_effort: medium
+    max_output_tokens: 8192
   budgets:
+    max_turns: 3
+    max_tokens: 40000
     run_timeout: 2m
 
 output:

@@ -173,6 +173,11 @@ input:
 	})
 
 	t.Run("clamps unset budgets and persists prompt_from_repo", func(t *testing.T) {
+		// Exercise unset-budget ceilings independently of the deployment preset's caps.
+		base := *wf
+		base.Agents = append([]domain.RoleConfig(nil), wf.Agents...)
+		base.Agents[3].LLM.MaxOutputTokens = 0
+		base.Synthesizer.Budgets.MaxTokens = 0
 		override := []byte(`
 agents:
   - role: correctness
@@ -198,7 +203,7 @@ output:
     - type: github_pr_review
       min_severity: "medium"
 `)
-		merged, err := config.MergeRepoOverrides(wf, override)
+		merged, err := config.MergeRepoOverrides(&base, override)
 		if err != nil {
 			t.Fatalf("MergeRepoOverrides failed: %v", err)
 		}
@@ -442,4 +447,3 @@ func TestReasoningEffortValidation(t *testing.T) {
 		}
 	}
 }
-
