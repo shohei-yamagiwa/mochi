@@ -79,6 +79,8 @@ func TestRuntimeWorkflowChecksAllDependencies(t *testing.T) {
 
 func TestCLI_ValidateSmallDeploymentPreset(t *testing.T) {
 	runtimeTestEnv(t)
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("GEMINI_API_KEY", "test-gemini-key")
 	path := filepath.Join("..", "..", "configs", "workflows", "pr-review-small.yaml")
 	for _, runtime := range []bool{false, true} {
 		cmd := newRootCmd()
@@ -97,11 +99,16 @@ func TestCLI_ValidateSmallDeploymentPreset(t *testing.T) {
 		}
 	}
 	// Plain validation remains usable in CI without deployment secrets.
-	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("GEMINI_API_KEY", "")
 	cmd := newRootCmd()
 	cmd.SetOut(os.Stdout)
 	cmd.SetArgs([]string{"validate", path})
 	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
+	}
+	cmd = newRootCmd()
+	cmd.SetArgs([]string{"validate", path, "--runtime"})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "GEMINI_API_KEY") {
+		t.Fatalf("missing Gemini key was not reported: %v", err)
 	}
 }

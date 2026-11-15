@@ -23,8 +23,8 @@ agents:
   - role: correctness
     prompt_file: configs/prompts/correctness.md
     llm:
-      provider: openai
-      model: gpt-6.1-sol
+      provider: gemini
+      model: gemini-3.8-flash
       reasoning_effort: medium
       max_output_tokens: 4000
     sandbox:
@@ -38,8 +38,8 @@ agents:
 synthesizer:
   prompt_file: configs/prompts/synthesizer.md
   llm:
-    provider: openai
-    model: gpt-6.1-sol
+    provider: gemini
+    model: gemini-3.8-flash
     reasoning_effort: medium
     max_output_tokens: 4000
   budgets:
