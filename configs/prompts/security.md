@@ -82,4 +82,4 @@ When you have finished investigating, call `submit_output` with:
   - `title`: One-line title of the vulnerability.
   - `description`: The evidence: attacker-controlled input, steps or command, and observed result. Then the impact.
   - `suggestion_code`: Remediation snippet for `[start_line, end_line]`, when a concrete fix exists. Prefer a fix you have confirmed blocks your exploit.
-  - `confidence`: `0.0` to `1.0`, reflecting how directly you demonstrated the claim. An exploit you ran yourself is high.
+  - `confidence`: `0.0` to `1.0`, reflecting how directly you demonstrated the claim. An exploit you ran yourself is high; one you did not run is `0.0`.

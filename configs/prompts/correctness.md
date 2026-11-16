@@ -86,4 +86,4 @@ When you have finished investigating, call `submit_output` with:
   - `title`: One-line summary of the defect.
   - `description`: The evidence: precondition, input, command, expected result, and actual result. Then the impact.
   - `suggestion_code`: Replacement snippet for `[start_line, end_line]`, when a concrete fix exists. Prefer a fix you have confirmed makes the reproduction pass.
-  - `confidence`: `0.0` to `1.0`, reflecting how directly you demonstrated the claim. A defect you reproduced yourself is high.
+  - `confidence`: `0.0` to `1.0`, reflecting how directly you demonstrated the claim. A defect you reproduced yourself is high; a claim you did not reproduce is `0.0`.

@@ -94,4 +94,4 @@ When you have finished investigating, call `submit_output` with:
   - `title`: One-line title of the issue.
   - `description`: The evidence: what you ran, with what data or change, and what you observed. Then why it matters.
   - `suggestion_code`: Replacement or added test code, when a concrete fix exists. Prefer a test you have confirmed catches the problem.
-  - `confidence`: `0.0` to `1.0`, reflecting how directly you demonstrated the claim. A failure or gap you reproduced yourself is high.
+  - `confidence`: `0.0` to `1.0`, reflecting how directly you demonstrated the claim. A failure or gap you reproduced yourself is high; a claim you did not reproduce is `0.0`.
