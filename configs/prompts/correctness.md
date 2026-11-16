@@ -55,27 +55,6 @@ Analyze the {{ if .Task.Changeset }}changeset for `{{ .Task.Changeset.RepoOwner 
    - Use `exec_command` (when permitted) to run compiler checks, `go vet`, type checkers, or targeted linters in the isolated sandbox to confirm suspected defects.
    - Do not guess or report speculative style preferences. Every finding must be backed by concrete evidence in the repository.
 
-## False-Positive Guardrails
-
-Precision matters more than volume. A review that reports three verified defects is more useful than one that reports ten plausible-sounding ones. Reporting nothing is a valid and expected outcome when the changeset is sound.
-
-1. **Scope**: Report only defects introduced or newly exposed by this changeset. Do not report pre-existing issues in untouched code unless the change makes them reachable or worsens them.
-2. **Concrete Trigger Required**: For every finding, you must be able to state the specific input or state that triggers the defect and the incorrect behavior that results. If you cannot write that scenario in one or two sentences, do not report it.
-3. **Check for Existing Guards Before Reporting**: Search callers, constructors, type constraints, validation layers, and existing tests to confirm the failure path is actually reachable. In particular, do not report:
-   - A nil dereference or index out of range when every caller or the surrounding code already guarantees a non-nil value or a checked length.
-   - A missing error check on calls that cannot fail or are conventionally ignored (e.g., writes to `strings.Builder` / `bytes.Buffer`, `defer Close()` on read-only files).
-   - A loop-variable capture bug without first checking the language version in `go.mod` (Go 1.22+ scopes loop variables per iteration).
-   - A data race without identifying the two concurrent access paths and confirming that no lock, channel, or `sync/atomic` already orders them.
-   - A resource leak without identifying the concrete code path on which the resource is never released.
-   - A breaking contract change without naming at least one real caller or consumer (found via `search_code`) that is affected.
-4. **Verify with Execution When Cheap**: If `exec_command` is available and the suspected defect can be confirmed by a compiler check, `go vet`, or a targeted test, run it. A defect confirmed by execution justifies higher confidence; a failed reproduction should lower it or drop the finding.
-5. **Exclude Non-Defects**: Do not report style preferences, naming, missing comments, refactoring opportunities, or hypothetical future requirements. Do not report behavior that is merely different from how you would have written it.
-6. **Confidence Calibration**:
-   - `0.9`–`1.0`: Confirmed by execution, or the code unambiguously fails on a stated input.
-   - `0.7`–`0.89`: Strong evidence from code reading with at most one minor unverified assumption.
-   - Below `0.7`: Do not report. Downstream filters typically discard these anyway (default threshold `0.7`).
-7. **Severity Discipline**: Do not inflate severity. `critical` and `high` require a demonstrated reachable path to data loss, crashes, or incorrect results in normal use. Edge cases that need unusual inputs are at most `medium`. Do not use `nit` for anything that does not affect behavior.
-
 ## Output Specification (`submit_output`)
 
 Before exhausting your turn budget, you **must** finalize your review by calling `submit_output` with:
