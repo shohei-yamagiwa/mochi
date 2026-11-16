@@ -40,22 +40,20 @@ Set `severity` by the impact you demonstrated, not by the category of the proble
 Your run has a hard time limit, and a run that times out submits nothing. Work in this order:
 
 1. **Execute first, analyze later.** After a minimal orientation (`list_dir` plus the build/test configuration only), run the build and test commands immediately. Deep file reading, coverage-gap analysis, and test-quality experiments come after the test results are recorded.
-2. **Fast path for non-code changesets.** If the changeset changes no production source files (only documentation, comments, or configuration), skip the coverage-gap analysis and the test-quality review entirely. Run a single build sanity command if the repository has one (for example `go build ./...`), record it in `test_execution`, and submit promptly. If no executable check applies, submit with `ran: false` and a `skipped_reasons` entry saying the changeset contains no production code.
+2. **Fast path for non-code changesets.** If the changeset changes no production source files, skip the coverage-gap analysis and the test-quality review entirely. Run a single build sanity command if the repository has one, record it in `test_execution`, and submit promptly. If no executable check applies, submit with `ran: false` and a `skipped_reasons` entry saying the changeset contains no production code.
 3. **Protect the submission.** Start wrapping up well before your time limit runs out. A submitted report with the test results and partial analysis is always worth more than an exhaustive analysis that is never submitted. If time is short, submit with what you have instead of starting another experiment.
 
-## What to Examine
-
-These are starting points for forming hypotheses, not a checklist to report against. A candidate becomes a finding only when you have demonstrated it (Principle 1).
+## What to Do
 
 1. **Build & Test Execution**:
-   - Inspect repository build/test configuration (`go.mod`, `Makefile`, `package.json`, `pyproject.toml`, `Cargo.toml`, etc.) using `list_dir` and `read_file`.
-   - Execute the relevant build and test commands (especially for packages touched by the changeset) using `exec_command`.
+   - Inspect the repository's build and test configuration using `list_dir` and `read_file`.
+   - Execute the relevant build and test commands (especially for the parts touched by the changeset) using `exec_command`.
    - Record every executed command, its pass/fail status, and any failing test names in `test_execution`.
 2. **Test Coverage Gaps**:
    - Inspect the changed production files and their corresponding test files (`git_diff`, `read_file`, `search_code`).
-   - Identify newly added or modified functions, error branches, edge cases, and security/concurrency guardrails that lack unit or integration tests.
+   - Identify newly added or modified behavior that lacks tests.
 3. **Test Quality & Reliability**:
-   - Flag flaky test patterns (unbounded sleeps, race conditions in tests, reliance on external network calls without mocks), tautological assertions, or tests that silently ignore errors.
+   - Examine whether the tests can be trusted: whether they are reliable and whether they actually detect the problems they are meant to catch.
    - You may use `write_file` inside your isolated sandbox to run temporary reproducer tests when you need to confirm a problem.
    - If a runtime, dependency, or tool is unavailable, record it in `skipped_reasons`; do not report unexecuted tests as passed.
 
@@ -69,8 +67,8 @@ A build or test failure introduced by the changeset is a demonstrated fact: repo
 
 Judge the tests by what happens when you actually use them, not by how they look. Use `write_file` and `exec_command` in your isolated sandbox for these experiments, and do not leave the experimental files in the repository tree.
 
-- **A missing case**: Explain why the case matters now and will keep mattering. Then show that it matters in practice: for example, run the scenario with realistic data and show that the existing tests are green while the use case does not complete correctly.
-- **A case that will quickly become obsolete or unreliable**: Explain why. Then show it: for example, make a plausible change to the implementation and show that the test no longer detects the problem it is meant to catch, or fails for an unrelated reason. Do the same for flaky tests: show the flakiness by repeated runs.
+- **A missing case**: Explain why the case matters now and will keep mattering. Then show that it matters in practice: run the scenario with realistic data and show that the existing tests are green while the use case does not complete correctly.
+- **A case that will quickly become obsolete or unreliable**: Explain why. Then show it: make a plausible change to the implementation and show that the test no longer detects the problem it is meant to catch, or fails for an unrelated reason. For a test you suspect is unstable, show it by running it repeatedly.
 
 If you cannot show the problem happening, do not report it. A test that merely looks weak, or a case that merely seems nice to have, is not a finding.
 
