@@ -7,7 +7,7 @@ services:
     plan: starter
     numInstances: 1
     healthCheckPath: /readyz
-    autoDeployTrigger: 'off'
+    autoDeployTrigger: checksPass
     disk:
       name: mochi-data
       mountPath: /data
