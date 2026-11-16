@@ -38,7 +38,7 @@ func TestLoadDefaultPRReviewWorkflow(t *testing.T) {
 	if wf.Agents[3].Role != "maintainability" {
 		t.Fatalf("unexpected maintainability config: %+v", wf.Agents[3])
 	}
-	if wf.Agents[4].Role != "test-runner" || wf.Agents[4].Budgets.RunTimeout.Std() != 8*time.Minute {
+	if wf.Agents[4].Role != "test-runner" || wf.Agents[4].Budgets.RunTimeout.Std() != 30*time.Minute {
 		t.Fatalf("unexpected test-runner config: %+v", wf.Agents[4])
 	}
 	if wf.Synthesizer.Budgets.RunTimeout.Std() != 2*time.Minute {

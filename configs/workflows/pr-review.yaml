@@ -101,7 +101,10 @@ agents:
       max_turns: 20
       max_tokens: 150000
       command_timeout: 180s
-      run_timeout: 8m
+      # Deliberately generous: the timeout is only a guard against runaway
+      # cost, not a target duration. Current budget figures are estimates,
+      # so the limit must not cut off reviews that are still making progress.
+      run_timeout: 30m
 
 synthesizer:
   prompt_file: "configs/prompts/synthesizer.md"
