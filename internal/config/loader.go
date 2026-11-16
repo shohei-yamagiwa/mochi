@@ -59,7 +59,8 @@ type SandboxOverride struct {
 }
 
 // ModelOverride defines the safe subset of LLM settings a repo override may tune.
-// Provider, Model, and BaseURL are captured only to reject disallowed override attempts explicitly.
+// Provider and BaseURL are captured only to reject disallowed override attempts explicitly.
+// Model is rejected unless the server workflow sets repo_overrides.allow_custom_models.
 type ModelOverride struct {
 	Provider        string   `yaml:"provider,omitempty"`
 	Model           string   `yaml:"model,omitempty"`
@@ -307,7 +308,7 @@ func MergeRepoOverrides(base *domain.Workflow, overrideYAML []byte) (*domain.Wor
 				cloned.Agents[idx].PromptFromRepo = true
 			}
 			if aov.LLM != nil {
-				if err := mergeModelOverride(&cloned.Agents[idx].LLM, aov.LLM); err != nil {
+				if err := mergeModelOverride(&cloned.Agents[idx].LLM, aov.LLM, cloned.RepoOverrides.AllowCustomModels); err != nil {
 					return nil, fmt.Errorf("agent %q llm: %w", aov.Role, err)
 				}
 			}
@@ -350,7 +351,7 @@ func MergeRepoOverrides(base *domain.Workflow, overrideYAML []byte) (*domain.Wor
 			cloned.Synthesizer.PromptFromRepo = true
 		}
 		if ov.Synthesizer.LLM != nil {
-			if err := mergeModelOverride(&cloned.Synthesizer.LLM, ov.Synthesizer.LLM); err != nil {
+			if err := mergeModelOverride(&cloned.Synthesizer.LLM, ov.Synthesizer.LLM, cloned.RepoOverrides.AllowCustomModels); err != nil {
 				return nil, fmt.Errorf("synthesizer llm: %w", err)
 			}
 		}
@@ -455,7 +456,7 @@ func reasoningEffortRank(effort string) (int, bool) {
 	}
 }
 
-func mergeModelOverride(dst *domain.ModelConfig, src *ModelOverride) error {
+func mergeModelOverride(dst *domain.ModelConfig, src *ModelOverride, allowCustomModels bool) error {
 	if src.BaseURL != "" {
 		return fmt.Errorf("base_url: %w", ErrDisallowedOverrideField)
 	}
@@ -463,7 +464,10 @@ func mergeModelOverride(dst *domain.ModelConfig, src *ModelOverride) error {
 		return fmt.Errorf("provider: %w", ErrDisallowedOverrideField)
 	}
 	if src.Model != "" {
-		return fmt.Errorf("model: %w", ErrDisallowedOverrideField)
+		if !allowCustomModels {
+			return fmt.Errorf("model: %w", ErrDisallowedOverrideField)
+		}
+		dst.Model = src.Model
 	}
 	if src.Temperature != nil {
 		t := *src.Temperature

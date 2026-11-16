@@ -126,6 +126,7 @@ type RepoOverridesConfig struct {
 	Path               string `yaml:"path,omitempty" json:"path,omitempty"`
 	AllowCustomPrompts bool   `yaml:"allow_custom_prompts,omitempty" json:"allow_custom_prompts,omitempty"`
 	AllowCustomImages  bool   `yaml:"allow_custom_images,omitempty" json:"allow_custom_images,omitempty"`
+	AllowCustomModels  bool   `yaml:"allow_custom_models,omitempty" json:"allow_custom_models,omitempty"`
 }
 
 // SandboxConfig defines base sandbox provisioning settings.
