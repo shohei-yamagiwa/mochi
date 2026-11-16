@@ -59,7 +59,7 @@ Wait until the recreated snapshot is active, then smoke-test it once by
 starting a sandbox from it and checking the toolchain (for example
 `go version`) before relying on it for reviews.
 
-The full preset creates four independent sandboxes per concurrent workflow; the
+The full preset creates five independent sandboxes per concurrent workflow; the
 small preset creates one. Ensure your Daytona quota permits this concurrency and
 allocated resources. Both presets disable forking and work with container
 snapshots. Enabling `fork_from_base` requires a compatible VM snapshot; see
