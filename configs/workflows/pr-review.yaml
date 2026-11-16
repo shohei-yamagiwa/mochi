@@ -38,7 +38,7 @@ agents:
       max_turns: 15
       max_tokens: 120000
       command_timeout: 60s
-      run_timeout: 5m
+      run_timeout: 15m
 
   - role: security
     prompt_file: "configs/prompts/security.md"
@@ -54,7 +54,7 @@ agents:
       max_turns: 15
       max_tokens: 120000
       command_timeout: 60s
-      run_timeout: 5m
+      run_timeout: 15m
 
   - role: performance-architecture
     prompt_file: "configs/prompts/performance_architecture.md"
@@ -70,7 +70,7 @@ agents:
       max_turns: 12
       max_tokens: 150000
       command_timeout: 60s
-      run_timeout: 5m
+      run_timeout: 15m
 
   - role: maintainability
     prompt_file: "configs/prompts/maintainability.md"
@@ -86,7 +86,7 @@ agents:
       max_turns: 12
       max_tokens: 150000
       command_timeout: 60s
-      run_timeout: 5m
+      run_timeout: 15m
 
   - role: test-runner
     prompt_file: "configs/prompts/test_runner.md"
