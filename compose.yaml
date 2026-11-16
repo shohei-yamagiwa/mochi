@@ -1,0 +1,24 @@
+services:
+  mochi:
+    build: .
+    env_file: .env
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - mochi-data:/data
+    tmpfs:
+      - /tmp:mode=1777
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    stop_grace_period: 40s
+    healthcheck:
+      test: [CMD, wget, -Y, 'off', -q, -O, /dev/null, http://127.0.0.1:8080/readyz]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+volumes:
+  mochi-data:

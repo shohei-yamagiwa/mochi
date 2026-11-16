@@ -1,0 +1,58 @@
+# Small preset: one specialist + synthesizer, one LLM provider.
+# Create the mochi-review snapshot in Daytona before enabling PR events.
+version: "1"
+name: pr-review
+description: Small GitHub App deployment with one correctness specialist
+input:
+  adapter: github_pr
+  triggers:
+    # Subscribe to pull_request and issue_comment in the GitHub App.
+    events: [opened, synchronize, reopened, ready_for_review]
+    comment_command: "/mochi review"
+    ignore_drafts: true
+repo_overrides:
+  enabled: false
+  allow_custom_prompts: false
+  allow_custom_images: false
+sandbox:
+  provider: daytona
+  default_snapshot: mochi-review
+  # Dockerfile-built container snapshots do not support Daytona fork.
+  # A single specialist needs only its own sandbox, without a shared base.
+  fork_from_base: false
+  setup_timeout: 3m
+agents:
+  - role: correctness
+    prompt_file: configs/prompts/correctness.md
+    llm:
+      provider: gemini
+      model: gemini-3.8-flash
+      reasoning_effort: medium
+      max_output_tokens: 4000
+    sandbox:
+      enabled: true
+    tools: [read_file, list_dir, search_code, git_diff, exec_command, submit_output]
+    budgets:
+      max_turns: 8
+      max_tokens: 40000
+      command_timeout: 60s
+      run_timeout: 3m
+synthesizer:
+  prompt_file: configs/prompts/synthesizer.md
+  llm:
+    provider: gemini
+    model: gemini-3.8-flash
+    reasoning_effort: medium
+    max_output_tokens: 4000
+  budgets:
+    max_turns: 2
+    max_tokens: 20000
+    run_timeout: 2m
+output:
+  sinks:
+    - type: github_pr_review
+      post_inline_comments: true
+      include_coverage_summary: true
+      min_severity: low
+      min_confidence: 0.7
+      verdict_mode: comment_only

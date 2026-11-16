@@ -1,0 +1,37 @@
+# Optional paid deployment: review pricing before creating a Blueprint.
+services:
+  - type: web
+    name: mochi
+    runtime: docker
+    branch: main
+    plan: starter
+    numInstances: 1
+    healthCheckPath: /readyz
+    autoDeployTrigger: 'off'
+    disk:
+      name: mochi-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: MOCHI_DB_PATH
+        value: /data/mochi.db
+      - key: MOCHI_WORKFLOW
+        value: configs/workflows/pr-review.yaml
+      - key: MOCHI_WORKERS
+        value: "1"
+      - key: MOCHI_QUEUE_SIZE
+        value: "16"
+      - key: MOCHI_GITHUB_APP_ID
+        sync: false
+      - key: MOCHI_GITHUB_PRIVATE_KEY
+        sync: false
+      - key: GITHUB_WEBHOOK_SECRET
+        sync: false
+      - key: MOCHI_API_TOKEN
+        generateValue: true
+      - key: DAYTONA_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false

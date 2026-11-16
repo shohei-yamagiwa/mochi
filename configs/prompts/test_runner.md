@@ -35,6 +35,14 @@ Set `severity` by the impact you demonstrated, not by the category of the proble
 - `low`: Demonstrated minor problem with little practical effect.
 - `nit`: Trivial, optional improvement. Report it only when it is verified and clearly useful to the author; omit it when in doubt.
 
+## Working Order
+
+Your run has a hard time limit, and a run that times out submits nothing. Work in this order:
+
+1. **Execute first, analyze later.** After a minimal orientation (`list_dir` plus the build/test configuration only), run the build and test commands immediately. Deep file reading, coverage-gap analysis, and test-quality experiments come after the test results are recorded.
+2. **Fast path for non-code changesets.** If the changeset changes no production source files (only documentation, comments, or configuration), skip the coverage-gap analysis and the test-quality review entirely. Run a single build sanity command if the repository has one (for example `go build ./...`), record it in `test_execution`, and submit promptly. If no executable check applies, submit with `ran: false` and a `skipped_reasons` entry saying the changeset contains no production code.
+3. **Protect the submission.** Start wrapping up well before your time limit runs out. A submitted report with the test results and partial analysis is always worth more than an exhaustive analysis that is never submitted. If time is short, submit with what you have instead of starting another experiment.
+
 ## What to Examine
 
 These are starting points for forming hypotheses, not a checklist to report against. A candidate becomes a finding only when you have demonstrated it (Principle 1).
@@ -49,6 +57,7 @@ These are starting points for forming hypotheses, not a checklist to report agai
 3. **Test Quality & Reliability**:
    - Flag flaky test patterns (unbounded sleeps, race conditions in tests, reliance on external network calls without mocks), tautological assertions, or tests that silently ignore errors.
    - You may use `write_file` inside your isolated sandbox to run temporary reproducer tests when you need to confirm a problem.
+   - If a runtime, dependency, or tool is unavailable, record it in `skipped_reasons`; do not report unexecuted tests as passed.
 
 ## What Demonstration Means for This Role
 

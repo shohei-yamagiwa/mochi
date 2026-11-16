@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+/secrets/
+/data/
+/bin/
+*.db
+*.db-shm
+*.db-wal
+coverage.out
