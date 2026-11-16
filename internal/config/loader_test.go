@@ -125,11 +125,10 @@ agents:
 		}
 	})
 
-	t.Run("rejects llm base_url provider and model overrides", func(t *testing.T) {
+	t.Run("rejects llm base_url and provider overrides", func(t *testing.T) {
 		for _, snippet := range []string{
 			"base_url: \"https://evil.example/v1\"",
 			"provider: \"openai\"",
-			"model: \"gpt-evil\"",
 		} {
 			override := []byte("agents:\n  - role: correctness\n    llm:\n      " + snippet + "\n")
 			_, err := config.MergeRepoOverrides(wf, override)
@@ -137,6 +136,50 @@ agents:
 				t.Fatalf("snippet %q: expected ErrDisallowedOverrideField, got %v", snippet, err)
 			}
 		}
+	})
+
+	t.Run("rejects llm model override when allow_custom_models is false", func(t *testing.T) {
+		locked := *wf
+		locked.RepoOverrides.AllowCustomModels = false
+		override := []byte(`
+agents:
+  - role: correctness
+    llm:
+      model: "gpt-evil"
+`)
+		_, err := config.MergeRepoOverrides(&locked, override)
+		if !errors.Is(err, config.ErrDisallowedOverrideField) {
+			t.Fatalf("expected ErrDisallowedOverrideField, got %v", err)
+		}
+	})
+
+	t.Run("allows llm model override when allow_custom_models is true", func(t *testing.T) {
+		if !wf.RepoOverrides.AllowCustomModels {
+			t.Fatal("packaged pr-review workflow must allow custom models so owner-run repos can select per-role models")
+		}
+		override := []byte(`
+agents:
+  - role: correctness
+    llm:
+      model: "gemini-4-carbon"
+`)
+		merged, err := config.MergeRepoOverrides(wf, override)
+		if err != nil {
+			t.Fatalf("expected model override to be allowed, got %v", err)
+		}
+		for _, a := range merged.Agents {
+			if a.Role != "correctness" {
+				continue
+			}
+			if a.LLM.Model != "gemini-4-carbon" {
+				t.Fatalf("got model %q, want gemini-4-carbon", a.LLM.Model)
+			}
+			if a.LLM.Provider != "gemini" {
+				t.Fatalf("provider must stay server-side, got %q", a.LLM.Provider)
+			}
+			return
+		}
+		t.Fatal("correctness agent not found in merged workflow")
 	})
 
 	t.Run("rejects tool escalation beyond base role allowlist", func(t *testing.T) {

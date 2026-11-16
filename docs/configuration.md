@@ -74,8 +74,9 @@ budget. These are execution limits, not exact monetary caps.
 ## Repository overrides
 
 When enabled by the server workflow, Mochi reads `.mochi/config.yaml` and custom
-prompts from the PR base branch. The full preset enables overrides and custom
-prompts, while disallowing custom images; the small preset disables overrides.
+prompts from the PR base branch. The full preset enables overrides, including
+custom prompts, sandbox images, and per-role models; the small preset disables
+overrides.
 For example, a repository can lower a role's budget and adjust an existing sink:
 
 ```yaml
@@ -96,8 +97,9 @@ inference settings, and adjust output filtering. Budget and output-token request
 are clamped to server limits. Keep at least one specialist enabled.
 
 Custom `prompt_file` paths must stay under `.mochi/` and require
-`allow_custom_prompts`. Sandbox changes require `allow_custom_images`. Overrides
-cannot change trigger rules, providers, models, API base URLs, sink destinations,
+`allow_custom_prompts`. Sandbox changes require `allow_custom_images`. Model
+changes require `allow_custom_models`. Overrides
+cannot change trigger rules, providers, API base URLs, sink destinations,
 or verdict mode, and cannot add roles, tools, or sinks. The allowlist and merging
 rules are implemented in [`internal/config/loader.go`](../internal/config/loader.go).
 

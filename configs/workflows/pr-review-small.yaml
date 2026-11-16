@@ -14,6 +14,7 @@ repo_overrides:
   enabled: false
   allow_custom_prompts: false
   allow_custom_images: false
+  allow_custom_models: false
 sandbox:
   provider: daytona
   default_snapshot: mochi-review

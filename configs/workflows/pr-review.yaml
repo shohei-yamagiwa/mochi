@@ -14,6 +14,7 @@ repo_overrides:
   path: ".mochi/config.yaml"
   allow_custom_prompts: true
   allow_custom_images: true # Owner-run private repositories only: lets a repo select its language snapshot via .mochi/config.yaml (e.g. mochi-review-java for BioCold Nexus). Revisit before opening Mochi to untrusted repositories.
+  allow_custom_models: true # Owner-run private repositories only: lets a repo select per-role models via .mochi/config.yaml. Providers and API base URLs stay server-side. Stopgap: the override architecture is under reconsideration. Revisit before opening Mochi to untrusted repositories.
 
 sandbox:
   provider: daytona
@@ -27,7 +28,7 @@ agents:
     prompt_file: "configs/prompts/correctness.md"
     llm:
       provider: gemini
-      model: gemini-hydrogen
+      model: gemini-4-hydrogen
       reasoning_effort: high
       max_output_tokens: 8192
     sandbox:
@@ -43,7 +44,7 @@ agents:
     prompt_file: "configs/prompts/security.md"
     llm:
       provider: gemini
-      model: gemini-hydrogen
+      model: gemini-4-hydrogen
       reasoning_effort: high
       max_output_tokens: 8192
     sandbox:
@@ -59,7 +60,7 @@ agents:
     prompt_file: "configs/prompts/performance_architecture.md"
     llm:
       provider: gemini
-      model: gemini-carbon
+      model: gemini-4-carbon
       reasoning_effort: medium
       max_output_tokens: 8192
     sandbox:
@@ -75,7 +76,7 @@ agents:
     prompt_file: "configs/prompts/maintainability.md"
     llm:
       provider: gemini
-      model: gemini-carbon
+      model: gemini-4-carbon
       reasoning_effort: medium
       max_output_tokens: 8192
     sandbox:
@@ -91,7 +92,7 @@ agents:
     prompt_file: "configs/prompts/test_runner.md"
     llm:
       provider: gemini
-      model: gemini-carbon
+      model: gemini-4-carbon
       reasoning_effort: medium
       max_output_tokens: 8192
     sandbox:
@@ -110,7 +111,7 @@ synthesizer:
   prompt_file: "configs/prompts/synthesizer.md"
   llm:
     provider: gemini
-    model: gemini-carbon
+    model: gemini-4-carbon
     reasoning_effort: medium
     max_output_tokens: 8192
   budgets:
