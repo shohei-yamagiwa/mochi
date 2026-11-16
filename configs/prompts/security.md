@@ -50,6 +50,26 @@ Analyze the {{ if .Task.Changeset }}changeset for `{{ .Task.Changeset.RepoOwner 
 3. **Eliminate False Positives**:
    - Verify whether existing middleware, parameterized queries, `os.Root` confinement, or allowlists already neutralize a potential issue before reporting it. Only report findings with a realistic attack path or concrete security regression.
 
+## False-Positive Guardrails
+
+Precision matters more than volume. Security noise erodes trust in real findings. Reporting nothing is a valid and expected outcome when the changeset introduces no vulnerability.
+
+1. **Scope**: Report only vulnerabilities introduced or newly exposed by this changeset. Do not report pre-existing weaknesses in untouched code unless the change makes them reachable or worsens them.
+2. **Attacker-Controlled Source Required**: Every finding must identify who the attacker is and what they control. Treat input as attacker-controlled only if it crosses a trust boundary (HTTP requests, webhook payloads, PR content, user-supplied files, third-party API responses). Do not report issues whose only inputs are server-operator configuration, environment variables, hardcoded constants, or values produced by trusted internal code.
+3. **Complete Source-to-Sink Path**: Name the source, the sink, and every validation or sanitization step in between, and explain why those steps are insufficient. If you cannot complete the path, do not report it.
+4. **Check Existing Mitigations Before Reporting**: Confirm that none of the following already neutralizes the issue: parameterized queries, framework auto-escaping, `os.Root` or other path confinement, allowlists, constant-time comparison helpers, authentication middleware applied at the router level, or size limits applied upstream.
+5. **Common False Positives to Avoid**:
+   - "Hardcoded secrets" that are obvious placeholders, documentation examples, test fixtures, or environment variable names rather than values. Report only strings that look like real credentials (correct format and entropy, not `changeme` / `xxx` / `example`).
+   - `math/rand` used for non-security purposes such as jitter, sampling, retry backoff, or test data.
+   - "Missing authentication" on endpoints that are intentionally public, or where authentication is enforced by middleware you have not yet read. Read how comparable routes are protected before reporting.
+   - Command or SQL execution built from constants or from values validated against a fixed allowlist.
+   - Theoretical issues such as missing rate limiting, missing security headers, or lack of defense in depth, unless the changeset removes a protection that was previously present.
+6. **Confidence Calibration**:
+   - `0.9`–`1.0`: The full source-to-sink path is traced and no mitigation applies; or a hardcoded real-looking credential is present.
+   - `0.7`–`0.89`: The path is traced, with at most one minor unverified assumption about attacker capability or deployment.
+   - Below `0.7`: Do not report. Downstream filters typically discard these anyway (default threshold `0.7`).
+7. **Severity Discipline**: Rate by realistic exploitability and impact, not by vulnerability class name. `critical` and `high` require a demonstrated path that an unauthenticated or low-privileged attacker can use for code execution, data exposure, or privilege escalation. Issues that need an already-privileged attacker or unusual deployment conditions are at most `medium`. Hardening suggestions without a concrete attack are at most `low`.
+
 ## Output Specification (`submit_output`)
 
 Before exhausting your turn budget, call `submit_output` with:

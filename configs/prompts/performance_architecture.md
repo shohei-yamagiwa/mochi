@@ -51,6 +51,28 @@ Analyze the {{ if .Task.Changeset }}changeset for `{{ .Task.Changeset.RepoOwner 
 3. **Focus on Material Impact**:
    - Prioritize measurable performance bottlenecks, unbounded resource growth, and concrete architectural violations over micro-optimizations on cold paths.
 
+## False-Positive Guardrails
+
+Precision matters more than volume. Performance and architecture opinions are the easiest to over-report, so hold every finding to an evidence standard. Reporting nothing is a valid and expected outcome when the changeset has no material issue.
+
+1. **Scope**: Report only regressions or design problems introduced or worsened by this changeset. Do not report pre-existing inefficiencies or structural debt in untouched code.
+2. **Scale and Hot-Path Evidence Required**: For every performance finding, state the input that grows (e.g., number of files, PR size, rows, requests) and the code path's frequency (per request, per run, at startup). Do not report:
+   - Loops over collections that are small and bounded by design (flags, configured roles, a handful of tools).
+   - Inefficiency on cold paths such as startup, one-time initialization, CLI setup, or error handling.
+   - Missing caching, pooling, or pre-compilation where the work happens once or rarely.
+   - Micro-optimizations (allocation counts, string concatenation, `defer` overhead) without evidence of a measurable effect.
+3. **Quote the Complexity**: When claiming quadratic or N+1 behavior, identify the two nested iterations or the per-item call concretely, and confirm the inner operation is not already O(1) or batched.
+4. **Architecture Findings Must Follow Existing Conventions**: Before flagging a layering violation, circular dependency, or leaky abstraction, use `list_dir`, `search_code`, and `read_file` to establish the repository's actual conventions (existing package boundaries, interfaces, import directions). Report only violations of conventions that the codebase already follows consistently, and name the specific import, type, or call that violates them. Do not report:
+   - Personal preferences about structure, naming, file size, or package layout.
+   - Suggestions to introduce new abstractions, interfaces, or patterns the codebase does not already use.
+   - Duplication that is small, local, or intentional.
+5. **Verify When Cheap**: If `exec_command` is available and a claim can be checked with a quick benchmark, a build, or a dependency listing (e.g., `go list -deps`, `go build ./...`), do so. A confirmed result justifies higher confidence.
+6. **Confidence Calibration**:
+   - `0.9`–`1.0`: Confirmed by execution, or the complexity or dependency violation is unambiguous and the scale argument is explicit.
+   - `0.7`–`0.89`: Strong evidence from code reading, with at most one minor unverified assumption about input size or usage frequency.
+   - Below `0.7`: Do not report. Downstream filters typically discard these anyway (default threshold `0.7`).
+7. **Severity Discipline**: `critical` and `high` require a demonstrated scaling failure (timeouts, unbounded memory growth, deadlock-prone contention) on a realistic workload. Architecture findings are at most `medium` unless they cause a concrete functional or maintenance failure now. Do not use `nit` for anything that is not an observable defect.
+
 ## Output Specification (`submit_output`)
 
 Before exhausting your turn budget, call `submit_output` with:
