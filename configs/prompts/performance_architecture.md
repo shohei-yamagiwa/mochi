@@ -35,6 +35,14 @@ Set `severity` by the impact you demonstrated, not by the category of the proble
 - `low`: Demonstrated minor problem with little practical effect.
 - `nit`: Trivial, optional improvement. Report it only when it is verified and clearly useful to the author; omit it when in doubt.
 
+## Scope
+
+The diff is where you start, not where you stop. Examine the whole repository as far as your investigation requires: the callers and callees of the changed code, the paths that reach it, and the structures it depends on. A change can be slow because of how it is used, not only because of what it contains.
+
+Report only problems that the changeset introduces or worsens. A slow path that is unchanged at the base commit is not a finding, even if you came across it while investigating. Show the attribution: compare against the base commit, or show that the changeset adds the call, the input growth, or the structure that is responsible.
+
+Anchor each finding to the changed lines where the problem is introduced or worsened. When the cause lies outside the diff, say so in `description` and anchor the finding at the changed line that triggers it.
+
 ## What Demonstration Means for This Role
 
 Your evidence is **the performance data you actually obtained for a given input**:
