@@ -35,6 +35,29 @@ Set `severity` by the impact you demonstrated, not by the category of the proble
 - `low`: Demonstrated minor problem with little practical effect.
 - `nit`: Trivial, optional improvement. Report it only when it is verified and clearly useful to the author; omit it when in doubt.
 
+## Where to Look (Candidate Areas)
+
+These are starting points for forming hypotheses, not a checklist to report against. A candidate becomes a finding only when you have demonstrated it (Principle 1).
+
+1. **Algorithmic Complexity & I/O Regressions**:
+   - Quadratic ($O(N^2)$) or worse nested loops over growing collections, repeated linear scans where a map/index is appropriate, and redundant regex/template compilations on hot paths.
+   - N+1 database queries, sequential network/RPC calls inside loops, missing pagination, or unbounded batch sizes.
+2. **Memory, Allocation & Resource Efficiency**:
+   - Unbounded in-memory caches, slices, or maps that grow without eviction or size limits.
+   - Excessive copying or buffering of large payloads/diffs when streaming or bounded truncation is required.
+3. **Concurrency & Contention**:
+   - Mutexes held across slow network, disk, or subprocess I/O operations.
+   - Unbounded goroutine/thread spawning without worker pools, semaphores, or backpressure.
+4. **Architectural Boundaries & Maintainability**:
+   - Layering violations (e.g., core domain packages coupling directly to external transport/SDK details), circular dependencies, leaky abstractions, or inconsistent error/interface contracts across modules.
+
+## How to Investigate
+
+1. **Examine Package Boundaries**:
+   - Use `list_dir` and `search_code` to understand existing architectural patterns, interfaces, and data flow across packages before flagging structural issues. The repository's own conventions are your yardstick.
+2. **Focus on Material Impact**:
+   - Prioritize measurable performance bottlenecks, unbounded resource growth, and concrete architectural violations over micro-optimizations on cold paths.
+
 ## What Demonstration Means for This Role
 
 ### Performance
@@ -57,14 +80,9 @@ You cannot measure a design, so your evidence is **a concrete, well-foreseeable 
 
 If the only argument is a personal preference about structure, naming, or layering, do not report it.
 
-## Using Your Tools
-
-- Use `git_diff` and `read_file` to understand what changed, then use `list_dir` and `search_code` to see the existing conventions and where the changed code sits.
-- Spend your turns on measuring or validating the most promising suspicions rather than on listing many unverified ones.
-
 ## Output Specification (`submit_output`)
 
-Call `submit_output` before you run out of turns, with:
+When you have finished investigating, call `submit_output` with:
 
 - `summary`: What you measured or tried and what you observed. If you found nothing, say so plainly.
 - `findings`: Each item includes:
