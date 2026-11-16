@@ -62,13 +62,32 @@ func TestMergeRepoOverridesSecurityControls(t *testing.T) {
 	}
 
 	t.Run("rejects custom sandbox image when allow_custom_images is false", func(t *testing.T) {
+		locked := *wf
+		locked.RepoOverrides.AllowCustomImages = false
 		override := []byte(`
 sandbox:
   default_image: "evil/exfiltrate:latest"
 `)
-		_, err := config.MergeRepoOverrides(wf, override)
+		_, err := config.MergeRepoOverrides(&locked, override)
 		if !errors.Is(err, config.ErrCustomImagesDisallowed) {
 			t.Fatalf("expected ErrCustomImagesDisallowed, got %v", err)
+		}
+	})
+
+	t.Run("allows custom sandbox snapshot when allow_custom_images is true", func(t *testing.T) {
+		if !wf.RepoOverrides.AllowCustomImages {
+			t.Fatal("packaged pr-review workflow must allow custom images so owner-run repos can select their language snapshot")
+		}
+		override := []byte(`
+sandbox:
+  default_snapshot: "mochi-review-java"
+`)
+		merged, err := config.MergeRepoOverrides(wf, override)
+		if err != nil {
+			t.Fatalf("expected custom snapshot to be allowed, got %v", err)
+		}
+		if merged.Sandbox.DefaultSnapshot != "mochi-review-java" {
+			t.Fatalf("got default_snapshot %q, want mochi-review-java", merged.Sandbox.DefaultSnapshot)
 		}
 	})
 
