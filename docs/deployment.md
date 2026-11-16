@@ -137,8 +137,37 @@ creating the service; LLM and Daytona usage are billed separately.
 
 Enter the required secrets, deploy, and verify `/readyz` returns HTTP 200. Update
 the GitHub App webhook URL to the public HTTPS URL plus `/webhooks/github`, and
-activate delivery. Automatic deployment is disabled by the Blueprint; release
-subsequent versions with Manual Deploy.
+activate delivery. The Blueprint enables automatic deployments after the linked
+`main` commit's CI checks pass (`autoDeployTrigger: checksPass`). Pushes to
+`develop` run CI but do not deploy production.
+
+### Enable continuous deployment on an existing service
+
+After merging this configuration, open the existing service in the Render
+Dashboard and set **Settings > Auto-Deploy > After CI Checks Pass**, then save.
+The Blueprint has automatic syncing disabled in the current deployment, so
+merging `render.yaml` alone does not update the live service setting. The Dashboard
+setting and this file must both use the CI-gated mode so a future Blueprint sync
+does not disable it. Alternatively, review and apply a Blueprint sync after the
+merge. No deploy hook or additional GitHub Actions secret is required.
+
+Render must have a connected Git provider for automatic deploys. If the setting
+is unavailable for a public-repository URL deployment, connect the GitHub
+repository in Render first. All checks on the linked commit must pass; Render
+does not deploy when no checks are found or any check fails. The existing CI
+workflow already runs on `main` pushes.
+
+Automatic deployment does not wait for Mochi's review queue to become idle.
+The persistent disk requires a brief interruption when swapping instances, and
+in-flight reviews or queued work can be interrupted. Merge production releases
+while reviews are idle and retrigger interrupted runs as described below. If a
+maintenance window is required, temporarily set Auto-Deploy to **Off**, deploy
+manually, and restore **After CI Checks Pass** afterward.
+
+For the first release after enabling CD, confirm the new `main` commit's CI
+succeeds, a deploy starts without Manual Deploy, and that same commit becomes
+`live` with `/readyz` returning HTTP 200. Snapshot image changes still require
+separate creation in Daytona; Render CD does not rebuild Daytona snapshots.
 
 To select another preset, first prepare its snapshot, then update
 `MOCHI_WORKFLOW` and redeploy while no reviews are running or queued. Existing
