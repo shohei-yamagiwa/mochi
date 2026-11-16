@@ -54,6 +54,25 @@ can incur provider charges and publish to GitHub when enabled. Follow the
 
 ## Pull requests and documentation
 
+Use the branch flow `feature branch -> develop -> main`. Production release PRs
+targeting `main` must come from this repository's `develop` branch. The
+[`main-source`](.github/workflows/main-source.yml) check rejects other source
+branches, including a fork's branch named `develop`. It uses `pull_request_target`
+to read the trusted base workflow and event metadata, with no token permissions
+and no checkout or execution of PR code. Updates to the PR head or base rerun the
+check. Direct pushes are prevented by the repository ruleset, not this workflow.
+
+To enforce this policy, install the workflow in `main` first, then open or update
+a `develop -> main` PR to register a successful `main-source` check. In
+**Settings > Rules > Rulesets**, create an **Active** branch ruleset targeting
+`main`, with no bypass actors. Require a pull request and the `verify` and
+`main-source` status checks, and enable **Block force pushes** and **Restrict
+deletions**. When selecting the status checks, select GitHub Actions as the
+expected source. A workflow file alone does not enforce merging restrictions.
+Do not mark `main-source` required before it is installed in `main`, or release
+PRs can be blocked waiting for a check that cannot run. If already-open release
+PRs lack the check, reopen them after installation.
+
 Keep changes focused and explain the behavior affected and the checks performed.
 Use the [pull request template](.github/pull_request_template.md): it asks for a
 summary, the changes, and the checks you ran, with optional sections for impact,
