@@ -32,11 +32,14 @@ func TestLoadDefaultPRReviewWorkflow(t *testing.T) {
 	if wf.Sandbox.SetupTimeout.Std() != 3*time.Minute {
 		t.Fatalf("got setup_timeout %v, want 3m", wf.Sandbox.SetupTimeout.Std())
 	}
-	if len(wf.Agents) != 4 {
-		t.Fatalf("got %d agents, want 4", len(wf.Agents))
+	if len(wf.Agents) != 5 {
+		t.Fatalf("got %d agents, want 5", len(wf.Agents))
 	}
-	if wf.Agents[3].Role != "test-runner" || wf.Agents[3].Budgets.RunTimeout.Std() != 8*time.Minute {
-		t.Fatalf("unexpected test-runner config: %+v", wf.Agents[3])
+	if wf.Agents[3].Role != "maintainability" {
+		t.Fatalf("unexpected maintainability config: %+v", wf.Agents[3])
+	}
+	if wf.Agents[4].Role != "test-runner" || wf.Agents[4].Budgets.RunTimeout.Std() != 8*time.Minute {
+		t.Fatalf("unexpected test-runner config: %+v", wf.Agents[4])
 	}
 	if wf.Synthesizer.Budgets.RunTimeout.Std() != 2*time.Minute {
 		t.Fatalf("unexpected synthesizer run_timeout: %v", wf.Synthesizer.Budgets.RunTimeout.Std())
@@ -151,6 +154,8 @@ agents:
     enabled: false
   - role: performance-architecture
     enabled: false
+  - role: maintainability
+    enabled: false
   - role: test-runner
     enabled: false
 `)
@@ -176,7 +181,7 @@ input:
 		// Exercise unset-budget ceilings independently of the deployment preset's caps.
 		base := *wf
 		base.Agents = append([]domain.RoleConfig(nil), wf.Agents...)
-		base.Agents[3].LLM.MaxOutputTokens = 0
+		base.Agents[4].LLM.MaxOutputTokens = 0
 		base.Synthesizer.Budgets.MaxTokens = 0
 		override := []byte(`
 agents:
@@ -193,6 +198,8 @@ agents:
       max_output_tokens: 999999
       reasoning_effort: high
   - role: performance-architecture
+    enabled: false
+  - role: maintainability
     enabled: false
 synthesizer:
   prompt_file: ".mochi/prompts/synth.md"
@@ -211,7 +218,7 @@ output:
 			t.Fatal("expected ignore_drafts=true to be preserved")
 		}
 		if len(merged.Agents) != 3 {
-			t.Fatalf("expected 3 agents after disabling performance-architecture, got %d", len(merged.Agents))
+			t.Fatalf("expected 3 agents after disabling performance-architecture and maintainability, got %d", len(merged.Agents))
 		}
 		if merged.Agents[0].Budgets.MaxTurns != 15 {
 			t.Fatalf("expected max_turns clamped to base 15, got %d", merged.Agents[0].Budgets.MaxTurns)
@@ -264,7 +271,7 @@ output:
 			t.Fatal("expected ParseWorkflow to reject prompt_from_repo=true in server workflow YAML")
 		}
 
-		if wf.Agents[0].Budgets.MaxTurns != 15 || len(wf.Agents) != 4 || wf.Agents[0].PromptFromRepo {
+		if wf.Agents[0].Budgets.MaxTurns != 15 || len(wf.Agents) != 5 || wf.Agents[0].PromptFromRepo {
 			t.Fatal("base workflow was mutated by MergeRepoOverrides")
 		}
 	})

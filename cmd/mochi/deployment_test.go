@@ -80,7 +80,7 @@ func TestRuntimeWorkflowChecksAllDependencies(t *testing.T) {
 func TestCLI_ValidateDeploymentPresets(t *testing.T) {
 	for _, tc := range []struct{ file, expected string }{
 		{"pr-review-small.yaml", "1 agents, 1 sinks"},
-		{"pr-review.yaml", "4 agents, 1 sinks"},
+		{"pr-review.yaml", "5 agents, 1 sinks"},
 	} {
 		t.Run(tc.file, func(t *testing.T) { testValidateDeploymentPreset(t, tc.file, tc.expected) })
 	}

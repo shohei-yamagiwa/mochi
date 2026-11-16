@@ -224,7 +224,7 @@ func detectRoleFromRequest(req llm.ChatRequest) string {
 	}
 	if len(req.Messages) > 0 {
 		first := req.Messages[0].Content
-		for _, r := range []string{"correctness", "security", "performance-architecture", "test-runner"} {
+		for _, r := range []string{"correctness", "security", "performance-architecture", "maintainability", "test-runner"} {
 			if strings.Contains(first, "## Specialist Role: `"+r+"`") {
 				return r
 			}
@@ -336,6 +336,21 @@ func TestRunner_EndToEndPresetWorkflowWithParallelFanOutCoverageAndSynthesizerSe
 				Name: "submit_output",
 				Arguments: json.RawMessage(`{
 					"summary": "No performance regressions detected.",
+					"findings": []
+				}`),
+			}
+			return &llm.ChatResponse{
+				Message:   llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{tc}},
+				ToolCalls: []llm.ToolCall{tc},
+				Usage:     llm.TokenUsage{InputTokens: 80, OutputTokens: 20},
+			}, nil
+
+		case "maintainability":
+			tc := llm.ToolCall{
+				ID:   "tc_maint_submit",
+				Name: "submit_output",
+				Arguments: json.RawMessage(`{
+					"summary": "No maintainability issues demonstrated.",
 					"findings": []
 				}`),
 			}
@@ -480,8 +495,8 @@ func TestRunner_EndToEndPresetWorkflowWithParallelFanOutCoverageAndSynthesizerSe
 	if res.Run.Status != domain.RunStatusCompleted {
 		t.Fatalf("Run.Status = %q, want %q", res.Run.Status, domain.RunStatusCompleted)
 	}
-	if len(res.Specialists) != 4 {
-		t.Fatalf("len(Specialists) = %d, want 4", len(res.Specialists))
+	if len(res.Specialists) != 5 {
+		t.Fatalf("len(Specialists) = %d, want 5", len(res.Specialists))
 	}
 
 	// Verify base sandbox was created once and destroyed cleanly.
@@ -492,9 +507,9 @@ func TestRunner_EndToEndPresetWorkflowWithParallelFanOutCoverageAndSynthesizerSe
 		t.Fatalf("baseSandbox.destroyed = %d, want 1", sbProvider.createdBase[0].destroyed)
 	}
 
-	// Verify 4 forked sandboxes were created (one per specialist role) and all destroyed.
-	if len(sbProvider.forkedByName) != 4 {
-		t.Fatalf("len(forkedByName) = %d, want 4", len(sbProvider.forkedByName))
+	// Verify 5 forked sandboxes were created (one per specialist role) and all destroyed.
+	if len(sbProvider.forkedByName) != 5 {
+		t.Fatalf("len(forkedByName) = %d, want 5", len(sbProvider.forkedByName))
 	}
 	for name, forked := range sbProvider.forkedByName {
 		if forked.destroyed != 1 {
@@ -502,8 +517,8 @@ func TestRunner_EndToEndPresetWorkflowWithParallelFanOutCoverageAndSynthesizerSe
 		}
 	}
 
-	// Verify rendered system prompts for all 4 specialist roles and synthesizer.
-	for _, role := range []string{"correctness", "security", "performance-architecture", "test-runner", "synthesizer"} {
+	// Verify rendered system prompts for all 5 specialist roles and synthesizer.
+	for _, role := range []string{"correctness", "security", "performance-architecture", "maintainability", "test-runner", "synthesizer"} {
 		sys := llmProvider.sysByRole[role]
 		if !strings.Contains(sys, "shohei-yamagiwa/mochi") {
 			t.Errorf("role %q system prompt did not contain repo name: %q", role, sys)
@@ -531,8 +546,8 @@ func TestRunner_EndToEndPresetWorkflowWithParallelFanOutCoverageAndSynthesizerSe
 	if res.Report.TestExecution == nil || !res.Report.TestExecution.Ran || !res.Report.TestExecution.Passed {
 		t.Fatalf("Report.TestExecution = %+v, want ran=true passed=true", res.Report.TestExecution)
 	}
-	if len(res.Report.AgentSummaries) != 4 {
-		t.Fatalf("len(Report.AgentSummaries) = %d, want 4", len(res.Report.AgentSummaries))
+	if len(res.Report.AgentSummaries) != 5 {
+		t.Fatalf("len(Report.AgentSummaries) = %d, want 5", len(res.Report.AgentSummaries))
 	}
 
 	// Verify SQLite persistence of Run, CoverageReport, and AgentRuns.
@@ -556,8 +571,8 @@ func TestRunner_EndToEndPresetWorkflowWithParallelFanOutCoverageAndSynthesizerSe
 	if err != nil {
 		t.Fatalf("st.ListAgentRuns: %v", err)
 	}
-	if len(agentRuns) != 5 { // 4 specialists + 1 synthesizer
-		t.Fatalf("len(agentRuns) = %d, want 5", len(agentRuns))
+	if len(agentRuns) != 6 { // 5 specialists + 1 synthesizer
+		t.Fatalf("len(agentRuns) = %d, want 6", len(agentRuns))
 	}
 
 	// Verify OutputSink received OnRunStarted and Publish.
@@ -620,8 +635,8 @@ func TestRunner_SpecialistFailureCleansUpSandboxesAndNotifiesSink(t *testing.T) 
 	}
 
 	// Every directly created sandbox must be cleaned up even when all agents fail.
-	if len(sbProvider.createdBase) != 4 || len(sbProvider.forkedByName) != 0 {
-		t.Fatalf("expected four direct sandboxes, got created=%d forked=%d", len(sbProvider.createdBase), len(sbProvider.forkedByName))
+	if len(sbProvider.createdBase) != 5 || len(sbProvider.forkedByName) != 0 {
+		t.Fatalf("expected five direct sandboxes, got created=%d forked=%d", len(sbProvider.createdBase), len(sbProvider.forkedByName))
 	}
 	for _, created := range sbProvider.createdBase {
 		if created.destroyed != 1 || created.lastDestroyEr != nil {
@@ -873,11 +888,13 @@ func TestRunner_RepoOverridesMerge(t *testing.T) {
 			if overridePath != ".mochi/config.yaml" {
 				t.Errorf("overridePath = %q, want .mochi/config.yaml", overridePath)
 			}
-			// Disable performance-architecture and test-runner via .mochi/config.yaml
+			// Disable performance-architecture, maintainability, and test-runner via .mochi/config.yaml
 			return &RepoOverrideBundle{
 				ConfigYAML: []byte(`
 agents:
   - role: performance-architecture
+    enabled: false
+  - role: maintainability
     enabled: false
   - role: test-runner
     enabled: false
@@ -1090,7 +1107,7 @@ func TestRunner_PresetsRunOnSandboxesWithoutForkSupport(t *testing.T) {
 		roles    []string
 	}{
 		{"pr-review-small.yaml", "mochi-review", []string{"correctness"}},
-		{"pr-review.yaml", "mochi-review-go", []string{"correctness", "security", "performance-architecture", "test-runner"}},
+		{"pr-review.yaml", "mochi-review-go", []string{"correctness", "security", "performance-architecture", "maintainability", "test-runner"}},
 	} {
 		t.Run(tc.file, func(t *testing.T) { testPresetWithoutFork(t, tc.file, tc.snapshot, tc.roles) })
 	}

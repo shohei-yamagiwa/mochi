@@ -1,6 +1,6 @@
 version: "1"
 name: pr-review
-description: Four Gemini specialists with separate Daytona sandboxes and one synthesizer
+description: Five Gemini specialists with separate Daytona sandboxes and one synthesizer
 
 input:
   adapter: github_pr
@@ -57,6 +57,22 @@ agents:
 
   - role: performance-architecture
     prompt_file: "configs/prompts/performance_architecture.md"
+    llm:
+      provider: gemini
+      model: gemini-3.8-flash
+      reasoning_effort: high
+      max_output_tokens: 8192
+    sandbox:
+      enabled: true
+    tools: ["read_file", "list_dir", "search_code", "git_diff", "exec_command", "submit_output"]
+    budgets:
+      max_turns: 12
+      max_tokens: 150000
+      command_timeout: 60s
+      run_timeout: 5m
+
+  - role: maintainability
+    prompt_file: "configs/prompts/maintainability.md"
     llm:
       provider: gemini
       model: gemini-3.8-flash

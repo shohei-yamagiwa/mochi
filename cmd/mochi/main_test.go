@@ -230,7 +230,7 @@ func TestCLI_RunDryRunLocalGit(t *testing.T) {
 	for _, want := range []string{
 		"Dry Run: workflow=pr-review trigger=cli",
 		"app.go",
-		"Specialist Agents (4):",
+		"Specialist Agents (5):",
 		"correctness",
 		"rendered (",
 	} {

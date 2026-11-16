@@ -38,7 +38,7 @@ require provider credentials and a prepared snapshot; see [usage](docs/usage.md)
 
 | Preset | Specialists | Daytona snapshot |
 | --- | --- | --- |
-| [Full](configs/workflows/pr-review.yaml), the default | Correctness, security, performance/architecture, and tests | `mochi-review-go` |
+| [Full](configs/workflows/pr-review.yaml), the default | Correctness, security, performance/architecture, maintainability, and tests | `mochi-review-go` |
 | [Small](configs/workflows/pr-review-small.yaml) | Correctness | `mochi-review` |
 
 Both presets use Gemini and a final synthesizer that combines specialist results.

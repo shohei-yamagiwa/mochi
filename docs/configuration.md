@@ -20,7 +20,7 @@ fields are rejected.
 | `output.sinks` | Artifact destinations and presentation settings |
 
 The [full preset](../configs/workflows/pr-review.yaml) defines correctness,
-security, performance/architecture, and test roles. The
+security, performance/architecture, maintainability, and test roles. The
 [small preset](../configs/workflows/pr-review-small.yaml) defines correctness only.
 Both use a synthesizer and independent specialist sandboxes with
 `fork_from_base: false`. Customize `sandbox.default_snapshot` for the language
