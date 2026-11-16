@@ -55,6 +55,11 @@ can incur provider charges and publish to GitHub when enabled. Follow the
 ## Pull requests and documentation
 
 Keep changes focused and explain the behavior affected and the checks performed.
+Use the [pull request template](.github/pull_request_template.md): it asks for a
+summary, the changes, and the checks you ran, with optional sections for impact,
+follow-ups, and post-merge steps. Write the title as a
+[Conventional Commit](https://www.conventionalcommits.org/) such as `feat: ...`
+or `docs(prompts): ...`.
 Add regression tests when changing behavior, especially around provider requests,
 configuration restrictions, cancellation, cleanup, and persisted contracts.
 
