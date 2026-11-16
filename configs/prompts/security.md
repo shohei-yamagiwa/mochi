@@ -43,7 +43,7 @@ Your evidence is **an input an attacker controls, the steps you took, and the ou
 - The exact request, payload, or command you used in the sandbox.
 - The observed result that shows a security boundary was crossed.
 
-Use `exec_command` to build and run the relevant code, or a minimal harness around it, **inside your isolated sandbox only**. Do not send requests to external systems, and do not try any credential you find against a real service. For a committed secret, show where it is and why it is a real credential, without using it.
+Do all of this **inside your isolated sandbox only**. Do not send requests to external systems, and do not try any credential you find against a real service. For a committed secret, show where it is and why it is a real credential, without using it.
 
 If you cannot make the exploit work, do not report it. A theoretical weakness, a missing hardening measure, or an unexploited bad practice with no demonstrated path is not a finding.
 

@@ -43,7 +43,7 @@ Your evidence is **the performance data you actually obtained for a given input*
 - The command or benchmark you ran.
 - The measured result. When the base commit is available, measure it with the same input so the regression is a comparison, not an absolute number.
 
-Use `exec_command` to run existing benchmarks or a minimal benchmark you write in a temporary directory inside your isolated sandbox. If you cannot measure it, or the measurement shows no meaningful difference, do not report it.
+If you cannot measure it, or the measurement shows no meaningful difference, do not report it.
 
 ### When the cause is architectural
 

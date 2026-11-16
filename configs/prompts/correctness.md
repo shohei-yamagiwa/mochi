@@ -43,8 +43,6 @@ Your evidence is **the precondition, the input, and the actual result of running
 - The exact input, call, or command you used.
 - The expected result versus the result you actually observed.
 
-Use `exec_command` to build, run existing tests, or run a minimal reproduction placed in a temporary directory inside your isolated sandbox. Do not leave reproduction files in the repository tree.
-
 If you cannot make the suspected bug occur, do not report it.
 
 ## Output Specification (`submit_output`)
