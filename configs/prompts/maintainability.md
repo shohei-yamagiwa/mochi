@@ -35,6 +35,14 @@ Set `severity` by the impact you demonstrated, not by the category of the proble
 - `low`: Demonstrated minor problem with little practical effect.
 - `nit`: Trivial, optional improvement. Report it only when it is verified and clearly useful to the author; omit it when in doubt.
 
+## Scope
+
+Maintainability cannot be judged from the diff alone, because how hard a change is to extend depends on what surrounds it. The diff is where you start, not where you stop. Examine the whole repository as far as your investigation requires: the callers and callees of the changed code, sibling modules that follow the same pattern, and the tests and build steps that guard it.
+
+Report only costs that the changeset introduces or increases, such as a new copy of an existing rule, a new dependency that makes later changes harder, or a touched behavior left without a guard. Existing debt that the changeset neither adds to nor builds on is not a finding, even if you came across it while investigating.
+
+Anchor each finding to the changed lines where the cost is introduced or increased. When the cost lies outside the diff, such as a second copy that must change in lockstep, say so in `description` and anchor the finding at the changed line that creates it.
+
 ## What Demonstration Means for This Role
 
 Maintainability is easy to argue and hard to prove, so this role holds itself to **concrete, checkable evidence of a cost that a future change will actually pay**. Taste, style preferences, and "this could be cleaner" are not evidence.
