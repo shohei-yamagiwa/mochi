@@ -347,3 +347,70 @@ func TestSQLiteStoreRelativePaths(t *testing.T) {
 		})
 	}
 }
+
+func TestSQLiteStoreRepoCredentialsCRUD(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer st.Close()
+
+	if _, err := st.GetRepoCredential(ctx, "owner", "repo", "gemini"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("GetRepoCredential missing = %v, want ErrNotFound", err)
+	}
+
+	if err := st.UpsertRepoCredential(ctx, &domain.RepoCredentialRecord{
+		RepoOwner:       "Shohei-Yamagiwa",
+		RepoName:        "Mochi",
+		Provider:        "GEMINI",
+		EncryptedAPIKey: []byte("cipher-1"),
+		Nonce:           []byte("nonce-1"),
+		BaseURL:         "",
+	}); err != nil {
+		t.Fatalf("UpsertRepoCredential: %v", err)
+	}
+
+	got, err := st.GetRepoCredential(ctx, "shohei-yamagiwa", "mochi", "gemini")
+	if err != nil {
+		t.Fatalf("GetRepoCredential: %v", err)
+	}
+	if string(got.EncryptedAPIKey) != "cipher-1" || got.RepoOwner != "shohei-yamagiwa" || got.RepoName != "mochi" || got.Provider != "gemini" {
+		t.Fatalf("unexpected credential record: %+v", got)
+	}
+
+	// Upsert overwrites encrypted key and base_url.
+	if err := st.UpsertRepoCredential(ctx, &domain.RepoCredentialRecord{
+		RepoOwner:       "shohei-yamagiwa",
+		RepoName:        "mochi",
+		Provider:        "gemini",
+		EncryptedAPIKey: []byte("cipher-2"),
+		Nonce:           []byte("nonce-2"),
+		BaseURL:         "https://example.invalid/v1",
+	}); err != nil {
+		t.Fatalf("UpsertRepoCredential overwrite: %v", err)
+	}
+	got2, err := st.GetRepoCredential(ctx, "SHOHEI-YAMAGIWA", "MOCHI", "gemini")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got2.EncryptedAPIKey) != "cipher-2" || got2.BaseURL != "https://example.invalid/v1" {
+		t.Fatalf("unexpected overwritten credential: %+v", got2)
+	}
+
+	// List summaries for repo.
+	list, err := st.ListRepoCredentials(ctx, "shohei-yamagiwa", "mochi")
+	if err != nil {
+		t.Fatalf("ListRepoCredentials: %v", err)
+	}
+	if len(list) != 1 || !list[0].HasAPIKey || list[0].Provider != "gemini" {
+		t.Fatalf("unexpected ListRepoCredentials: %+v", list)
+	}
+
+	if err := st.DeleteRepoCredential(ctx, "shohei-yamagiwa", "mochi", "gemini"); err != nil {
+		t.Fatalf("DeleteRepoCredential: %v", err)
+	}
+	if err := st.DeleteRepoCredential(ctx, "shohei-yamagiwa", "mochi", "gemini"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("second DeleteRepoCredential = %v, want ErrNotFound", err)
+	}
+}

@@ -23,7 +23,7 @@ import (
 	"github.com/shohei-yamagiwa/mochi/internal/tools"
 )
 
-const defaultSynthesizerMaxTurns = 3
+const defaultSynthesizerMaxTurns = 5
 
 var errSpecialistSandbox = errors.New("sandbox setup failed")
 
@@ -58,12 +58,16 @@ type RepoOverrideBundle struct {
 // RepoOverrideLoader fetches optional .mochi/ overrides from the target repository's base branch.
 type RepoOverrideLoader func(ctx context.Context, task *domain.TaskContext, baseSandbox sandbox.Sandbox, overridePath string) (*RepoOverrideBundle, error)
 
+// LLMRegistryResolver constructs a per-run LLM provider registry (for example from per-repo encrypted credentials).
+type LLMRegistryResolver func(ctx context.Context, task *domain.TaskContext, wf *domain.Workflow) (*llm.Registry, error)
+
 // Runner orchestrates base sandbox preparation, parallel specialist agent fan-out (Fork + errgroup),
 // deterministic diff coverage verification, Synthesizer execution, and OutputSink delivery.
 type Runner struct {
 	Store               store.Store
 	SandboxProvider     sandbox.Provider
 	LLMRegistry         *llm.Registry
+	LLMRegistryResolver LLMRegistryResolver
 	DefaultLLMProvider  llm.Provider
 	ToolRegistry        *tools.Registry
 	PromptEngine        *config.PromptEngine
@@ -85,6 +89,10 @@ func (r *Runner) Execute(ctx context.Context, task *domain.TaskContext, wf *doma
 	}
 	if wf == nil {
 		return nil, fmt.Errorf("runner: workflow must not be nil")
+	}
+
+	if promptDir := strings.TrimSpace(task.PromptDir); promptDir != "" {
+		defer func() { _ = os.RemoveAll(promptDir) }()
 	}
 
 	if strings.TrimSpace(task.RunID) == "" {
@@ -148,6 +156,13 @@ func (r *Runner) Execute(ctx context.Context, task *domain.TaskContext, wf *doma
 	}
 
 	promptEngine := r.PromptEngine
+	if taskPromptDir := strings.TrimSpace(task.PromptDir); taskPromptDir != "" {
+		if promptEngine != nil {
+			promptEngine = promptEngine.WithRepoDir(taskPromptDir)
+		} else {
+			promptEngine = config.NewPromptEngineWithRoots("", taskPromptDir)
+		}
+	}
 	if activeWf.RepoOverrides.Enabled && r.RepoOverrideLoader != nil {
 		overridePath := strings.TrimSpace(activeWf.RepoOverrides.Path)
 		if overridePath == "" {
@@ -199,6 +214,16 @@ func (r *Runner) Execute(ctx context.Context, task *domain.TaskContext, wf *doma
 		}
 	}
 
+	llmReg := r.LLMRegistry
+	if r.LLMRegistryResolver != nil {
+		resolvedReg, err := r.LLMRegistryResolver(ctx, task, activeWf)
+		if err != nil {
+			r.markRunFailedOrCancelled(ctx, task, runRec, startedSinks, err)
+			return nil, err
+		}
+		llmReg = resolvedReg
+	}
+
 	var baseSandbox sandbox.Sandbox
 	var destroyBaseOnce sync.Once
 	destroyBase := func() {
@@ -231,7 +256,7 @@ func (r *Runner) Execute(ctx context.Context, task *domain.TaskContext, wf *doma
 		idx := i
 		role := roleCfg
 		g.Go(func() error {
-			res, err := r.runSpecialistAgent(gctx, task, activeWf, role, baseSandbox, promptEngine, toolReg)
+			res, err := r.runSpecialistAgent(gctx, task, activeWf, role, baseSandbox, promptEngine, toolReg, llmReg)
 			if err != nil {
 				return err
 			}
@@ -286,7 +311,7 @@ func (r *Runner) Execute(ctx context.Context, task *domain.TaskContext, wf *doma
 		}
 	}
 
-	synthRun, report, artifactJSON, err := r.runSynthesizer(ctx, task, activeWf, promptEngine, specialistSlice, coverageReport)
+	synthRun, report, artifactJSON, err := r.runSynthesizer(ctx, task, activeWf, promptEngine, llmReg, specialistSlice, coverageReport)
 	if err != nil {
 		runErr := contextCauseOrErr(ctx, err)
 		r.markRunFailedOrCancelled(ctx, task, runRec, startedSinks, runErr)
@@ -352,6 +377,7 @@ func (r *Runner) runSpecialistAgent(
 	baseSandbox sandbox.Sandbox,
 	promptEngine *config.PromptEngine,
 	toolReg *tools.Registry,
+	llmReg *llm.Registry,
 ) (*SpecialistResult, error) {
 	failOrRecord := func(err error, ar *domain.AgentRunRecord, raw json.RawMessage, execs []*domain.ToolExecRecord) (*SpecialistResult, error) {
 		roleErr := fmt.Errorf("specialist agent %q: %w", role.Role, err)
@@ -401,7 +427,7 @@ func (r *Runner) runSpecialistAgent(
 	}
 	userPrompt := BuildSpecialistUserPrompt(task, role)
 
-	provider, err := r.resolveLLMProvider(role.LLM.Provider)
+	provider, err := r.resolveLLMProvider(llmReg, role.LLM.Provider)
 	if err != nil {
 		return failOrRecord(fmt.Errorf("resolve llm provider: %w", err), nil, nil, nil)
 	}
@@ -461,6 +487,7 @@ func (r *Runner) runSynthesizer(
 	task *domain.TaskContext,
 	wf *domain.Workflow,
 	promptEngine *config.PromptEngine,
+	llmReg *llm.Registry,
 	specialists []*SpecialistResult,
 	coverage *domain.CoverageReport,
 ) (*domain.AgentRunRecord, *output.ReviewReport, json.RawMessage, error) {
@@ -518,7 +545,7 @@ func (r *Runner) runSynthesizer(
 	}
 	userPrompt := BuildSynthesizerUserPrompt(task, specialists, coverage)
 
-	provider, err := r.resolveLLMProvider(wf.Synthesizer.LLM.Provider)
+	provider, err := r.resolveLLMProvider(llmReg, wf.Synthesizer.LLM.Provider)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("resolve synthesizer llm provider: %w", err)
 	}
@@ -573,11 +600,7 @@ func (r *Runner) runSynthesizer(
 		return agentRun, runErr
 	}
 
-	maxTurns := wf.Synthesizer.Budgets.MaxTurns
-	if maxTurns <= 0 {
-		maxTurns = defaultSynthesizerMaxTurns
-	}
-	maxTokens := wf.Synthesizer.Budgets.MaxTokens
+	maxTurns := defaultSynthesizerMaxTurns
 
 	messages := []llm.Message{
 		{
@@ -592,12 +615,7 @@ func (r *Runner) runSynthesizer(
 			return ar, nil, nil, err
 		}
 		if agentRun.TurnsUsed >= maxTurns {
-			err := fmt.Errorf("synthesizer: %w (%d)", ErrMaxTurnsExceeded, maxTurns)
-			ar, _ := finalizeSynth(domain.AgentRunStatusFailed, nil, err)
-			return ar, nil, nil, err
-		}
-		if maxTokens > 0 && (agentRun.InputTokens+agentRun.OutputTokens) >= maxTokens {
-			err := fmt.Errorf("synthesizer: %w (%d/%d)", ErrMaxTokensExceeded, agentRun.InputTokens+agentRun.OutputTokens, maxTokens)
+			err := fmt.Errorf("synthesizer exceeded max turns (%d)", maxTurns)
 			ar, _ := finalizeSynth(domain.AgentRunStatusFailed, nil, err)
 			return ar, nil, nil, err
 		}
@@ -673,11 +691,6 @@ func (r *Runner) runSynthesizer(
 		rawCandidate := extractSynthesizerJSON(resp)
 		report, valErr := validator.ValidateJSON(rawCandidate)
 		if valErr != nil {
-			if maxTokens > 0 && (agentRun.InputTokens+agentRun.OutputTokens) > maxTokens {
-				err := fmt.Errorf("synthesizer: %w (%d > %d)", ErrMaxTokensExceeded, agentRun.InputTokens+agentRun.OutputTokens, maxTokens)
-				ar, _ := finalizeSynth(domain.AgentRunStatusFailed, nil, err)
-				return ar, nil, nil, err
-			}
 			if agentRun.TurnsUsed >= maxTurns {
 				runErr := fmt.Errorf("synthesizer output validation failed after %d turns: %w", agentRun.TurnsUsed, valErr)
 				ar, _ := finalizeSynth(domain.AgentRunStatusFailed, nil, runErr)
@@ -732,12 +745,6 @@ func sanitizeSpecialistFailureSummary(sr *SpecialistResult) string {
 	}
 	if errors.Is(sr.Error, context.Canceled) || (sr.AgentRun != nil && sr.AgentRun.Status == domain.AgentRunStatusCancelled) {
 		return "failed (cancelled)"
-	}
-	if errors.Is(sr.Error, ErrMaxTurnsExceeded) {
-		return "failed (max_turns_exceeded)"
-	}
-	if errors.Is(sr.Error, ErrMaxTokensExceeded) {
-		return "failed (max_tokens_exceeded)"
 	}
 	if errors.Is(sr.Error, errSpecialistSandbox) {
 		return "failed (sandbox error)"
@@ -1069,15 +1076,15 @@ func (r *Runner) resolveSinks(wf *domain.Workflow) ([]output.OutputSink, error) 
 	return resolved, nil
 }
 
-func (r *Runner) resolveLLMProvider(providerName string) (llm.Provider, error) {
+func (r *Runner) resolveLLMProvider(llmReg *llm.Registry, providerName string) (llm.Provider, error) {
 	name := strings.TrimSpace(providerName)
-	if r.LLMRegistry != nil && name != "" {
-		if p, ok := r.LLMRegistry.Get(name); ok {
+	if llmReg != nil && name != "" {
+		if p, ok := llmReg.Get(name); ok {
 			return p, nil
 		}
 	}
 	if r.DefaultLLMProvider != nil {
-		if name == "" || r.DefaultLLMProvider.Name() == name || r.LLMRegistry == nil {
+		if name == "" || r.DefaultLLMProvider.Name() == name || llmReg == nil {
 			return r.DefaultLLMProvider, nil
 		}
 	}

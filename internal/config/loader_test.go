@@ -19,7 +19,7 @@ func repoRoot(t *testing.T) string {
 
 func TestLoadDefaultPRReviewWorkflow(t *testing.T) {
 	root := repoRoot(t)
-	wfPath := filepath.Join(root, "configs", "workflows", "pr-review.yaml")
+	wfPath := filepath.Join(root, ".mochi", "workflows", "pr-review.yaml")
 
 	wf, err := config.LoadWorkflowFile(wfPath, root)
 	if err != nil {
@@ -52,13 +52,29 @@ func TestLoadDefaultPRReviewWorkflow(t *testing.T) {
 	if !strings.Contains(yamlText, "name: pr-review") {
 		t.Fatalf("marshaled YAML missing workflow name:\n%s", yamlText)
 	}
+
+	smallPath := filepath.Join(root, ".mochi", "workflows", "pr-review-small.yaml")
+	smallWf, err := config.LoadWorkflowFile(smallPath, root)
+	if err != nil {
+		t.Fatalf("LoadWorkflowFile(pr-review-small) failed: %v", err)
+	}
+	if len(smallWf.Agents) != 1 || smallWf.Agents[0].Role != "correctness" {
+		t.Fatalf("unexpected small workflow agents: %+v", smallWf.Agents)
+	}
 }
 
 func TestMergeRepoOverridesSecurityControls(t *testing.T) {
 	root := repoRoot(t)
-	wf, err := config.LoadWorkflowFile(filepath.Join(root, "configs", "workflows", "pr-review.yaml"), root)
+	wf, err := config.LoadWorkflowFile(filepath.Join(root, ".mochi", "workflows", "pr-review.yaml"), root)
 	if err != nil {
 		t.Fatalf("LoadWorkflowFile failed: %v", err)
+	}
+	wf.RepoOverrides = domain.RepoOverridesConfig{
+		Enabled:            true,
+		Path:               ".mochi/config.yaml",
+		AllowCustomPrompts: true,
+		AllowCustomImages:  true,
+		AllowCustomModels:  true,
 	}
 
 	t.Run("rejects custom sandbox image when allow_custom_images is false", func(t *testing.T) {
@@ -75,9 +91,6 @@ sandbox:
 	})
 
 	t.Run("allows custom sandbox snapshot when allow_custom_images is true", func(t *testing.T) {
-		if !wf.RepoOverrides.AllowCustomImages {
-			t.Fatal("packaged pr-review workflow must allow custom images so owner-run repos can select their language snapshot")
-		}
 		override := []byte(`
 sandbox:
   default_snapshot: "mochi-review-java"
@@ -194,16 +207,30 @@ agents:
 		}
 	})
 
-	t.Run("rejects adding new webhook sink or external url or verdict_mode override", func(t *testing.T) {
+	t.Run("rejects adding new webhook sink or external url override", func(t *testing.T) {
 		for _, override := range []string{
 			"output:\n  sinks:\n    - type: webhook\n      url: \"https://evil.example/hook\"\n",
 			"output:\n  sinks:\n    - type: github_pr_review\n      url: \"https://evil.example/hook\"\n",
-			"output:\n  sinks:\n    - type: github_pr_review\n      verdict_mode: \"enforce\"\n",
 		} {
 			_, err := config.MergeRepoOverrides(wf, []byte(override))
 			if !errors.Is(err, config.ErrDisallowedOverrideField) {
 				t.Fatalf("override %q: expected ErrDisallowedOverrideField, got %v", override, err)
 			}
+		}
+	})
+
+	t.Run("rejects removed verdict_mode field in strict yaml", func(t *testing.T) {
+		override := "output:\n  sinks:\n    - type: github_pr_review\n      verdict_mode: \"enforce\"\n"
+		if _, err := config.MergeRepoOverrides(wf, []byte(override)); err == nil {
+			t.Fatal("expected strict yaml error for removed verdict_mode field in override, got nil")
+		}
+		serverYAML, err := os.ReadFile(filepath.Join(root, ".mochi", "workflows", "pr-review.yaml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		withVerdictMode := string(serverYAML) + "      verdict_mode: \"comment_only\"\n"
+		if _, err := config.ParseWorkflow([]byte(withVerdictMode)); err == nil {
+			t.Fatal("expected strict yaml error for removed verdict_mode field in workflow, got nil")
 		}
 	})
 
@@ -239,12 +266,10 @@ input:
 		}
 	})
 
-	t.Run("clamps unset budgets and persists prompt_from_repo", func(t *testing.T) {
-		// Exercise unset-budget ceilings independently of the deployment preset's caps.
+	t.Run("merges run_timeout without clamping, clamps max_output_tokens, and persists prompt_from_repo", func(t *testing.T) {
 		base := *wf
 		base.Agents = append([]domain.RoleConfig(nil), wf.Agents...)
 		base.Agents[4].LLM.MaxOutputTokens = 0
-		base.Synthesizer.Budgets.MaxTokens = 0
 		override := []byte(`
 agents:
   - role: correctness
@@ -253,12 +278,13 @@ agents:
       reasoning_effort: low
     tools: ["read_file", "submit_output"]
     budgets:
-      max_turns: 999
       run_timeout: 2m
   - role: test-runner
     llm:
       max_output_tokens: 999999
       reasoning_effort: high
+    budgets:
+      run_timeout: 45m
   - role: performance-architecture
     enabled: false
   - role: maintainability
@@ -266,7 +292,7 @@ agents:
 synthesizer:
   prompt_file: ".mochi/prompts/synth.md"
   budgets:
-    max_tokens: 99999999
+    run_timeout: 5m
 output:
   sinks:
     - type: github_pr_review
@@ -282,9 +308,6 @@ output:
 		if len(merged.Agents) != 3 {
 			t.Fatalf("expected 3 agents after disabling performance-architecture and maintainability, got %d", len(merged.Agents))
 		}
-		if merged.Agents[0].Budgets.MaxTurns != 15 {
-			t.Fatalf("expected max_turns clamped to base 15, got %d", merged.Agents[0].Budgets.MaxTurns)
-		}
 		if merged.Agents[0].Budgets.RunTimeout.Std() != 2*time.Minute {
 			t.Fatalf("expected run_timeout lowered to 2m, got %v", merged.Agents[0].Budgets.RunTimeout.Std())
 		}
@@ -297,15 +320,18 @@ output:
 		if !merged.Synthesizer.PromptFromRepo || merged.Synthesizer.PromptFile != ".mochi/prompts/synth.md" {
 			t.Fatalf("unexpected synthesizer custom prompt metadata: %+v", merged.Synthesizer)
 		}
-		// test-runner is at index 2 after performance-architecture is disabled.
+		// test-runner is at index 2 after performance-architecture and maintainability are disabled.
 		if merged.Agents[2].LLM.MaxOutputTokens != 16384 {
 			t.Fatalf("expected unset max_output_tokens clamped to ceiling 16384, got %d", merged.Agents[2].LLM.MaxOutputTokens)
 		}
 		if merged.Agents[2].LLM.ReasoningEffort != "high" {
 			t.Fatalf("expected test-runner reasoning_effort raised to high, got %q", merged.Agents[2].LLM.ReasoningEffort)
 		}
-		if merged.Synthesizer.Budgets.MaxTokens != 200000 {
-			t.Fatalf("expected unset synthesizer max_tokens clamped to ceiling 200000, got %d", merged.Synthesizer.Budgets.MaxTokens)
+		if merged.Agents[2].Budgets.RunTimeout.Std() != 45*time.Minute {
+			t.Fatalf("expected test-runner run_timeout raised to 45m without clamping, got %v", merged.Agents[2].Budgets.RunTimeout.Std())
+		}
+		if merged.Synthesizer.Budgets.RunTimeout.Std() != 5*time.Minute {
+			t.Fatalf("expected synthesizer run_timeout raised to 5m without clamping, got %v", merged.Synthesizer.Budgets.RunTimeout.Std())
 		}
 		if len(merged.Agents[0].Tools) != 2 {
 			t.Fatalf("expected subset tools, got %v", merged.Agents[0].Tools)
@@ -333,7 +359,7 @@ output:
 			t.Fatal("expected ParseWorkflow to reject prompt_from_repo=true in server workflow YAML")
 		}
 
-		if wf.Agents[0].Budgets.MaxTurns != 15 || len(wf.Agents) != 5 || wf.Agents[0].PromptFromRepo {
+		if wf.Agents[0].Budgets.RunTimeout.Std() != 15*time.Minute || len(wf.Agents) != 5 || wf.Agents[0].PromptFromRepo {
 			t.Fatal("base workflow was mutated by MergeRepoOverrides")
 		}
 	})
@@ -341,7 +367,7 @@ output:
 
 func TestPromptEngineSecurityAndRendering(t *testing.T) {
 	root := repoRoot(t)
-	wf, err := config.LoadWorkflowFile(filepath.Join(root, "configs", "workflows", "pr-review.yaml"), root)
+	wf, err := config.LoadWorkflowFile(filepath.Join(root, ".mochi", "workflows", "pr-review.yaml"), root)
 	if err != nil {
 		t.Fatalf("LoadWorkflowFile failed: %v", err)
 	}
@@ -486,10 +512,11 @@ func TestPromptEngineSecurityAndRendering(t *testing.T) {
 
 func TestReasoningEffortValidation(t *testing.T) {
 	root := repoRoot(t)
-	wf, err := config.LoadWorkflowFile(filepath.Join(root, "configs", "workflows", "pr-review.yaml"), root)
+	wf, err := config.LoadWorkflowFile(filepath.Join(root, ".mochi", "workflows", "pr-review.yaml"), root)
 	if err != nil {
 		t.Fatalf("LoadWorkflowFile: %v", err)
 	}
+	wf.RepoOverrides.Enabled = true
 
 	for _, valid := range []string{"minimal", "low", "medium", "high", "xhigh", "max"} {
 		override := []byte("agents:\n  - role: correctness\n    llm:\n      reasoning_effort: " + valid + "\n")
@@ -514,5 +541,103 @@ func TestReasoningEffortValidation(t *testing.T) {
 		if _, err := config.MergeRepoOverrides(wf, override); err == nil {
 			t.Fatalf("expected reasoning_effort %q to be rejected by MergeRepoOverrides", invalid)
 		}
+	}
+}
+
+func TestParseRepoWorkflowAndEmbeddedPrompts(t *testing.T) {
+	rawYAML := []byte(`
+version: "1"
+name: feature-review
+input:
+  adapter: github_pr
+  triggers:
+    events: ["opened", "synchronize"]
+    base_branches: ["develop", "release/*"]
+    head_branches: ["feature/*", "fix/*"]
+    comment_command: "/mochi review-feature"
+    ignore_drafts: true
+sandbox:
+  provider: daytona
+  default_snapshot: mochi-review
+agents:
+  - role: correctness
+    prompt_file: "configs/prompts/correctness.md"
+    llm:
+      provider: openai
+      model: gpt-5
+    sandbox:
+      enabled: true
+    tools: ["read_file", "submit_output"]
+  - role: security
+    prompt_file: ".mochi/prompts/security-custom.md"
+    llm:
+      provider: anthropic
+      model: claude-sonnet
+    sandbox:
+      enabled: true
+    tools: ["read_file", "submit_output"]
+synthesizer:
+  prompt_file: "configs/prompts/synthesizer.md"
+  llm:
+    provider: gemini
+    model: gemini-3.8-flash
+output:
+  sinks:
+    - type: github_pr_review
+`)
+
+	wf, err := config.ParseRepoWorkflow(rawYAML)
+	if err != nil {
+		t.Fatalf("ParseRepoWorkflow: %v", err)
+	}
+	if len(wf.Input.Triggers.BaseBranches) != 2 || wf.Input.Triggers.BaseBranches[1] != "release/*" {
+		t.Fatalf("unexpected BaseBranches: %+v", wf.Input.Triggers.BaseBranches)
+	}
+	if len(wf.Input.Triggers.HeadBranches) != 2 || wf.Input.Triggers.HeadBranches[0] != "feature/*" {
+		t.Fatalf("unexpected HeadBranches: %+v", wf.Input.Triggers.HeadBranches)
+	}
+	if wf.Agents[0].PromptFromRepo {
+		t.Fatal("built-in prompt configs/prompts/correctness.md must have PromptFromRepo=false")
+	}
+	if !wf.Agents[1].PromptFromRepo || wf.Agents[1].PromptFile != ".mochi/prompts/security-custom.md" {
+		t.Fatalf("repo prompt must have PromptFromRepo=true: %+v", wf.Agents[1])
+	}
+	if wf.Synthesizer.PromptFromRepo {
+		t.Fatal("built-in synthesizer prompt must have PromptFromRepo=false")
+	}
+
+	// Verify embedded prompt fallback works even without a serverDir on disk.
+	repoDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repoDir, ".mochi", "prompts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".mochi", "prompts", "security-custom.md"), []byte("Custom security prompt for {{ .Task.Changeset.RepoName }}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	engine := config.NewPromptEngineWithRoots(t.TempDir(), repoDir)
+	task := &domain.TaskContext{
+		RunID:        "run-emb-1",
+		WorkflowName: wf.Name,
+		Changeset:    &domain.ChangesetSpec{RepoOwner: "owner", RepoName: "repo"},
+	}
+	out0, err := engine.RenderRole(wf.Agents[0], config.NewPromptData(task, wf, &wf.Agents[0]))
+	if err != nil {
+		t.Fatalf("RenderRole embedded fallback: %v", err)
+	}
+	if strings.TrimSpace(out0) == "" {
+		t.Fatal("embedded prompt rendered empty")
+	}
+	out1, err := engine.RenderRole(wf.Agents[1], config.NewPromptData(task, wf, &wf.Agents[1]))
+	if err != nil {
+		t.Fatalf("RenderRole repo prompt: %v", err)
+	}
+	if out1 != "Custom security prompt for repo" {
+		t.Fatalf("unexpected repo prompt render: %q", out1)
+	}
+
+	// Reject unknown non-.mochi/ prompt path.
+	badYAML := strings.ReplaceAll(string(rawYAML), "configs/prompts/correctness.md", "configs/prompts/does-not-exist.md")
+	if _, err := config.ParseRepoWorkflow([]byte(badYAML)); err == nil {
+		t.Fatal("expected ParseRepoWorkflow to reject non-existent embedded prompt")
 	}
 }

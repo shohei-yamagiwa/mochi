@@ -1,9 +1,10 @@
 # Deployment and operations
 
-Mochi needs a continuously running server, persistent SQLite storage, a Daytona
-account, and credentials for the configured LLM providers. The supplied image
-works with [Compose](../compose.yaml) or the [Render Blueprint](../render.yaml).
-Use one server instance: the queue and cancellation state live in memory.
+Mochi needs a continuously running server, persistent SQLite storage, a shared
+Daytona account, a 32-byte `MOCHI_MASTER_KEY`, and per-repository LLM API keys
+registered in Mochi. The supplied image works with [Compose](../compose.yaml) or
+the [Render Blueprint](../render.yaml). Use one server instance: the queue and
+cancellation state live in memory.
 
 ## Configure a GitHub App
 
@@ -18,7 +19,7 @@ Grant these repository permissions:
 | Permission | Access | Purpose |
 | --- | --- | --- |
 | Metadata | Read | Repository metadata |
-| Contents | Read | Source files and read-only clone tokens |
+| Contents | Read | Repository workflows, custom prompts, and clone tokens |
 | Pull requests | Read and write | PR metadata, reviews, and inline comments |
 | Checks | Read and write | Check Runs |
 | Issues | Read | Issue comment event subscription |
@@ -28,15 +29,15 @@ App ID, download a generated private key, and install the App on the repositorie
 to review. Mochi obtains the installation ID from webhook events. After changing
 App permissions, approve the updated permissions at the installation.
 
-Both presets review open, non-draft PRs on `opened`, `synchronize`, `reopened`,
-and `ready_for_review`. An owner, member, or collaborator can comment
-`/mochi review` to rerun a review. For comment-only triggering, disable the App's
-Pull request event subscription. `events: []` restores the default events rather
-than disabling them.
+Each installed repository configures its own trigger rules under
+`.mochi/workflows/*.yaml` on its base branch. To enable comment-only triggering
+for a workflow without automatic PR events, set `events: []` in that workflow's
+`input.triggers`.
 
 ## Prepare Daytona snapshots
 
-Create a Daytona API key, then use the Daytona CLI from the repository root:
+Create a shared Daytona API key for the server, then use the Daytona CLI from
+the repository root:
 
 ```sh
 daytona login
@@ -46,23 +47,22 @@ daytona snapshot create mochi-review-go \
 daytona snapshot list
 ```
 
-Wait until the snapshot is available. The full preset uses `mochi-review-go`,
-which includes Go and basic review tools. The small preset uses `mochi-review`;
-create it from `deploy/sandbox/Dockerfile` instead. Add the target repository's
-language runtimes and build tools when needed. If you change a snapshot name,
-update `sandbox.default_snapshot` in the workflow too.
+Wait until the snapshot is available. This repository's full workflow uses
+`mochi-review-go` (Go and basic review tools), and its small workflow uses
+`mochi-review` (`deploy/sandbox/Dockerfile`). Add each repository's language
+runtimes and build tools when needed, and reference the snapshot name in that
+repository's `.mochi/workflows/*.yaml` (`sandbox.default_snapshot`).
 
 Changing a Dockerfile under `deploy/sandbox/` does not update an existing
-snapshot. Delete the snapshot and create it again under the same name — the
-workflow references snapshots by name, so no configuration change is needed.
-Wait until the recreated snapshot is active, then smoke-test it once by
-starting a sandbox from it and checking the toolchain (for example
-`go version`) before relying on it for reviews.
+snapshot. Delete the snapshot and create it again under the same name — workflows
+reference snapshots by name, so no configuration change is needed. Wait until the
+recreated snapshot is active, then smoke-test it once by starting a sandbox from
+it and checking the toolchain (for example `go version`).
 
-The full preset creates five independent sandboxes per concurrent workflow; the
-small preset creates one. Ensure your Daytona quota permits this concurrency and
-allocated resources. Both presets disable forking and work with container
-snapshots. Enabling `fork_from_base` requires a compatible VM snapshot; see
+Ensure your Daytona quota permits the specialist concurrency configured by your
+repositories' workflows (`fork_from_base: false` creates one sandbox per
+sandbox-enabled specialist). Enabling `fork_from_base` requires a compatible VM
+snapshot; see
 [Daytona's sandbox documentation](https://www.daytona.io/docs/en/sandboxes/).
 
 Use the Dockerfiles under `deploy/sandbox/` for snapshots; the root `Dockerfile`
@@ -79,31 +79,57 @@ Use hosting secrets or, for Compose, copy [`.env.example`](../.env.example) to
 | `MOCHI_GITHUB_APP_ID` | Numeric GitHub App ID, not the Client ID |
 | `MOCHI_GITHUB_PRIVATE_KEY` | Full PEM private key with actual line breaks |
 | `GITHUB_WEBHOOK_SECRET` | Same secret as the GitHub App webhook |
-| `MOCHI_API_TOKEN` | Separate random token for inspection, cancellation, and generic triggers |
-| `DAYTONA_API_KEY` | Daytona API key |
-| `GEMINI_API_KEY` | Gemini key for both presets; `GOOGLE_API_KEY` is an alternative |
+| `MOCHI_API_TOKEN` | Random bearer token for credential management, inspection, cancellation, and generic triggers |
+| `MOCHI_MASTER_KEY` | 32-byte key (`openssl rand -hex 32` or base64) used to encrypt per-repository LLM API keys in SQLite |
+| `DAYTONA_API_KEY` | Shared Daytona API key |
 | `DAYTONA_TARGET` | Optional Daytona target |
 | `PORT` | Container HTTP port; defaults to `8080` |
 | `MOCHI_DB_PATH` | SQLite path; container default is `/data/mochi.db` |
-| `MOCHI_WORKFLOW` | Container workflow path; defaults to `configs/workflows/pr-review.yaml` |
 | `MOCHI_WORKERS` | Container workflow concurrency; defaults to `1` |
 | `MOCHI_QUEUE_SIZE` | Container scheduler queue capacity; defaults to `16` |
+| `MOCHI_WORKFLOW` | Optional comma-separated static workflow path(s); leave unset for per-repo `.mochi/workflows/*.yaml` mode |
 
-Generate the webhook secret and API token separately with `openssl rand -hex 32`.
-The Render Blueprint generates the API token and requests the remaining required
-secrets. For Compose, retain the single quotes around the multiline PEM shown in
-`.env.example`; in a hosting secret field, paste the PEM without the outer quotes.
-Alternatively, set `MOCHI_GITHUB_PRIVATE_KEY_PATH` to a mounted PEM file instead of
-setting `MOCHI_GITHUB_PRIVATE_KEY`.
+Generate `GITHUB_WEBHOOK_SECRET`, `MOCHI_API_TOKEN`, and `MOCHI_MASTER_KEY`
+separately with `openssl rand -hex 32`. Keep a secure backup of `MOCHI_MASTER_KEY`
+alongside your SQLite backups: without it, stored per-repository API keys cannot
+be decrypted.
 
-GitHub App deployments do not need `GITHUB_TOKEN` or `GH_TOKEN`. Both presets use
-Gemini only; other provider credentials are described in
-[configuration](configuration.md#llm-providers). `GEMINI_API_KEY` takes precedence
-over `GOOGLE_API_KEY` when both are set.
+The Render Blueprint generates `MOCHI_API_TOKEN` and requests the remaining
+required secrets. For Compose, retain the single quotes around the multiline PEM
+shown in `.env.example`; in a hosting secret field, paste the PEM without the
+outer quotes. Alternatively, set `MOCHI_GITHUB_PRIVATE_KEY_PATH` to a mounted PEM
+file instead of setting `MOCHI_GITHUB_PRIVATE_KEY`.
 
-`MOCHI_WORKFLOW`, `MOCHI_WORKERS`, `MOCHI_QUEUE_SIZE`, and `PORT` are interpreted by
-the container entrypoint. For a standalone binary, use the corresponding
+Server-level LLM provider environment variables (`GEMINI_API_KEY`,
+`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) are **not** used by `mochi serve`. Every
+repository must have its own provider API key registered in Mochi.
+
+`MOCHI_WORKERS`, `MOCHI_QUEUE_SIZE`, and `PORT` are interpreted by the container
+entrypoint. For a standalone binary, use the corresponding
 [`serve` flags](usage.md#start-the-server). The binary does not load `.env` files.
+
+## Register per-repository LLM API keys
+
+After starting the server, register an encrypted API key for each repository and
+each provider referenced by its `.mochi/workflows/*.yaml`:
+
+```sh
+# Via the HTTP API on the deployed server:
+./mochi credentials set owner/repo gemini \
+  --server https://mochi.example.com \
+  --api-token "$MOCHI_API_TOKEN" \
+  --api-key-stdin
+
+# Or directly against the container's local SQLite database:
+docker compose exec -T mochi mochi credentials set owner/repo gemini --api-key-stdin
+```
+
+Inspect configured providers (keys are never returned) or remove a key:
+
+```sh
+./mochi credentials list owner/repo --server https://mochi.example.com --api-token "$MOCHI_API_TOKEN"
+./mochi credentials delete owner/repo gemini --server https://mochi.example.com --api-token "$MOCHI_API_TOKEN"
+```
 
 ## Start with Docker Compose
 
@@ -111,16 +137,16 @@ After configuring secrets and preparing the snapshot:
 
 ```sh
 docker compose build
-docker compose run --rm mochi validate --runtime configs/workflows/pr-review.yaml
+docker compose run --rm mochi validate --runtime
 docker compose up -d
 curl --fail http://localhost:8080/readyz
 docker compose logs --tail=100 mochi
 ```
 
-`validate --runtime` checks local configuration, provider credential presence,
-GitHub authentication setup, and HTTP authentication settings. It makes no
-external API calls and does not verify key validity, model access, snapshot
-availability, or remote permissions. The entrypoint runs it before serving.
+`validate --runtime` (without workflow paths) checks server deployment
+readiness: GitHub authentication setup, HTTP webhook/API auth secrets, shared
+Daytona credentials, and `MOCHI_MASTER_KEY`. It makes no external API calls. The
+container entrypoint runs it before serving.
 
 Compose binds to localhost. Configure a public HTTPS reverse proxy or tunnel to
 receive GitHub webhooks. SQLite is stored in the `mochi-data` volume. The entrypoint
@@ -135,11 +161,15 @@ and uses `/readyz` for health checks. Review current
 [Render pricing](https://render.com/pricing), region, and disk capacity before
 creating the service; LLM and Daytona usage are billed separately.
 
-Enter the required secrets, deploy, and verify `/readyz` returns HTTP 200. Update
-the GitHub App webhook URL to the public HTTPS URL plus `/webhooks/github`, and
-activate delivery. The Blueprint enables automatic deployments after the linked
-`main` commit's CI checks pass (`autoDeployTrigger: checksPass`). Pushes to
-`develop` run CI but do not deploy production.
+Enter the required secrets (including `MOCHI_MASTER_KEY`), deploy, and verify
+`/readyz` returns HTTP 200. Update the GitHub App webhook URL to the public HTTPS
+URL plus `/webhooks/github`, and activate delivery. Then register per-repository
+API keys against `https://<your-render-service>.onrender.com` using
+`mochi credentials set --server ...` with `MOCHI_API_TOKEN`.
+
+The Blueprint enables automatic deployments after the linked `main` commit's CI
+checks pass (`autoDeployTrigger: checksPass`). Pushes to `develop` run CI but do
+not deploy production.
 
 ### Enable continuous deployment on an existing service
 
@@ -169,24 +199,22 @@ succeeds, a deploy starts without Manual Deploy, and that same commit becomes
 `live` with `/readyz` returning HTTP 200. Snapshot image changes still require
 separate creation in Daytona; Render CD does not rebuild Daytona snapshots.
 
-To select another preset, first prepare its snapshot, then update
-`MOCHI_WORKFLOW` and redeploy while no reviews are running or queued. Existing
-service environment values take precedence over image defaults. On other hosts,
-provide the same persistent storage and continuously running single instance.
-
 ## Verify a deployment
 
 Redeliver a GitHub App ping and confirm an HTTP 200 `ignored` response. Then open
-a small non-draft PR and check that a review starts automatically. Add a commit
-to verify reruns; verify drafts are skipped and marking a PR ready starts a review.
-These checks call external APIs and publish to the test PR.
+a small non-draft PR targeting a branch matched by your repository's
+`.mochi/workflows/*.yaml` and check that a review starts automatically. Add a
+commit to verify reruns; verify drafts are skipped and marking a PR ready starts
+a review. These checks call external APIs and publish to the test PR.
 
-Confirm the Check Run and review identify the intended head SHA, all expected
-specialist results are present, and their sandboxes are removed after completion.
-For the test runner, inspect `test_execution` and any `skipped_reasons`; a
-completed report does not prove tests ran. Verify unauthenticated
-`GET /api/v1/runs` returns 401 and an authenticated request succeeds. After a
-redeploy, confirm past runs remain available through the API or `mochi inspect`.
+Confirm the Check Run (`Mochi Code Review (<workflow_name>)`) and review
+identify the intended head SHA, all expected specialist results are present, and
+their sandboxes are removed after completion. For the test runner, inspect
+`test_execution` and any `skipped_reasons`; a completed report does not prove
+tests ran. Verify unauthenticated `GET /api/v1/runs` and
+`GET /api/v1/repos/{owner}/{repo}/credentials` return 401 and authenticated
+requests succeed. After a redeploy, confirm past runs and encrypted credentials
+remain available.
 
 HTTP 202 acknowledges a webhook; it does not mean review completion. Inspect logs,
 Check Runs, and persisted runs for later failures. `/readyz` checks scheduler

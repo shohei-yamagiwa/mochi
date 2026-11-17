@@ -2,12 +2,33 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
+	"github.com/shohei-yamagiwa/mochi/internal/credentials"
 	"github.com/shohei-yamagiwa/mochi/internal/domain"
 )
 
-// validateRuntimeWorkflow checks local configuration without provisioning sandboxes,
+// validateServerRuntime checks server deployment readiness without calling external APIs.
+// In server mode, per-repository LLM credentials are stored encrypted via MOCHI_MASTER_KEY,
+// so server-level LLM API keys and static workflow files are not required.
+func validateServerRuntime() error {
+	if _, err := buildGitHubClientFactoryFromEnv(true); err != nil {
+		return err
+	}
+	if err := validateServeAuthConfig(true, envAny("GITHUB_WEBHOOK_SECRET"), envAny("MOCHI_TRIGGER_SECRET"), envAny("MOCHI_API_TOKEN"), false); err != nil {
+		return err
+	}
+	if envAny("DAYTONA_API_KEY", "DAYTONA_JWT_TOKEN") == "" {
+		return fmt.Errorf("server deployment requires shared DAYTONA_API_KEY or DAYTONA_JWT_TOKEN")
+	}
+	if _, err := credentials.ParseMasterKey(os.Getenv("MOCHI_MASTER_KEY")); err != nil {
+		return fmt.Errorf("server deployment: %w", err)
+	}
+	return nil
+}
+
+// validateRuntimeWorkflow checks local CLI configuration without provisioning sandboxes,
 // calling an LLM, or publishing to GitHub. Remote permissions/model availability
 // still need an end-to-end smoke test after deployment.
 func validateRuntimeWorkflow(wf *domain.Workflow) error {

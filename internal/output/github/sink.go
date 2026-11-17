@@ -35,6 +35,7 @@ func WithCheckName(name string) Option {
 	return func(s *Sink) {
 		if trimmed := strings.TrimSpace(name); trimmed != "" {
 			s.checkName = trimmed
+			s.customCheckName = true
 		}
 	}
 }
@@ -95,10 +96,11 @@ func (t *checkRunTracker) delete(runID string) {
 // Sink implements output.OutputSink (and output.ConfigurableSink) by publishing
 // GitHub Check Runs, diff-mapped inline PR review comments, and collapsible coverage tables.
 type Sink struct {
-	clients   ghinput.ClientFactory
-	checkName string
-	cfg       domain.SinkConfig
-	tracker   *checkRunTracker
+	clients         ghinput.ClientFactory
+	checkName       string
+	customCheckName bool
+	cfg             domain.SinkConfig
+	tracker         *checkRunTracker
 }
 
 var (
@@ -120,7 +122,6 @@ func NewSink(clients ghinput.ClientFactory, opts ...Option) (*Sink, error) {
 			IncludeCoverageSummary: true,
 			MinSeverity:            string(output.SeverityLow),
 			MinConfidence:          0.7,
-			VerdictMode:            "comment_only",
 		},
 		tracker: &checkRunTracker{
 			ids: make(map[string]int64),
@@ -146,8 +147,21 @@ func (s *Sink) WithConfig(cfg domain.SinkConfig) output.OutputSink {
 	cp.cfg = cfg
 	if name, ok := cfg.Options["check_name"].(string); ok && strings.TrimSpace(name) != "" {
 		cp.checkName = strings.TrimSpace(name)
+		cp.customCheckName = true
 	}
 	return &cp
+}
+
+func (s *Sink) effectiveCheckName(task *domain.TaskContext) string {
+	if s.customCheckName {
+		return s.checkName
+	}
+	if task != nil {
+		if wfName := strings.TrimSpace(task.WorkflowName); wfName != "" {
+			return fmt.Sprintf("%s (%s)", s.checkName, wfName)
+		}
+	}
+	return s.checkName
 }
 
 // OnRunStarted creates an in-progress GitHub Check Run for the PR head commit.
@@ -168,7 +182,7 @@ func (s *Sink) OnRunStarted(ctx context.Context, task *domain.TaskContext) error
 	}
 
 	cr, _, err := client.Checks.CreateCheckRun(ctx, target.owner, target.repo, github.CreateCheckRunOptions{
-		Name:       s.checkName,
+		Name:       s.effectiveCheckName(task),
 		HeadSHA:    target.headSHA,
 		ExternalID: github.Ptr(task.RunID),
 		Status:     github.Ptr("in_progress"),
@@ -275,7 +289,7 @@ func (s *Sink) Publish(ctx context.Context, task *domain.TaskContext, artifact j
 	if hasCheckRun && checkRunID > 0 {
 		conclusion := s.resolveCheckConclusion(report.Verdict)
 		_, _, err := client.Checks.UpdateCheckRun(ctx, target.owner, target.repo, checkRunID, github.UpdateCheckRunOptions{
-			Name:        s.checkName,
+			Name:        s.effectiveCheckName(task),
 			Status:      github.Ptr("completed"),
 			Conclusion:  github.Ptr(conclusion),
 			CompletedAt: &github.Timestamp{Time: time.Now().UTC()},
@@ -330,7 +344,7 @@ func (s *Sink) OnRunFailed(ctx context.Context, task *domain.TaskContext, runErr
 	}
 
 	_, _, updateErr := client.Checks.UpdateCheckRun(ctx, target.owner, target.repo, checkRunID, github.UpdateCheckRunOptions{
-		Name:        s.checkName,
+		Name:        s.effectiveCheckName(task),
 		Status:      github.Ptr("completed"),
 		Conclusion:  github.Ptr(conclusion),
 		CompletedAt: &github.Timestamp{Time: time.Now().UTC()},
@@ -412,32 +426,25 @@ func (s *Sink) createPRReviewWithFallbacks(
 }
 
 func (s *Sink) resolveReviewEvent(verdict output.Verdict) string {
-	if strings.EqualFold(strings.TrimSpace(s.cfg.VerdictMode), "enforce") {
-		switch verdict {
-		case output.VerdictApprove:
-			return "APPROVE"
-		case output.VerdictRequestChanges:
-			return "REQUEST_CHANGES"
-		}
+	switch verdict {
+	case output.VerdictApprove:
+		return "APPROVE"
+	case output.VerdictRequestChanges:
+		return "REQUEST_CHANGES"
+	default:
+		return "COMMENT"
 	}
-	return "COMMENT"
 }
 
 func (s *Sink) resolveCheckConclusion(verdict output.Verdict) string {
-	if strings.EqualFold(strings.TrimSpace(s.cfg.VerdictMode), "enforce") {
-		switch verdict {
-		case output.VerdictApprove:
-			return "success"
-		case output.VerdictRequestChanges:
-			return "failure"
-		default:
-			return "neutral"
-		}
-	}
-	if verdict == output.VerdictApprove {
+	switch verdict {
+	case output.VerdictApprove:
 		return "success"
+	case output.VerdictRequestChanges:
+		return "failure"
+	default:
+		return "neutral"
 	}
-	return "neutral"
 }
 
 func filterFindings(findings []output.Finding, minSev string, minConf float64) (kept []output.Finding, dropped int) {

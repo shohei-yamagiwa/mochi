@@ -100,11 +100,6 @@ func (t *gitDiffTool) Execute(ctx context.Context, execCtx ExecutionContext, raw
 		cmdParts = append(cmdParts, "--", shellQuote(cleanPath))
 	}
 
-	timeout := execCtx.CommandTimeout
-	if timeout <= 0 {
-		timeout = defaultCommandTimeout
-	}
-
 	maxBytes := t.maxBytes
 	if maxBytes <= 0 {
 		maxBytes = defaultMaxOutputBytes
@@ -112,7 +107,6 @@ func (t *gitDiffTool) Execute(ctx context.Context, execCtx ExecutionContext, raw
 
 	res, err := execCtx.Sandbox.Exec(ctx, sandbox.ExecRequest{
 		Command: strings.Join(cmdParts, " "),
-		Timeout: timeout,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("git_diff: %w", err)

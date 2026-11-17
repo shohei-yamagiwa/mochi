@@ -1,20 +1,16 @@
 # Small preset: one specialist + synthesizer, one LLM provider.
 # Create the mochi-review snapshot in Daytona before enabling PR events.
 version: "1"
-name: pr-review
-description: Small GitHub App deployment with one correctness specialist
+name: pr-review-small
+description: Small GitHub App workflow with one correctness specialist
 input:
   adapter: github_pr
   triggers:
     # Subscribe to pull_request and issue_comment in the GitHub App.
     events: [opened, synchronize, reopened, ready_for_review]
-    comment_command: "/mochi review"
+    base_branches: [develop]
+    comment_command: "/mochi review-small"
     ignore_drafts: true
-repo_overrides:
-  enabled: false
-  allow_custom_prompts: false
-  allow_custom_images: false
-  allow_custom_models: false
 sandbox:
   provider: daytona
   default_snapshot: mochi-review
@@ -34,9 +30,6 @@ agents:
       enabled: true
     tools: [read_file, list_dir, search_code, git_diff, exec_command, submit_output]
     budgets:
-      max_turns: 8
-      max_tokens: 40000
-      command_timeout: 60s
       run_timeout: 3m
 synthesizer:
   prompt_file: configs/prompts/synthesizer.md
@@ -46,8 +39,6 @@ synthesizer:
     reasoning_effort: medium
     max_output_tokens: 4000
   budgets:
-    max_turns: 2
-    max_tokens: 20000
     run_timeout: 2m
 output:
   sinks:
@@ -56,4 +47,3 @@ output:
       include_coverage_summary: true
       min_severity: low
       min_confidence: 0.7
-      verdict_mode: comment_only

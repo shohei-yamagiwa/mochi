@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/shohei-yamagiwa/mochi/internal/credentials"
 	"github.com/shohei-yamagiwa/mochi/internal/domain"
 	ghinput "github.com/shohei-yamagiwa/mochi/internal/input/github"
 	whinput "github.com/shohei-yamagiwa/mochi/internal/input/webhook"
@@ -42,6 +44,7 @@ type Config struct {
 	WebhookAdapter      *whinput.Adapter
 	Scheduler           *orchestrator.Scheduler
 	Store               store.Store
+	CredentialService   *credentials.Service
 	TriggerSecret       string
 	APIToken            string
 	AllowInsecureNoAuth bool
@@ -119,6 +122,10 @@ func New(cfg Config) (*Server, error) {
 			r.Get("/runs/{run_id}", s.handleGetRun)
 			r.Get("/runs/{run_id}/coverage", s.handleGetRunCoverage)
 			r.Post("/runs/{run_id}/cancel", s.handleCancelRun)
+
+			r.Get("/repos/{owner}/{repo}/credentials", s.handleListRepoCredentials)
+			r.Put("/repos/{owner}/{repo}/credentials/{provider}", s.handlePutRepoCredential)
+			r.Delete("/repos/{owner}/{repo}/credentials/{provider}", s.handleDeleteRepoCredential)
 		})
 	})
 
@@ -203,16 +210,21 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	wf, err := s.resolveGitHubWorkflow(r)
-	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
-		return
-	}
-
 	eventType := strings.TrimSpace(r.Header.Get("X-GitHub-Event"))
 	deliveryID := strings.TrimSpace(r.Header.Get("X-GitHub-Delivery"))
 	if eventType == "" {
 		writeError(w, http.StatusBadRequest, "missing X-GitHub-Event header")
+		return
+	}
+
+	if strings.TrimSpace(r.URL.Query().Get("workflow")) == "" && len(s.cfg.Workflows) == 0 {
+		s.handleRepoWorkflowGitHubWebhook(w, body, eventType, deliveryID)
+		return
+	}
+
+	wf, err := s.resolveGitHubWorkflow(r)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
 
@@ -290,6 +302,93 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		"run_id":      runID,
 		"workflow":    wf.Name,
 		"pr_number":   target.PRNumber,
+		"delivery_id": deliveryID,
+	})
+}
+
+func (s *Server) handleRepoWorkflowGitHubWebhook(w http.ResponseWriter, body []byte, eventType, deliveryID string) {
+	cand, err := s.cfg.GitHubAdapter.ParseWebhookCandidate(eventType, body)
+	if err != nil {
+		if errors.Is(err, ghinput.ErrIgnoredEvent) {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"status":      "ignored",
+				"delivery_id": deliveryID,
+				"reason":      err.Error(),
+			})
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	hydrationDedupKey := ""
+	if cand.Owner != "" && cand.Repo != "" && cand.PRNumber > 0 {
+		hydrationDedupKey = fmt.Sprintf("github:%s/%s:pr:%d", cand.Owner, cand.Repo, cand.PRNumber)
+	}
+	hydrateCtx, hydrateCancel := context.WithTimeout(s.bgCtx, s.cfg.EnqueueTimeout)
+	seq := s.registerWebhookHydration(hydrationDedupKey, hydrateCancel)
+
+	s.bgWG.Add(1)
+	go func() {
+		defer s.bgWG.Done()
+		defer hydrateCancel()
+		defer s.finishWebhookHydration(hydrationDedupKey, seq)
+
+		repoTasks, buildErr := s.cfg.GitHubAdapter.BuildTaskContextsForRepoWorkflows(hydrateCtx, cand)
+		if buildErr != nil {
+			if errors.Is(buildErr, ghinput.ErrIgnoredEvent) {
+				s.logger.Info("ignored github pr event in repo-workflow mode", "delivery_id", deliveryID, "pr", cand.PRNumber, "reason", buildErr)
+				return
+			}
+			if s.isWebhookSuperseded(hydrationDedupKey, seq) && errors.Is(buildErr, context.Canceled) {
+				s.logger.Info("cancelled superseded github repo-workflow hydration", "delivery_id", deliveryID, "pr", cand.PRNumber, "seq", seq)
+				return
+			}
+			s.logger.Error("failed to resolve repo workflows for github pr", "delivery_id", deliveryID, "pr", cand.PRNumber, "error", buildErr)
+			return
+		}
+
+		cleanupRemaining := func(startIdx int) {
+			for i := startIdx; i < len(repoTasks); i++ {
+				if rt := repoTasks[i]; rt != nil && rt.Task != nil && rt.Task.PromptDir != "" {
+					_ = os.RemoveAll(rt.Task.PromptDir)
+				}
+			}
+		}
+
+		if s.isWebhookSuperseded(hydrationDedupKey, seq) {
+			cleanupRemaining(0)
+			s.logger.Info("skipping enqueue for superseded github repo-workflow webhook", "delivery_id", deliveryID, "pr", cand.PRNumber, "seq", seq)
+			return
+		}
+
+		for i, rt := range repoTasks {
+			if rt == nil || rt.Task == nil || rt.Workflow == nil {
+				continue
+			}
+			if s.isWebhookSuperseded(hydrationDedupKey, seq) {
+				cleanupRemaining(i)
+				return
+			}
+			rt.Task.RunID = newRunID()
+			rt.Task.DedupSequence = seq
+			if _, enqErr := s.cfg.Scheduler.Enqueue(hydrateCtx, rt.Task, rt.Workflow); enqErr != nil {
+				if rt.Task.PromptDir != "" {
+					_ = os.RemoveAll(rt.Task.PromptDir)
+				}
+				if errors.Is(enqErr, orchestrator.ErrRunSuperseded) {
+					s.logger.Info("github repo-workflow run superseded before enqueue", "workflow", rt.Workflow.Name, "delivery_id", deliveryID, "pr", cand.PRNumber, "seq", seq)
+					continue
+				}
+				s.logger.Error("failed to enqueue github repo-workflow run", "workflow", rt.Workflow.Name, "run_id", rt.Task.RunID, "pr", cand.PRNumber, "error", enqErr)
+			}
+		}
+	}()
+
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"status":      "accepted",
+		"mode":        "repo_workflows",
+		"pr_number":   cand.PRNumber,
 		"delivery_id": deliveryID,
 	})
 }
@@ -498,6 +597,123 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeError(w, http.StatusNotFound, fmt.Sprintf("run %q not found", runID))
+}
+
+func (s *Server) handleListRepoCredentials(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.CredentialService == nil {
+		writeError(w, http.StatusServiceUnavailable, "credential service is not configured")
+		return
+	}
+	owner, repo, err := credentials.NormalizeRepo(chi.URLParam(r, "owner"), chi.URLParam(r, "repo"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	creds, err := s.cfg.CredentialService.List(r.Context(), owner, repo)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("list credentials: %v", err))
+		return
+	}
+	if creds == nil {
+		creds = []*domain.RepoCredentialSummary{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"credentials": creds,
+	})
+}
+
+func (s *Server) handlePutRepoCredential(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.CredentialService == nil {
+		writeError(w, http.StatusServiceUnavailable, "credential service is not configured")
+		return
+	}
+	owner, repo, err := credentials.NormalizeRepo(chi.URLParam(r, "owner"), chi.URLParam(r, "repo"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	provider, err := credentials.ValidateProvider(chi.URLParam(r, "provider"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	raw, err := readBoundedBody(w, r, 64<<10)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "credential payload exceeds maximum size")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+
+	var req struct {
+		APIKey  string `json:"api_key"`
+		BaseURL string `json:"base_url"`
+	}
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid json body: %v", err))
+		return
+	}
+	if strings.TrimSpace(req.APIKey) == "" {
+		writeError(w, http.StatusBadRequest, "api_key must not be empty")
+		return
+	}
+
+	if err := s.cfg.CredentialService.Set(r.Context(), owner, repo, provider, req.APIKey, req.BaseURL); err != nil {
+		if strings.Contains(err.Error(), "invalid base_url") || strings.Contains(err.Error(), "must not be empty") || strings.Contains(err.Error(), "unsupported provider") {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("store credential: %v", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":      "saved",
+		"repo_owner":  owner,
+		"repo_name":   repo,
+		"provider":    provider,
+		"base_url":    strings.TrimSpace(req.BaseURL),
+		"has_api_key": true,
+	})
+}
+
+func (s *Server) handleDeleteRepoCredential(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.CredentialService == nil {
+		writeError(w, http.StatusServiceUnavailable, "credential service is not configured")
+		return
+	}
+	owner, repo, err := credentials.NormalizeRepo(chi.URLParam(r, "owner"), chi.URLParam(r, "repo"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	provider, err := credentials.ValidateProvider(chi.URLParam(r, "provider"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if err := s.cfg.CredentialService.Delete(r.Context(), owner, repo, provider); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("credential for %s/%s (%s) not found", owner, repo, provider))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("delete credential: %v", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":     "deleted",
+		"repo_owner": owner,
+		"repo_name":  repo,
+		"provider":   provider,
+	})
 }
 
 func (s *Server) resolveGitHubWorkflow(r *http.Request) (*domain.Workflow, error) {

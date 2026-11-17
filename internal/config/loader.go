@@ -99,7 +99,6 @@ type SinkOverride struct {
 	IncludeCoverageSummary *bool    `yaml:"include_coverage_summary,omitempty"`
 	MinSeverity            string   `yaml:"min_severity,omitempty"`
 	MinConfidence          *float64 `yaml:"min_confidence,omitempty"`
-	VerdictMode            string   `yaml:"verdict_mode,omitempty"`
 	URL                    string   `yaml:"url,omitempty"`
 }
 
@@ -134,6 +133,49 @@ func ParseWorkflow(data []byte) (*domain.Workflow, error) {
 	}
 	if wf.Synthesizer.PromptFromRepo {
 		return nil, fmt.Errorf("synthesizer: prompt_from_repo cannot be set in server workflow YAML")
+	}
+	return wf, nil
+}
+
+// ParseRepoWorkflow decodes a repository-owned workflow YAML (e.g. .mochi/workflows/*.yaml)
+// fetched from the base branch. Prompt paths under .mochi/ are marked PromptFromRepo=true
+// so PromptEngine reads them from the repository bundle; non-.mochi/ paths must match built-in
+// embedded prompts.
+func ParseRepoWorkflow(data []byte) (*domain.Workflow, error) {
+	wf, err := ParseWorkflow(data)
+	if err != nil {
+		return nil, err
+	}
+	for i := range wf.Agents {
+		cleanSlash := filepath.ToSlash(filepath.Clean(filepath.FromSlash(wf.Agents[i].PromptFile)))
+		if strings.HasPrefix(cleanSlash, ".mochi/") {
+			if err := ensureSafeRepoPromptPath(wf.Agents[i].PromptFile); err != nil {
+				return nil, fmt.Errorf("agent %q prompt_file: %w", wf.Agents[i].Role, err)
+			}
+			wf.Agents[i].PromptFile = cleanSlash
+			wf.Agents[i].PromptFromRepo = true
+		} else {
+			if _, err := ReadEmbeddedPrompt(wf.Agents[i].PromptFile); err != nil {
+				return nil, fmt.Errorf("agent %q prompt_file %q must be under .mochi/ or match a built-in prompt: %w", wf.Agents[i].Role, wf.Agents[i].PromptFile, err)
+			}
+			wf.Agents[i].PromptFromRepo = false
+		}
+	}
+	cleanSynth := filepath.ToSlash(filepath.Clean(filepath.FromSlash(wf.Synthesizer.PromptFile)))
+	if strings.HasPrefix(cleanSynth, ".mochi/") {
+		if err := ensureSafeRepoPromptPath(wf.Synthesizer.PromptFile); err != nil {
+			return nil, fmt.Errorf("synthesizer prompt_file: %w", err)
+		}
+		wf.Synthesizer.PromptFile = cleanSynth
+		wf.Synthesizer.PromptFromRepo = true
+	} else {
+		if _, err := ReadEmbeddedPrompt(wf.Synthesizer.PromptFile); err != nil {
+			return nil, fmt.Errorf("synthesizer prompt_file %q must be under .mochi/ or match a built-in prompt: %w", wf.Synthesizer.PromptFile, err)
+		}
+		wf.Synthesizer.PromptFromRepo = false
+	}
+	if err := ValidateWorkflow(wf, ""); err != nil {
+		return nil, err
 	}
 	return wf, nil
 }
@@ -236,9 +278,6 @@ func ValidateWorkflow(wf *domain.Workflow, baseDir string) error {
 		if s.MinConfidence < 0 || s.MinConfidence > 1 {
 			return fmt.Errorf("output.sinks[%d].min_confidence must be between 0.0 and 1.0", i)
 		}
-		if s.VerdictMode != "" && s.VerdictMode != "comment_only" && s.VerdictMode != "enforce" {
-			return fmt.Errorf("output.sinks[%d].verdict_mode %q is invalid", i, s.VerdictMode)
-		}
 	}
 
 	return nil
@@ -322,7 +361,7 @@ func MergeRepoOverrides(base *domain.Workflow, overrideYAML []byte) (*domain.Wor
 				cloned.Agents[idx].Tools = slices.Clone(aov.Tools)
 			}
 			if aov.Budgets != nil {
-				if err := mergeClampedBudgetConfig(&cloned.Agents[idx].Budgets, aov.Budgets); err != nil {
+				if err := mergeBudgetConfig(&cloned.Agents[idx].Budgets, aov.Budgets); err != nil {
 					return nil, fmt.Errorf("agent %q budgets: %w", aov.Role, err)
 				}
 			}
@@ -356,7 +395,7 @@ func MergeRepoOverrides(base *domain.Workflow, overrideYAML []byte) (*domain.Wor
 			}
 		}
 		if ov.Synthesizer.Budgets != nil {
-			if err := mergeClampedBudgetConfig(&cloned.Synthesizer.Budgets, ov.Synthesizer.Budgets); err != nil {
+			if err := mergeBudgetConfig(&cloned.Synthesizer.Budgets, ov.Synthesizer.Budgets); err != nil {
 				return nil, fmt.Errorf("synthesizer budgets: %w", err)
 			}
 		}
@@ -370,9 +409,6 @@ func MergeRepoOverrides(base *domain.Workflow, overrideYAML []byte) (*domain.Wor
 		for _, sov := range ov.Output.Sinks {
 			if sov.URL != "" {
 				return nil, fmt.Errorf("output sink %q url: %w", sov.Type, ErrDisallowedOverrideField)
-			}
-			if sov.VerdictMode != "" {
-				return nil, fmt.Errorf("output sink %q verdict_mode: %w", sov.Type, ErrDisallowedOverrideField)
 			}
 			idx, ok := sinkIndex[sov.Type]
 			if !ok {
@@ -403,6 +439,8 @@ func MergeRepoOverrides(base *domain.Workflow, overrideYAML []byte) (*domain.Wor
 func cloneWorkflow(wf *domain.Workflow) *domain.Workflow {
 	out := *wf
 	out.Input.Triggers.Events = slices.Clone(wf.Input.Triggers.Events)
+	out.Input.Triggers.BaseBranches = slices.Clone(wf.Input.Triggers.BaseBranches)
+	out.Input.Triggers.HeadBranches = slices.Clone(wf.Input.Triggers.HeadBranches)
 	out.Input.Triggers.AllowedCommentAssociations = slices.Clone(wf.Input.Triggers.AllowedCommentAssociations)
 	out.Agents = make([]domain.RoleConfig, len(wf.Agents))
 	for i, a := range wf.Agents {
@@ -429,13 +467,7 @@ func cloneWorkflow(wf *domain.Workflow) *domain.Workflow {
 	return &out
 }
 
-const (
-	defaultMaxOutputTokensCeiling = 16384
-	defaultMaxTurnsCeiling        = 20
-	defaultMaxTokensCeiling       = 200000
-	defaultCommandTimeoutCeiling  = domain.Duration(5 * 60 * 1e9)  // 5m
-	defaultRunTimeoutCeiling      = domain.Duration(10 * 60 * 1e9) // 10m
-)
+const defaultMaxOutputTokensCeiling = 16384
 
 func reasoningEffortRank(effort string) (int, bool) {
 	switch effort {
@@ -485,37 +517,17 @@ func mergeModelOverride(dst *domain.ModelConfig, src *ModelOverride, allowCustom
 	return nil
 }
 
-func mergeClampedBudgetConfig(dst, src *domain.BudgetConfig) error {
+func mergeBudgetConfig(dst, src *domain.BudgetConfig) error {
 	if err := validateBudgetConfig(*src); err != nil {
 		return err
 	}
-	if src.MaxTurns > 0 {
-		dst.MaxTurns = clampInt(src.MaxTurns, dst.MaxTurns, defaultMaxTurnsCeiling)
-	}
-	if src.MaxTokens > 0 {
-		dst.MaxTokens = clampInt(src.MaxTokens, dst.MaxTokens, defaultMaxTokensCeiling)
-	}
-	if src.CommandTimeout > 0 {
-		dst.CommandTimeout = clampDuration(src.CommandTimeout, dst.CommandTimeout, defaultCommandTimeoutCeiling)
-	}
 	if src.RunTimeout > 0 {
-		dst.RunTimeout = clampDuration(src.RunTimeout, dst.RunTimeout, defaultRunTimeoutCeiling)
+		dst.RunTimeout = src.RunTimeout
 	}
 	return nil
 }
 
 func clampInt(requested, base, ceiling int) int {
-	limit := base
-	if limit <= 0 {
-		limit = ceiling
-	}
-	if limit > 0 && requested > limit {
-		return limit
-	}
-	return requested
-}
-
-func clampDuration(requested, base, ceiling domain.Duration) domain.Duration {
 	limit := base
 	if limit <= 0 {
 		limit = ceiling
@@ -551,15 +563,6 @@ func validateModelConfig(m domain.ModelConfig) error {
 }
 
 func validateBudgetConfig(b domain.BudgetConfig) error {
-	if b.MaxTurns < 0 {
-		return fmt.Errorf("max_turns must not be negative")
-	}
-	if b.MaxTokens < 0 {
-		return fmt.Errorf("max_tokens must not be negative")
-	}
-	if b.CommandTimeout < 0 {
-		return fmt.Errorf("command_timeout must not be negative")
-	}
 	if b.RunTimeout < 0 {
 		return fmt.Errorf("run_timeout must not be negative")
 	}
@@ -573,6 +576,9 @@ func validatePromptPath(promptPath, baseDir string) error {
 	if baseDir != "" {
 		root, err := os.OpenRoot(baseDir)
 		if err != nil {
+			if _, embErr := ReadEmbeddedPrompt(promptPath); embErr == nil {
+				return nil
+			}
 			return fmt.Errorf("open prompt root %q: %w", baseDir, err)
 		}
 		defer root.Close()
@@ -580,6 +586,9 @@ func validatePromptPath(promptPath, baseDir string) error {
 		cleanRel := filepath.ToSlash(filepath.Clean(filepath.FromSlash(promptPath)))
 		info, err := root.Stat(cleanRel)
 		if err != nil {
+			if _, embErr := ReadEmbeddedPrompt(promptPath); embErr == nil {
+				return nil
+			}
 			return fmt.Errorf("stat prompt file %q under %q: %w", cleanRel, baseDir, err)
 		}
 		if info.IsDir() {

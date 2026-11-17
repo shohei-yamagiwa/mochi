@@ -6,15 +6,9 @@ input:
   adapter: github_pr
   triggers:
     events: ["opened", "synchronize", "reopened", "ready_for_review"]
+    base_branches: ["main"]
     comment_command: "/mochi review"
     ignore_drafts: true
-
-repo_overrides:
-  enabled: true
-  path: ".mochi/config.yaml"
-  allow_custom_prompts: true
-  allow_custom_images: true # Owner-run private repositories only: lets a repo select its language snapshot via .mochi/config.yaml (e.g. mochi-review-java for BioCold Nexus). Revisit before opening Mochi to untrusted repositories.
-  allow_custom_models: true # Owner-run private repositories only: lets a repo select per-role models via .mochi/config.yaml. Providers and API base URLs stay server-side. Stopgap: the override architecture is under reconsideration. Revisit before opening Mochi to untrusted repositories.
 
 sandbox:
   provider: daytona
@@ -35,9 +29,6 @@ agents:
       enabled: true
     tools: ["read_file", "list_dir", "search_code", "git_diff", "exec_command", "submit_output"]
     budgets:
-      max_turns: 15
-      max_tokens: 120000
-      command_timeout: 60s
       run_timeout: 15m
 
   - role: security
@@ -51,9 +42,6 @@ agents:
       enabled: true
     tools: ["read_file", "list_dir", "search_code", "git_diff", "exec_command", "submit_output"]
     budgets:
-      max_turns: 15
-      max_tokens: 120000
-      command_timeout: 60s
       run_timeout: 15m
 
   - role: performance-architecture
@@ -67,9 +55,6 @@ agents:
       enabled: true
     tools: ["read_file", "list_dir", "search_code", "git_diff", "exec_command", "submit_output"]
     budgets:
-      max_turns: 12
-      max_tokens: 150000
-      command_timeout: 60s
       run_timeout: 15m
 
   - role: maintainability
@@ -83,9 +68,6 @@ agents:
       enabled: true
     tools: ["read_file", "list_dir", "search_code", "git_diff", "exec_command", "submit_output"]
     budgets:
-      max_turns: 12
-      max_tokens: 150000
-      command_timeout: 60s
       run_timeout: 15m
 
   - role: test-runner
@@ -99,9 +81,6 @@ agents:
       enabled: true
     tools: ["read_file", "write_file", "list_dir", "search_code", "git_diff", "exec_command", "submit_output"]
     budgets:
-      max_turns: 20
-      max_tokens: 150000
-      command_timeout: 180s
       # Deliberately generous: the timeout is only a guard against runaway
       # cost, not a target duration. Current budget figures are estimates,
       # so the limit must not cut off reviews that are still making progress.
@@ -115,8 +94,6 @@ synthesizer:
     reasoning_effort: medium
     max_output_tokens: 8192
   budgets:
-    max_turns: 3
-    max_tokens: 40000
     run_timeout: 2m
 
 output:
@@ -126,4 +103,3 @@ output:
       include_coverage_summary: true
       min_severity: "low"
       min_confidence: 0.7
-      verdict_mode: "comment_only"

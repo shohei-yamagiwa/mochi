@@ -90,7 +90,7 @@ type ModelConfig struct {
 	BaseURL         string   `yaml:"base_url,omitempty" json:"base_url,omitempty"` // Optional base URL for openai_compat endpoints
 	Temperature     *float64 `yaml:"temperature,omitempty" json:"temperature,omitempty"`
 	MaxOutputTokens int      `yaml:"max_output_tokens,omitempty" json:"max_output_tokens,omitempty"`
-	ReasoningEffort string `yaml:"reasoning_effort,omitempty" json:"reasoning_effort,omitempty"` // "minimal", "low", "medium", "high", "xhigh", "max" (Anthropic clamps "minimal"->"low"; Gemini clamps "xhigh"/"max"->"high")
+	ReasoningEffort string   `yaml:"reasoning_effort,omitempty" json:"reasoning_effort,omitempty"` // "minimal", "low", "medium", "high", "xhigh", "max" (Anthropic clamps "minimal"->"low"; Gemini clamps "xhigh"/"max"->"high")
 }
 
 // Workflow represents a complete declarative workflow definition (e.g. pr-review.yaml).
@@ -115,6 +115,8 @@ type InputConfig struct {
 // TriggerConfig defines trigger filtering rules for an input adapter.
 type TriggerConfig struct {
 	Events                     []string `yaml:"events,omitempty" json:"events,omitempty"`
+	BaseBranches               []string `yaml:"base_branches,omitempty" json:"base_branches,omitempty"`
+	HeadBranches               []string `yaml:"head_branches,omitempty" json:"head_branches,omitempty"`
 	CommentCommand             string   `yaml:"comment_command,omitempty" json:"comment_command,omitempty"`
 	AllowedCommentAssociations []string `yaml:"allowed_comment_associations,omitempty" json:"allowed_comment_associations,omitempty"`
 	IgnoreDrafts               bool     `yaml:"ignore_drafts,omitempty" json:"ignore_drafts,omitempty"`
@@ -156,13 +158,7 @@ type AgentSandboxConfig struct {
 
 // BudgetConfig defines execution guardrails for an agent or synthesizer run.
 type BudgetConfig struct {
-	MaxTurns int `yaml:"max_turns,omitempty" json:"max_turns,omitempty"`
-	// MaxTokens is the cumulative per-agent budget across all turns (sum of per-turn InputTokens + OutputTokens,
-	// including cached input tokens). When a multi-turn agent approaches or first crosses MaxTokens, one final
-	// wind-down turn scoped to submit_output is attempted so findings gathered so far are preserved.
-	MaxTokens      int      `yaml:"max_tokens,omitempty" json:"max_tokens,omitempty"`
-	CommandTimeout Duration `yaml:"command_timeout,omitempty" json:"command_timeout,omitempty"`
-	RunTimeout     Duration `yaml:"run_timeout,omitempty" json:"run_timeout,omitempty"`
+	RunTimeout Duration `yaml:"run_timeout,omitempty" json:"run_timeout,omitempty"`
 }
 
 // SynthesizerConfig defines the final synthesis agent step.
@@ -185,7 +181,6 @@ type SinkConfig struct {
 	IncludeCoverageSummary bool           `yaml:"include_coverage_summary,omitempty" json:"include_coverage_summary,omitempty"`
 	MinSeverity            string         `yaml:"min_severity,omitempty" json:"min_severity,omitempty"`
 	MinConfidence          float64        `yaml:"min_confidence,omitempty" json:"min_confidence,omitempty"`
-	VerdictMode            string         `yaml:"verdict_mode,omitempty" json:"verdict_mode,omitempty"`
 	URL                    string         `yaml:"url,omitempty" json:"url,omitempty"`
 	Options                map[string]any `yaml:"options,omitempty" json:"options,omitempty"`
 }

@@ -50,8 +50,6 @@ func minimalSchedulerWorkflow() *domain.Workflow {
 				Sandbox: domain.AgentSandboxConfig{Enabled: false},
 				Tools:   []string{"submit_output"},
 				Budgets: domain.BudgetConfig{
-					MaxTurns:   2,
-					MaxTokens:  10000,
 					RunTimeout: domain.Duration(10 * time.Second),
 				},
 			},
@@ -62,8 +60,6 @@ func minimalSchedulerWorkflow() *domain.Workflow {
 				Model:    "mock-model",
 			},
 			Budgets: domain.BudgetConfig{
-				MaxTurns:   2,
-				MaxTokens:  10000,
 				RunTimeout: domain.Duration(10 * time.Second),
 			},
 		},

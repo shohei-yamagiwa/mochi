@@ -7,18 +7,23 @@ For credentials and sandbox preparation, see [deployment](deployment.md).
 ## Validate configuration
 
 ```sh
-./mochi validate configs/workflows/pr-review.yaml configs/workflows/pr-review-small.yaml
-./mochi validate --runtime configs/workflows/pr-review.yaml
+./mochi validate
+./mochi validate .mochi/workflows/pr-review.yaml .mochi/workflows/pr-review-small.yaml
+./mochi validate --runtime
 ```
 
-Plain validation checks workflow structure, tool names, and prompt templates
-without credentials. Runtime validation also checks local credentials and server
-authentication configuration; neither command calls external APIs. Prompt files
-resolve relative to an automatically detected project root, or `--base-dir`.
+With no arguments, `mochi validate` discovers `.mochi/workflows/*.yaml` (and
+`*.yml`) in the current repository and checks workflow structure, tool names,
+and prompt templates (including built-in prompts embedded in the binary).
+Running `./mochi validate --runtime` with no workflow arguments checks server
+deployment readiness (GitHub authentication, webhook/API secrets, shared Daytona
+credentials, and `MOCHI_MASTER_KEY`) without requiring `MOCHI_WORKFLOW` or
+server-side LLM API keys. Passing explicit workflow files alongside `--runtime`
+checks local CLI provider environment variables for `mochi run`.
 
 ## Review a GitHub pull request
 
-Export `GEMINI_API_KEY` and `DAYTONA_API_KEY` for the bundled presets, and configure
+Export `GEMINI_API_KEY` and `DAYTONA_API_KEY` for local CLI runs, and configure
 GitHub App credentials or a token in `GITHUB_TOKEN` (`GH_TOKEN` is also accepted).
 The token needs access to the repository; publishing also requires permissions
 for reviews and Check Runs. Prepare the workflow's Daytona snapshot first.
@@ -53,32 +58,64 @@ commits must be accessible there. Local files and unpushed commits are not uploa
 For private repositories, prefer `--pr` so GitHub authentication supplies the
 clone token.
 
-Use `--workflow` to choose a preset or custom YAML. Runs persist to `mochi.db` by
-default (`MOCHI_DB_PATH` overrides this); `--db ''` disables persistence for a CLI
-run. `--fail-on-changes` exits with code 2 when the final verdict is
+Use `--workflow` to choose a specific YAML file (defaults to
+`.mochi/workflows/pr-review.yaml`). Runs persist to `mochi.db` by default
+(`MOCHI_DB_PATH` overrides this); `--db ''` disables persistence for a CLI run.
+`--fail-on-changes` exits with code 2 when the final verdict is
 `REQUEST_CHANGES`; execution errors exit with code 1.
 
 ## Start the server
 
-After exporting credentials and HTTP authentication secrets:
+After exporting GitHub App credentials, HTTP authentication secrets,
+`DAYTONA_API_KEY`, and `MOCHI_MASTER_KEY`:
 
 ```sh
 ./mochi serve --addr :8080 \
-  --workflow configs/workflows/pr-review.yaml \
   --db mochi.db --workers 1 --queue-size 16
 ```
 
-The standalone command defaults to four workers and a queue of 128; the container
-entrypoint defaults to one worker and a queue of 16. Workers count concurrent
-workflows, not specialists. Multiple workflow files can be loaded with repeated
-`--workflow` flags; give them unique `name` values. Both bundled presets are named
-`pr-review`, so select one or rename a copy before loading both. The first loaded
-workflow is the default for GitHub webhooks.
+By default, `mochi serve` starts in **per-repository workflow mode**: it
+discovers `.mochi/workflows/*.yaml` from each repository's base branch when
+webhooks arrive, and requires per-repository LLM API keys encrypted with
+`MOCHI_MASTER_KEY` (server-level LLM environment variables are ignored).
 
-Configure `GITHUB_WEBHOOK_SECRET` for GitHub delivery and `MOCHI_API_TOKEN` for run
-inspection and cancellation. Generic triggers use `MOCHI_TRIGGER_SECRET` when
-set, otherwise `MOCHI_API_TOKEN`. `--insecure-no-auth` permits omitted secrets
-for local development only. The standalone binary does not load `.env`.
+To run in optional static workflow mode instead, pass `--workflow` (repeatable)
+or `MOCHI_WORKFLOW`. Workers count concurrent workflows, not specialists; the
+standalone binary defaults to 4 workers and a queue of 128, while the container
+entrypoint defaults to 1 worker and a queue of 16.
+
+Configure `GITHUB_WEBHOOK_SECRET` for GitHub delivery and `MOCHI_API_TOKEN` for
+credential management, run inspection, and cancellation. Generic triggers use
+`MOCHI_TRIGGER_SECRET` when set, otherwise `MOCHI_API_TOKEN`. `--insecure-no-auth`
+permits omitted auth secrets for local development only (`MOCHI_MASTER_KEY` is
+still required). The standalone binary does not load `.env`.
+
+## Manage per-repository credentials
+
+Manage encrypted per-repository LLM API keys either directly against the local
+SQLite database (`--db` + `--master-key` / `MOCHI_MASTER_KEY`) or remotely over
+the server HTTP API (`--server` + `--api-token` / `MOCHI_API_TOKEN`):
+
+```sh
+# Store an API key from stdin (local SQLite mode):
+printf '%s\n' "$REPO_GEMINI_KEY" | ./mochi credentials set owner/repo gemini --api-key-stdin
+
+# Store an API key via a running server:
+printf '%s\n' "$REPO_GEMINI_KEY" | ./mochi credentials set owner/repo gemini \
+  --server https://mochi.example.com --api-token "$MOCHI_API_TOKEN" --api-key-stdin
+
+# Optional custom base URL (required for openai_compat unless set in workflow):
+./mochi credentials set owner/repo openai_compat \
+  --base-url https://llm.example.com/v1 --api-key "$KEY"
+
+# List configured providers (never returns plaintext keys):
+./mochi credentials list owner/repo --json
+
+# Delete a stored provider credential:
+./mochi credentials delete owner/repo gemini
+```
+
+Supported providers are `gemini`, `openai`, `anthropic`, and `openai_compat`.
 
 ## Inspect and cancel runs
 
@@ -103,6 +140,9 @@ The server exposes these endpoints:
 | GET | `/api/v1/runs/{run_id}` | Full run detail | API bearer token |
 | GET | `/api/v1/runs/{run_id}/coverage` | Coverage report | API bearer token |
 | POST | `/api/v1/runs/{run_id}/cancel` | Cancel an active or queued run | API bearer token |
+| GET | `/api/v1/repos/{owner}/{repo}/credentials` | List configured provider credentials (no secrets) | API bearer token |
+| PUT | `/api/v1/repos/{owner}/{repo}/credentials/{provider}` | Store or update encrypted API key and optional `base_url` | API bearer token |
+| DELETE | `/api/v1/repos/{owner}/{repo}/credentials/{provider}` | Remove stored provider credential | API bearer token |
 
 `/api/v1/webhooks/github` is an alias for `/webhooks/github`. Example inspection
 and cancellation requests, with `MOCHI_API_TOKEN` exported in your shell:
@@ -144,6 +184,6 @@ commands, and `skipped_reasons` before treating a review as test verification.
 
 Coverage measures recorded access to changed files and hunks, not the absence of
 bugs or test coverage. Check uncovered files and failed specialists before relying
-on a result. The presets use `comment_only`: the GitHub sink publishes comments
-rather than approval or change-request decisions. See
+on a result. The GitHub sink enforces the final verdict by submitting `APPROVE`,
+`REQUEST_CHANGES`, or `COMMENT` reviews with matching Check Run conclusions. See
 [configuration](configuration.md#output-sinks) for output controls.

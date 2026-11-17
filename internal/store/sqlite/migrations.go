@@ -126,6 +126,25 @@ CREATE TABLE IF NOT EXISTS coverage_reports (
 );
 `,
 	},
+	{
+		version: 2,
+		name:    "repo_credentials",
+		sql: `
+CREATE TABLE IF NOT EXISTS repo_credentials (
+	repo_owner TEXT NOT NULL,
+	repo_name TEXT NOT NULL,
+	provider TEXT NOT NULL,
+	encrypted_api_key BLOB NOT NULL,
+	nonce BLOB NOT NULL,
+	base_url TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL,
+	PRIMARY KEY (repo_owner, repo_name, provider)
+);
+
+CREATE INDEX IF NOT EXISTS idx_repo_credentials_repo ON repo_credentials (repo_owner, repo_name);
+`,
+	},
 }
 
 func runMigrations(ctx context.Context, db *sql.DB) error {
