@@ -455,3 +455,330 @@ func TestBuildTaskContext_AllowsNonWebhookDraftAndClosedMergedPR(t *testing.T) {
 		})
 	}
 }
+
+func TestMatchBranchPatternAndMatchBranches(t *testing.T) {
+	if !ghinput.MatchBranches(nil, "anything/goes") {
+		t.Fatal("empty patterns should match all branches")
+	}
+	if ghinput.MatchBranches([]string{"main"}, "") {
+		t.Fatal("non-empty patterns must not match empty branch")
+	}
+
+	cases := []struct {
+		pattern string
+		branch  string
+		want    bool
+	}{
+		{"main", "main", true},
+		{"main", "main2", false},
+		{"feature/*", "feature/login", true},
+		{"feature/*", "feature/team/login", false},
+		{"feature/**", "feature/login", true},
+		{"feature/**", "feature/team/login", true},
+		{"release/v?.0", "release/v1.0", true},
+		{"release/v?.0", "release/v10.0", false},
+		{"**/main", "main", true},
+		{"**/main", "org/main", true},
+		{"a/**/b", "a/b", true},
+		{"a/**/b", "a/x/y/b", true},
+	}
+	for _, tc := range cases {
+		if got := ghinput.MatchBranchPattern(tc.pattern, tc.branch); got != tc.want {
+			t.Errorf("MatchBranchPattern(%q, %q) = %v, want %v", tc.pattern, tc.branch, got, tc.want)
+		}
+	}
+}
+
+func TestBuildTaskContext_BranchTriggerFiltering(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/shohei-yamagiwa/mochi/pulls/55":
+			if strings.Contains(r.Header.Get("Accept"), "application/vnd.github.v3.diff") {
+				_, _ = w.Write([]byte("diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1,2 @@\n package a\n+var x = 1\n"))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number":   55,
+				"title":    "Branch filter PR",
+				"state":    "open",
+				"draft":    false,
+				"merged":   false,
+				"html_url": "https://github.com/shohei-yamagiwa/mochi/pull/55",
+				"user":     map[string]any{"login": "shohei"},
+				"base":     map[string]any{"ref": "develop", "sha": "base55", "repo": map[string]any{"clone_url": "https://github.com/shohei-yamagiwa/mochi.git"}},
+				"head":     map[string]any{"ref": "feature/ui", "sha": "head55"},
+			})
+		case "/repos/shohei-yamagiwa/mochi/pulls/55/files":
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"filename": "a.go", "status": "modified", "additions": 1, "patch": "@@ -1 +1,2 @@\n package a\n+var x = 1"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	baseURL := srv.URL + "/"
+	ghClient, err := github.NewClient(github.WithHTTPClient(srv.Client()), github.WithURLs(&baseURL, &baseURL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := ghinput.NewAdapter(ghinput.NewStaticClientFactory(ghClient, "tok"), ghinput.WithAllowInsecureNoWebhookSecret(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Pull request targeting develop should be ignored when trigger requires base_branches: ["main"].
+	prPayload := []byte(`{
+		"action": "opened",
+		"number": 55,
+		"repository": {"name": "mochi", "owner": {"login": "shohei-yamagiwa"}},
+		"pull_request": {
+			"number": 55,
+			"draft": false,
+			"base": {"ref": "develop"},
+			"head": {"ref": "feature/ui"}
+		}
+	}`)
+	if _, err := adapter.ParseWebhookEvent("pull_request", prPayload, &domain.TriggerConfig{
+		BaseBranches: []string{"main"},
+		IgnoreDrafts: true,
+	}); !errors.Is(err, ghinput.ErrIgnoredEvent) {
+		t.Fatalf("expected ErrIgnoredEvent for base mismatch, got %v", err)
+	}
+
+	// Issue comment command on PR targeting develop should be ignored after PullRequests.Get if base_branches=["main"].
+	commentPayload := []byte(`{
+		"action": "created",
+		"repository": {"name": "mochi", "owner": {"login": "shohei-yamagiwa"}},
+		"sender": {"login": "shohei", "type": "User"},
+		"issue": {"number": 55, "state": "open", "pull_request": {"url": "https://api.github.com/repos/shohei-yamagiwa/mochi/pulls/55"}},
+		"comment": {"body": "/mochi review", "author_association": "OWNER"}
+	}`)
+	if _, err := adapter.BuildTaskContext(context.Background(), &ghinput.WebhookEvent{
+		EventType: "issue_comment",
+		Payload:   commentPayload,
+		Triggers: &domain.TriggerConfig{
+			BaseBranches: []string{"main"},
+			IgnoreDrafts: true,
+		},
+	}); !errors.Is(err, ghinput.ErrIgnoredEvent) {
+		t.Fatalf("expected ErrIgnoredEvent for issue_comment base mismatch, got %v", err)
+	}
+
+	// Matching base_branches + head_branches succeeds.
+	task, err := adapter.BuildTaskContext(context.Background(), &ghinput.WebhookEvent{
+		EventType: "issue_comment",
+		Payload:   commentPayload,
+		Triggers: &domain.TriggerConfig{
+			BaseBranches: []string{"develop"},
+			HeadBranches: []string{"feature/*"},
+			IgnoreDrafts: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected matching branch trigger to succeed, got %v", err)
+	}
+	if task.Changeset.BaseBranch != "develop" || task.Changeset.HeadBranch != "feature/ui" {
+		t.Fatalf("unexpected branches: %+v", task.Changeset)
+	}
+}
+
+func TestBuildTaskContextsForRepoWorkflows(t *testing.T) {
+	mainWF := `version: "1"
+name: pr-review
+input:
+  adapter: github_pr
+  triggers:
+    events: ["opened", "synchronize"]
+    base_branches: ["main"]
+    comment_command: "/mochi review"
+    ignore_drafts: true
+sandbox:
+  provider: daytona
+agents:
+  - role: correctness
+    prompt_file: "configs/prompts/correctness.md"
+    llm:
+      provider: gemini
+      model: gemini-4-hydrogen
+    tools: ["read_file", "submit_output"]
+synthesizer:
+  prompt_file: "configs/prompts/synthesizer.md"
+  llm:
+    provider: gemini
+    model: gemini-4-hydrogen
+output:
+  sinks:
+    - type: github_pr_review
+`
+
+	developSmallWF := `version: "1"
+name: pr-review-small
+input:
+  adapter: github_pr
+  triggers:
+    events: ["opened", "synchronize"]
+    base_branches: ["develop"]
+    head_branches: ["feature/**"]
+    comment_command: "/mochi review-small"
+    ignore_drafts: true
+sandbox:
+  provider: daytona
+agents:
+  - role: correctness
+    prompt_file: ".mochi/prompts/small.md"
+    llm:
+      provider: gemini
+      model: gemini-4-hydrogen
+    tools: ["read_file", "submit_output"]
+synthesizer:
+  prompt_file: "configs/prompts/synthesizer.md"
+  llm:
+    provider: gemini
+    model: gemini-4-hydrogen
+output:
+  sinks:
+    - type: github_pr_review
+`
+
+	var baseBranch string
+	var headBranch string
+	var requestedRefs []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/shohei-yamagiwa/mochi/pulls/77":
+			if strings.Contains(r.Header.Get("Accept"), "application/vnd.github.v3.diff") {
+				_, _ = w.Write([]byte("diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1,2 @@\n package a\n+var x = 1\n"))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number":   77,
+				"title":    "Multi-workflow PR",
+				"state":    "open",
+				"draft":    false,
+				"merged":   false,
+				"html_url": "https://github.com/shohei-yamagiwa/mochi/pull/77",
+				"user":     map[string]any{"login": "shohei"},
+				"base":     map[string]any{"ref": baseBranch, "sha": "base777", "repo": map[string]any{"clone_url": "https://github.com/shohei-yamagiwa/mochi.git"}},
+				"head":     map[string]any{"ref": headBranch, "sha": "head777"},
+			})
+
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/shohei-yamagiwa/mochi/pulls/77/files":
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"filename": "a.go", "status": "modified", "additions": 1, "patch": "@@ -1 +1,2 @@\n package a\n+var x = 1"},
+			})
+
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/shohei-yamagiwa/mochi/contents/.mochi/workflows":
+			requestedRefs = append(requestedRefs, r.URL.Query().Get("ref"))
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"name": "pr-review.yaml", "path": ".mochi/workflows/pr-review.yaml", "type": "file"},
+				{"name": "pr-review-small.yaml", "path": ".mochi/workflows/pr-review-small.yaml", "type": "file"},
+				{"name": "README.md", "path": ".mochi/workflows/README.md", "type": "file"},
+			})
+
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/shohei-yamagiwa/mochi/contents/.mochi/workflows/pr-review.yaml":
+			requestedRefs = append(requestedRefs, r.URL.Query().Get("ref"))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"type":     "file",
+				"encoding": "base64",
+				"content":  base64.StdEncoding.EncodeToString([]byte(mainWF)),
+			})
+
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/shohei-yamagiwa/mochi/contents/.mochi/workflows/pr-review-small.yaml":
+			requestedRefs = append(requestedRefs, r.URL.Query().Get("ref"))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"type":     "file",
+				"encoding": "base64",
+				"content":  base64.StdEncoding.EncodeToString([]byte(developSmallWF)),
+			})
+
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/shohei-yamagiwa/mochi/contents/.mochi/prompts/small.md":
+			requestedRefs = append(requestedRefs, r.URL.Query().Get("ref"))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"type":     "file",
+				"encoding": "base64",
+				"content":  base64.StdEncoding.EncodeToString([]byte("SMALL_BASE_PROMPT")),
+			})
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	baseURL := srv.URL + "/"
+	ghClient, err := github.NewClient(github.WithHTTPClient(srv.Client()), github.WithURLs(&baseURL, &baseURL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := ghinput.NewAdapter(ghinput.NewStaticClientFactory(ghClient, "tok"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. feature/team/add -> develop matches pr-review-small only, via custom comment command /mochi review-small.
+	baseBranch = "develop"
+	headBranch = "feature/team/add"
+	requestedRefs = nil
+	cand, err := adapter.ParseWebhookCandidate("issue_comment", []byte(`{
+		"action": "created",
+		"installation": {"id": 99},
+		"repository": {"name": "mochi", "owner": {"login": "shohei-yamagiwa"}},
+		"sender": {"login": "shohei", "type": "User"},
+		"issue": {"number": 77, "state": "open", "pull_request": {"url": "https://api.github.com/repos/shohei-yamagiwa/mochi/pulls/77"}},
+		"comment": {"body": "/mochi review-small", "author_association": "OWNER"}
+	}`))
+	if err != nil {
+		t.Fatalf("ParseWebhookCandidate: %v", err)
+	}
+	tasks, err := adapter.BuildTaskContextsForRepoWorkflows(context.Background(), cand)
+	if err != nil {
+		t.Fatalf("BuildTaskContextsForRepoWorkflows: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Workflow.Name != "pr-review-small" {
+		t.Fatalf("got %d tasks (%v), want [pr-review-small]", len(tasks), tasks)
+	}
+	defer os.RemoveAll(tasks[0].Task.PromptDir)
+
+	if tasks[0].Task.DedupKey != "github:shohei-yamagiwa/mochi:pr:77:workflow:pr-review-small" {
+		t.Fatalf("DedupKey = %q", tasks[0].Task.DedupKey)
+	}
+	if !tasks[0].Workflow.Agents[0].PromptFromRepo {
+		t.Fatal("expected .mochi/prompts/small.md to be marked PromptFromRepo=true")
+	}
+	promptData, err := os.ReadFile(filepath.Join(tasks[0].Task.PromptDir, ".mochi", "prompts", "small.md"))
+	if err != nil || string(promptData) != "SMALL_BASE_PROMPT" {
+		t.Fatalf("unexpected materialized prompt: err=%v data=%q", err, string(promptData))
+	}
+	for _, ref := range requestedRefs {
+		if ref != "base777" {
+			t.Fatalf("expected all workflow/prompt fetches from base777, got %q", ref)
+		}
+	}
+
+	// 2. develop -> main pull_request opened matches pr-review only (and requires no PromptDir since it uses built-in prompts).
+	baseBranch = "main"
+	headBranch = "develop"
+	prCand, err := adapter.ParseWebhookCandidate("pull_request", []byte(`{
+		"action": "opened",
+		"number": 77,
+		"installation": {"id": 99},
+		"repository": {"name": "mochi", "owner": {"login": "shohei-yamagiwa"}},
+		"pull_request": {"number": 77, "draft": false}
+	}`))
+	if err != nil {
+		t.Fatalf("ParseWebhookCandidate(pr): %v", err)
+	}
+	mainTasks, err := adapter.BuildTaskContextsForRepoWorkflows(context.Background(), prCand)
+	if err != nil {
+		t.Fatalf("BuildTaskContextsForRepoWorkflows(main): %v", err)
+	}
+	if len(mainTasks) != 1 || mainTasks[0].Workflow.Name != "pr-review" {
+		t.Fatalf("got %d tasks, want [pr-review]", len(mainTasks))
+	}
+	if mainTasks[0].Task.PromptDir != "" {
+		t.Fatalf("expected empty PromptDir for workflow using built-in prompts, got %q", mainTasks[0].Task.PromptDir)
+	}
+}

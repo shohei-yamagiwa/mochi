@@ -16,7 +16,7 @@ command, and example checks you performed.
 
 - [ ] `go vet ./...`
 - [ ] `go test -race ./...`
-- [ ] `go run ./cmd/mochi validate configs/workflows/pr-review.yaml configs/workflows/pr-review-small.yaml`
+- [ ] `go run ./cmd/mochi validate .mochi/workflows/pr-review.yaml .mochi/workflows/pr-review-small.yaml`
 
 <!--
 Optional sections. Add the ones that apply and delete the rest.

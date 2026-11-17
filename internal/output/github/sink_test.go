@@ -839,3 +839,58 @@ func TestGitHubSink_EnforcesVerdictsAndHTTP422Fallback(t *testing.T) {
 		})
 	}
 }
+
+func TestGitHubSink_CheckNameQualifiesByWorkflowUnlessOverridden(t *testing.T) {
+	var createdNames []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/shohei-yamagiwa/mochi/check-runs":
+			var req capturedCheckReq
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			createdNames = append(createdNames, req.Name)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": int64(len(createdNames))})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	baseURL := srv.URL + "/"
+	ghClient, err := github.NewClient(github.WithHTTPClient(srv.Client()), github.WithURLs(&baseURL, &baseURL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink, err := ghoutput.NewSink(ghinput.NewStaticClientFactory(ghClient, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t1 := testTaskContext()
+	t1.RunID = "run-small"
+	t1.WorkflowName = "pr-review-small"
+	if err := sink.OnRunStarted(context.Background(), t1); err != nil {
+		t.Fatal(err)
+	}
+
+	custom := sink.WithConfig(domain.SinkConfig{
+		Type:    "github_pr_review",
+		Options: map[string]any{"check_name": "Custom Security Gate"},
+	})
+	t2 := testTaskContext()
+	t2.RunID = "run-custom"
+	t2.WorkflowName = "security-gate"
+	if err := custom.OnRunStarted(context.Background(), t2); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(createdNames) != 2 {
+		t.Fatalf("createdNames = %v, want 2 entries", createdNames)
+	}
+	if createdNames[0] != "Mochi Code Review (pr-review-small)" {
+		t.Fatalf("createdNames[0] = %q, want %q", createdNames[0], "Mochi Code Review (pr-review-small)")
+	}
+	if createdNames[1] != "Custom Security Gate" {
+		t.Fatalf("createdNames[1] = %q, want %q", createdNames[1], "Custom Security Gate")
+	}
+}

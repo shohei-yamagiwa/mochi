@@ -137,6 +137,49 @@ func ParseWorkflow(data []byte) (*domain.Workflow, error) {
 	return wf, nil
 }
 
+// ParseRepoWorkflow decodes a repository-owned workflow YAML (e.g. .mochi/workflows/*.yaml)
+// fetched from the base branch. Prompt paths under .mochi/ are marked PromptFromRepo=true
+// so PromptEngine reads them from the repository bundle; non-.mochi/ paths must match built-in
+// embedded prompts.
+func ParseRepoWorkflow(data []byte) (*domain.Workflow, error) {
+	wf, err := ParseWorkflow(data)
+	if err != nil {
+		return nil, err
+	}
+	for i := range wf.Agents {
+		cleanSlash := filepath.ToSlash(filepath.Clean(filepath.FromSlash(wf.Agents[i].PromptFile)))
+		if strings.HasPrefix(cleanSlash, ".mochi/") {
+			if err := ensureSafeRepoPromptPath(wf.Agents[i].PromptFile); err != nil {
+				return nil, fmt.Errorf("agent %q prompt_file: %w", wf.Agents[i].Role, err)
+			}
+			wf.Agents[i].PromptFile = cleanSlash
+			wf.Agents[i].PromptFromRepo = true
+		} else {
+			if _, err := ReadEmbeddedPrompt(wf.Agents[i].PromptFile); err != nil {
+				return nil, fmt.Errorf("agent %q prompt_file %q must be under .mochi/ or match a built-in prompt: %w", wf.Agents[i].Role, wf.Agents[i].PromptFile, err)
+			}
+			wf.Agents[i].PromptFromRepo = false
+		}
+	}
+	cleanSynth := filepath.ToSlash(filepath.Clean(filepath.FromSlash(wf.Synthesizer.PromptFile)))
+	if strings.HasPrefix(cleanSynth, ".mochi/") {
+		if err := ensureSafeRepoPromptPath(wf.Synthesizer.PromptFile); err != nil {
+			return nil, fmt.Errorf("synthesizer prompt_file: %w", err)
+		}
+		wf.Synthesizer.PromptFile = cleanSynth
+		wf.Synthesizer.PromptFromRepo = true
+	} else {
+		if _, err := ReadEmbeddedPrompt(wf.Synthesizer.PromptFile); err != nil {
+			return nil, fmt.Errorf("synthesizer prompt_file %q must be under .mochi/ or match a built-in prompt: %w", wf.Synthesizer.PromptFile, err)
+		}
+		wf.Synthesizer.PromptFromRepo = false
+	}
+	if err := ValidateWorkflow(wf, ""); err != nil {
+		return nil, err
+	}
+	return wf, nil
+}
+
 // ParseResolvedWorkflow decodes a persisted resolved_config_yaml snapshot (which may contain prompt_from_repo).
 func ParseResolvedWorkflow(data []byte) (*domain.Workflow, error) {
 	var wf domain.Workflow
@@ -396,6 +439,8 @@ func MergeRepoOverrides(base *domain.Workflow, overrideYAML []byte) (*domain.Wor
 func cloneWorkflow(wf *domain.Workflow) *domain.Workflow {
 	out := *wf
 	out.Input.Triggers.Events = slices.Clone(wf.Input.Triggers.Events)
+	out.Input.Triggers.BaseBranches = slices.Clone(wf.Input.Triggers.BaseBranches)
+	out.Input.Triggers.HeadBranches = slices.Clone(wf.Input.Triggers.HeadBranches)
 	out.Input.Triggers.AllowedCommentAssociations = slices.Clone(wf.Input.Triggers.AllowedCommentAssociations)
 	out.Agents = make([]domain.RoleConfig, len(wf.Agents))
 	for i, a := range wf.Agents {
@@ -531,6 +576,9 @@ func validatePromptPath(promptPath, baseDir string) error {
 	if baseDir != "" {
 		root, err := os.OpenRoot(baseDir)
 		if err != nil {
+			if _, embErr := ReadEmbeddedPrompt(promptPath); embErr == nil {
+				return nil
+			}
 			return fmt.Errorf("open prompt root %q: %w", baseDir, err)
 		}
 		defer root.Close()
@@ -538,6 +586,9 @@ func validatePromptPath(promptPath, baseDir string) error {
 		cleanRel := filepath.ToSlash(filepath.Clean(filepath.FromSlash(promptPath)))
 		info, err := root.Stat(cleanRel)
 		if err != nil {
+			if _, embErr := ReadEmbeddedPrompt(promptPath); embErr == nil {
+				return nil
+			}
 			return fmt.Errorf("stat prompt file %q under %q: %w", cleanRel, baseDir, err)
 		}
 		if info.IsDir() {

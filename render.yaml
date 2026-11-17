@@ -17,8 +17,6 @@ services:
         value: "8080"
       - key: MOCHI_DB_PATH
         value: /data/mochi.db
-      - key: MOCHI_WORKFLOW
-        value: configs/workflows/pr-review.yaml
       - key: MOCHI_WORKERS
         value: "1"
       - key: MOCHI_QUEUE_SIZE
@@ -31,7 +29,7 @@ services:
         sync: false
       - key: MOCHI_API_TOKEN
         generateValue: true
-      - key: DAYTONA_API_KEY
+      - key: MOCHI_MASTER_KEY
         sync: false
-      - key: GEMINI_API_KEY
+      - key: DAYTONA_API_KEY
         sync: false

@@ -3,7 +3,9 @@ package config
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
 	"net/url"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"text/template"
 	"unicode/utf8"
 
+	"github.com/shohei-yamagiwa/mochi/configs"
 	"github.com/shohei-yamagiwa/mochi/internal/domain"
 )
 
@@ -250,29 +253,65 @@ func (e *PromptEngine) RenderRepoFile(promptPath string, data PromptData) (strin
 	return e.RenderPrompt(promptPath, true, data)
 }
 
-// RenderPrompt reads a prompt template from either serverDir (fromRepo=false) or repoDir (fromRepo=true)
-// using os.Root confinement so symlinks cannot escape the designated root.
+// RenderPrompt reads a prompt template from either serverDir / embedded prompts (fromRepo=false)
+// or repoDir (fromRepo=true) using os.Root confinement so symlinks cannot escape the designated root.
 func (e *PromptEngine) RenderPrompt(promptPath string, fromRepo bool, data PromptData) (string, error) {
-	rootDir := e.serverDir
-	if fromRepo {
-		if err := ensureSafeRepoPromptPath(promptPath); err != nil {
-			return "", err
-		}
-		if strings.TrimSpace(e.repoDir) == "" {
-			return "", fmt.Errorf("cannot render repo prompt %q: repo prompt root is not configured", promptPath)
-		}
-		rootDir = e.repoDir
-	} else {
-		if err := ensureSafeRelativePath(promptPath); err != nil {
-			return "", err
-		}
-	}
-
-	raw, err := readFileInRoot(rootDir, promptPath)
+	raw, err := e.ReadPrompt(promptPath, fromRepo)
 	if err != nil {
 		return "", err
 	}
 	return e.RenderTemplate(promptPath, string(raw), data)
+}
+
+// ReadPrompt reads raw prompt template bytes from repoDir (fromRepo=true) or serverDir with
+// fallback to built-in embedded prompts (fromRepo=false).
+func (e *PromptEngine) ReadPrompt(promptPath string, fromRepo bool) ([]byte, error) {
+	if fromRepo {
+		if err := ensureSafeRepoPromptPath(promptPath); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(e.repoDir) == "" {
+			return nil, fmt.Errorf("cannot read repo prompt %q: repo prompt root is not configured", promptPath)
+		}
+		return readFileInRoot(e.repoDir, promptPath)
+	}
+	if err := ensureSafeRelativePath(promptPath); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(e.serverDir) != "" {
+		raw, err := readFileInRoot(e.serverDir, promptPath)
+		if err == nil {
+			return raw, nil
+		}
+		if embedded, embErr := ReadEmbeddedPrompt(promptPath); embErr == nil {
+			return embedded, nil
+		}
+		return nil, err
+	}
+	return ReadEmbeddedPrompt(promptPath)
+}
+
+// ReadEmbeddedPrompt reads a built-in prompt template embedded into the Mochi binary.
+func ReadEmbeddedPrompt(promptPath string) ([]byte, error) {
+	if err := ensureSafeRelativePath(promptPath); err != nil {
+		return nil, err
+	}
+	cleanRel := filepath.ToSlash(filepath.Clean(filepath.FromSlash(promptPath)))
+	embeddedPath := cleanRel
+	if strings.HasPrefix(cleanRel, "configs/") {
+		embeddedPath = strings.TrimPrefix(cleanRel, "configs/")
+	}
+	if !strings.HasPrefix(embeddedPath, "prompts/") {
+		return nil, fmt.Errorf("embedded prompt %q not found: %w", cleanRel, fs.ErrNotExist)
+	}
+	raw, err := fs.ReadFile(configs.PromptsFS, embeddedPath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("embedded prompt %q not found: %w", cleanRel, err)
+		}
+		return nil, fmt.Errorf("read embedded prompt %q: %w", cleanRel, err)
+	}
+	return raw, nil
 }
 
 // RenderTemplate parses and executes an inline Go text/template string with strict missingkey=error handling.

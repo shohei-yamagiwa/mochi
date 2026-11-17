@@ -8,7 +8,7 @@ needed to check the server and sandbox images. From a clone of this repository:
 ```sh
 go mod download
 go build -o mochi ./cmd/mochi
-go run ./cmd/mochi validate configs/workflows/pr-review.yaml configs/workflows/pr-review-small.yaml
+go run ./cmd/mochi validate .mochi/workflows/pr-review.yaml .mochi/workflows/pr-review-small.yaml
 ```
 
 Unit tests and plain workflow validation do not require GitHub, LLM, or Daytona
@@ -18,8 +18,9 @@ in [deployment](docs/deployment.md). The standalone binary does not load `.env`.
 ## Project layout
 
 - `cmd/mochi/`: CLI commands, environment configuration, and runtime wiring.
-- `internal/`: adapters, orchestration, providers, tools, persistence, and output.
-- `configs/`: workflow presets and prompt templates used at runtime.
+- `internal/`: adapters, orchestration, credentials, providers, tools, persistence, and output.
+- `configs/`: built-in prompt templates embedded into the binary via [`configs/embed.go`](configs/embed.go).
+- `.mochi/workflows/`: workflow definitions for this repository.
 - `deploy/`: container entrypoint and Daytona snapshot Dockerfiles.
 - `docs/`: usage, configuration, deployment, and architecture guides.
 
@@ -35,14 +36,14 @@ checks used by [CI](.github/workflows/ci.yml):
 ```sh
 go vet ./...
 go test -race ./...
-go run ./cmd/mochi validate configs/workflows/pr-review.yaml configs/workflows/pr-review-small.yaml
+go run ./cmd/mochi validate .mochi/workflows/pr-review.yaml .mochi/workflows/pr-review-small.yaml
 ```
 
-For packaging changes, also check the server image and packaged workflow files:
+For packaging changes, also check the server image and repository workflow files:
 
 ```sh
 docker build -t mochi:dev .
-docker run --rm mochi:dev validate configs/workflows/pr-review.yaml configs/workflows/pr-review-small.yaml
+docker run --rm -v "$PWD/.mochi:/app/.mochi:ro" mochi:dev validate .mochi/workflows/pr-review.yaml .mochi/workflows/pr-review-small.yaml
 docker build -f deploy/sandbox/go.Dockerfile -t mochi:sandbox-go .
 docker run --rm mochi:sandbox-go sh -c 'go version && git --version && rg --version'
 ```

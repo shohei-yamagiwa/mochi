@@ -1,54 +1,105 @@
 # Configuration
 
-Server workflows are YAML files under [`configs/workflows/`](../configs/workflows/).
-Prompts are Go `text/template` files under [`configs/prompts/`](../configs/prompts/).
-Start by copying a bundled workflow, then validate it with `mochi validate`.
-The field definitions live in
-[`internal/domain/workflow.go`](../internal/domain/workflow.go); unknown YAML
-fields are rejected.
+In server mode, Mochi discovers workflow YAML files directly from each
+installed repository's `.mochi/workflows/*.yaml` (or `*.yml`) directory on the
+PR base branch. Built-in prompt templates under [`configs/prompts/`](../configs/prompts/)
+are embedded in the Mochi binary, while repositories can optionally place custom
+prompts under `.mochi/`.
 
-## Workflow settings
+Validate workflow files locally with `mochi validate`. The field definitions
+live in [`internal/domain/workflow.go`](../internal/domain/workflow.go);
+unknown YAML fields are rejected.
+
+## Repository workflows and examples
+
+This repository maintains two example workflows under `.mochi/workflows/`:
+
+- [`.mochi/workflows/pr-review.yaml`](../.mochi/workflows/pr-review.yaml):
+  five specialists (correctness, security, performance/architecture,
+  maintainability, and test-runner) triggered on PRs targeting `main`
+  (`base_branches: ["main"]`) or `/mochi review`.
+- [`.mochi/workflows/pr-review-small.yaml`](../.mochi/workflows/pr-review-small.yaml):
+  one correctness specialist triggered on PRs targeting `develop`
+  (`base_branches: ["develop"]`) or `/mochi review-small`.
 
 | Section | Controls |
 | --- | --- |
 | `version`, `name`, `description` | Workflow identity and description |
-| `input` | Adapter and GitHub trigger filters |
-| `repo_overrides` | Whether repository configuration, prompts, or images may override server settings |
+| `input` | Adapter and GitHub trigger filters (`events`, `base_branches`, `head_branches`, `comment_command`) |
+| `repo_overrides` | Optional `.mochi/config.yaml` overrides when running a static server workflow |
 | `sandbox` | Daytona snapshot or image, forking, and setup timeout |
 | `agents` | Specialist roles, prompts, models, tools, and budgets |
 | `synthesizer` | Final synthesis prompt, model, and budgets |
 | `output.sinks` | Artifact destinations and presentation settings |
 
-The [full preset](../configs/workflows/pr-review.yaml) defines correctness,
-security, performance/architecture, maintainability, and test roles. The
-[small preset](../configs/workflows/pr-review-small.yaml) defines correctness only.
-Both use a synthesizer and independent specialist sandboxes with
-`fork_from_base: false`. Customize `sandbox.default_snapshot` for the language
-runtimes needed by your target repositories; see [snapshot setup](deployment.md#prepare-daytona-snapshots).
+## GitHub triggers and branch filters
 
-GitHub triggers include an event list, `comment_command`, `ignore_drafts`, and
-optional `allowed_comment_associations`. The default command associations are
-`OWNER`, `MEMBER`, and `COLLABORATOR`. Trigger filters are evaluated before
-repository overrides are loaded. An empty event list restores default events.
+GitHub triggers support:
 
-## LLM providers
+- `events`: PR actions (`opened`, `synchronize`, `reopened`, `ready_for_review`,
+  etc.). Omitting `events` defaults to `["opened", "synchronize", "reopened",
+  "ready_for_review"]`. Setting `events: []` explicitly disables automatic PR
+  event triggering (useful for comment-only workflows).
+- `base_branches`: optional list of target branch patterns (globs supporting `*`,
+  `?`, and `**`, e.g. `["main"]`, `["release/**"]`). Empty matches all base
+  branches.
+- `head_branches`: optional list of source branch patterns using the same glob
+  syntax (e.g. `["develop"]`, `["feature/**"]`). Empty matches all head
+  branches.
+- `comment_command`: slash command in PR comments (e.g. `"/mochi review"`).
+  Comment commands still respect `base_branches` and `head_branches` filters.
+- `allowed_comment_associations`: defaults to `["OWNER", "MEMBER", "COLLABORATOR"]`.
+- `ignore_drafts`: skips draft PRs when true.
 
-Each specialist and the synthesizer has its own `llm` settings. The executable
-registers providers when the corresponding environment variables are set:
+Example routing `feature/* -> develop` PRs to a lightweight review and
+`develop -> main` PRs to a full review:
 
-| YAML provider | Environment |
-| --- | --- |
-| `gemini` | `GEMINI_API_KEY`, falling back to `GOOGLE_API_KEY` |
-| `openai` | `OPENAI_API_KEY` |
-| `anthropic` | `ANTHROPIC_API_KEY` |
-| `openai_compat` | `OPENAI_COMPAT_BASE_URL`; optional `OPENAI_COMPAT_API_KEY`, falling back to `OPENAI_API_KEY` |
+```yaml
+# .mochi/workflows/pr-review-small.yaml
+input:
+  adapter: github_pr
+  triggers:
+    events: ["opened", "synchronize", "reopened", "ready_for_review"]
+    base_branches: ["develop"]
+    head_branches: ["feature/**"]
+    comment_command: "/mochi review-small"
+    ignore_drafts: true
+```
 
-Set `model` to an identifier available to your account. Optional settings include
-`temperature`, `max_output_tokens`, `reasoning_effort`, and `base_url`. Supported
-reasoning values are `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`;
-providers map these to their own supported levels. When changing providers or
-models, update every relevant specialist and the synthesizer, then verify actual
-API access. Local runtime validation does not check model availability.
+```yaml
+# .mochi/workflows/pr-review.yaml
+input:
+  adapter: github_pr
+  triggers:
+    events: ["opened", "synchronize", "reopened", "ready_for_review"]
+    base_branches: ["main"]
+    head_branches: ["develop"]
+    comment_command: "/mochi review"
+    ignore_drafts: true
+```
+
+Multiple matching workflows in `.mochi/workflows/` run independently on the same
+PR, each creating its own Check Run (`Mochi Code Review (<workflow_name>)`) and
+run record (`DedupKey` qualified by workflow name).
+
+## LLM providers and credentials
+
+Each specialist and the synthesizer defines its own `llm` settings (`provider`,
+`model`, optional `temperature`, `max_output_tokens`, `reasoning_effort`, and
+`base_url`). Supported providers are `gemini`, `openai`, `anthropic`, and
+`openai_compat`. Supported `reasoning_effort` values are `minimal`, `low`,
+`medium`, `high`, `xhigh`, and `max`.
+
+- **In server mode (`mochi serve`)**: API keys are resolved **strictly per
+  repository** from encrypted SQLite credentials managed via
+  [`mochi credentials`](usage.md#manage-per-repository-credentials) or the HTTP
+  API (`/api/v1/repos/{owner}/{repo}/credentials/{provider}`). Server environment
+  variables (`GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) are never
+  used as fallbacks; missing repository credentials fail the run with an
+  explicit error.
+- **In local CLI mode (`mochi run`)**: providers are read from environment
+  variables (`GEMINI_API_KEY` / `GOOGLE_API_KEY`, `OPENAI_API_KEY`,
+  `ANTHROPIC_API_KEY`, `OPENAI_COMPAT_BASE_URL` / `OPENAI_COMPAT_API_KEY`).
 
 ## Tools, prompts, and budgets
 
@@ -58,45 +109,21 @@ tools in its `tools` list. `exec_command` can modify the sandbox through shell
 commands even when `write_file` is absent. The synthesizer uses structured model
 output and has no execution tools.
 
-Prompts receive secret-free `.Task` and `.Workflow` contexts and the current
-`.Role` for specialists. Synthesis also receives `.AgentSummaries` and `.Coverage`.
-Helpers include `shortSHA`, `truncate`, `join`, `toJSON`, `indent`, and `default`.
-See [`internal/config/prompt.go`](../internal/config/prompt.go) for exact fields
-and helper arguments. Server prompt paths are relative to `--base-dir` or the
-automatically detected project root.
+Prompts are Go `text/template` files receiving secret-free `.Task` and
+`.Workflow` contexts and `.Role` for specialists (plus `.AgentSummaries` and
+`.Coverage` for the synthesizer). Helpers include `shortSHA`, `truncate`, `join`,
+`toJSON`, `indent`, and `default`; see
+[`internal/config/prompt.go`](../internal/config/prompt.go).
+
+In repository workflows (`.mochi/workflows/*.yaml`), `prompt_file` may reference:
+
+- **Built-in embedded prompts** (e.g. `configs/prompts/correctness.md`): bundled
+  directly in the Mochi binary via [`configs/embed.go`](../configs/embed.go), so
+  target repositories do not need to copy prompt files.
+- **Repository-local prompts** under `.mochi/` (e.g. `.mochi/prompts/custom.md`):
+  automatically fetched from the PR base branch commit (`BaseSHA`).
 
 Budgets set `run_timeout` using duration strings such as `60s` or `15m`.
-
-## Repository overrides
-
-When enabled by the server workflow, Mochi reads `.mochi/config.yaml` and custom
-prompts from the PR base branch. The full preset enables overrides, including
-custom prompts, sandbox images, and per-role models; the small preset disables
-overrides.
-For example, a repository can adjust a role's timeout and an existing sink:
-
-```yaml
-agents:
-  - role: correctness
-    budgets:
-      run_timeout: 20m
-output:
-  sinks:
-    - type: github_pr_review
-      min_severity: medium
-      min_confidence: 0.8
-```
-
-Overrides may disable existing roles, reduce tool allowlists, tune supported
-inference and `run_timeout` settings, and adjust output filtering. Output-token
-requests are clamped to server limits. Keep at least one specialist enabled.
-
-Custom `prompt_file` paths must stay under `.mochi/` and require
-`allow_custom_prompts`. Sandbox changes require `allow_custom_images`. Model
-changes require `allow_custom_models`. Overrides
-cannot change trigger rules, providers, API base URLs, or sink destinations, and
-cannot add roles, tools, or sinks. The allowlist and merging rules are implemented
-in [`internal/config/loader.go`](../internal/config/loader.go).
 
 ## Output sinks
 
@@ -109,11 +136,17 @@ in [`internal/config/loader.go`](../internal/config/loader.go).
 
 For GitHub output, the review event and Check Run conclusion enforce the artifact's
 verdict (`APPROVE` to `success`, `REQUEST_CHANGES` to `failure`, and `COMMENT` to
-`neutral`, falling back to a `COMMENT` review if GitHub returns HTTP 422). Severity
-thresholds are `nit`, `low`, `medium`, `high`, or `critical`; confidence ranges from
-0 to 1. The bundled workflows use minimum severity `low` and minimum confidence
-`0.7`. CLI runs suppress GitHub delivery unless `--post-github` is set.
+`neutral`, falling back to a `COMMENT` review if GitHub returns HTTP 422). When
+the default Check Run name is used, Mochi qualifies it as
+`Mochi Code Review (<workflow_name>)` so multiple workflows on a single PR do not
+overwrite each other's Check Runs. Severity thresholds are `nit`, `low`,
+`medium`, `high`, or `critical`; confidence ranges from `0` to `1`. CLI runs
+suppress GitHub delivery unless `--post-github` is set.
 
-Keep server workflow files containing webhook secrets private. Prompt contexts
-omit sink URLs and options, but resolved workflow configuration is persisted for
-inspection, so protect database and API access as well.
+## Static server mode and repository overrides (optional)
+
+If `--workflow` or `MOCHI_WORKFLOW` is explicitly passed to `mochi serve`, Mochi
+switches to static workflow mode instead of per-repository `.mochi/workflows/`
+discovery. In that mode, `repo_overrides` can still allow `.mochi/config.yaml`
+on the PR base branch to adjust existing roles, tools, models, budgets, or sink
+thresholds; see [`internal/config/loader.go`](../internal/config/loader.go).

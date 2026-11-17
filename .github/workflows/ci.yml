@@ -18,8 +18,8 @@ jobs:
       - run: go test -race ./...
       - name: Build deployment image
         run: docker build -t mochi:ci .
-      - name: Validate packaged workflows
-        run: docker run --rm mochi:ci validate configs/workflows/pr-review.yaml configs/workflows/pr-review-small.yaml
+      - name: Validate repository workflows with container binary
+        run: docker run --rm -v "${{ github.workspace }}/.mochi:/app/.mochi:ro" mochi:ci validate .mochi/workflows/pr-review.yaml .mochi/workflows/pr-review-small.yaml
       - name: Build Go review sandbox image
         run: docker build -f deploy/sandbox/go.Dockerfile -t mochi:sandbox-go .
       - name: Verify sandbox toolchain
