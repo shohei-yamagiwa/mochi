@@ -6,6 +6,10 @@ Rules for AI agents working in this repository.
 
 - Write all documentation and all content on GitHub (pull requests, issues, comments, and similar) in English.
 
+## Commit messages
+
+- Follow [Conventional Commits](https://www.conventionalcommits.org/) for all commit messages.
+
 ## Comments in code
 
 - Add comments only to code that is invariant and non-obvious.
