@@ -65,11 +65,7 @@ See [`internal/config/prompt.go`](../internal/config/prompt.go) for exact fields
 and helper arguments. Server prompt paths are relative to `--base-dir` or the
 automatically detected project root.
 
-Budgets set `max_turns`, cumulative `max_tokens`, `command_timeout`, and
-`run_timeout`. Durations use strings such as `60s` or `5m`. Token budgets count
-input and output across calls, including cached input tokens; accounting occurs
-after calls. Specialists can receive a final submission-only turn near their
-budget. These are execution limits, not exact monetary caps.
+Budgets set `run_timeout` using duration strings such as `60s` or `15m`.
 
 ## Repository overrides
 
@@ -77,14 +73,13 @@ When enabled by the server workflow, Mochi reads `.mochi/config.yaml` and custom
 prompts from the PR base branch. The full preset enables overrides, including
 custom prompts, sandbox images, and per-role models; the small preset disables
 overrides.
-For example, a repository can lower a role's budget and adjust an existing sink:
+For example, a repository can adjust a role's timeout and an existing sink:
 
 ```yaml
 agents:
   - role: correctness
     budgets:
-      max_turns: 8
-      run_timeout: 3m
+      run_timeout: 20m
 output:
   sinks:
     - type: github_pr_review
@@ -93,8 +88,8 @@ output:
 ```
 
 Overrides may disable existing roles, reduce tool allowlists, tune supported
-inference settings, and adjust output filtering. Budget and output-token requests
-are clamped to server limits. Keep at least one specialist enabled.
+inference and `run_timeout` settings, and adjust output filtering. Output-token
+requests are clamped to server limits. Keep at least one specialist enabled.
 
 Custom `prompt_file` paths must stay under `.mochi/` and require
 `allow_custom_prompts`. Sandbox changes require `allow_custom_images`. Model

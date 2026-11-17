@@ -34,9 +34,6 @@ agents:
       enabled: true
     tools: [read_file, list_dir, search_code, git_diff, exec_command, submit_output]
     budgets:
-      max_turns: 8
-      max_tokens: 40000
-      command_timeout: 60s
       run_timeout: 3m
 synthesizer:
   prompt_file: configs/prompts/synthesizer.md
@@ -46,8 +43,6 @@ synthesizer:
     reasoning_effort: medium
     max_output_tokens: 4000
   budgets:
-    max_turns: 2
-    max_tokens: 20000
     run_timeout: 2m
 output:
   sinks:

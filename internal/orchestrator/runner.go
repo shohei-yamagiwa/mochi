@@ -23,7 +23,7 @@ import (
 	"github.com/shohei-yamagiwa/mochi/internal/tools"
 )
 
-const defaultSynthesizerMaxTurns = 3
+const defaultSynthesizerMaxTurns = 5
 
 var errSpecialistSandbox = errors.New("sandbox setup failed")
 
@@ -573,11 +573,7 @@ func (r *Runner) runSynthesizer(
 		return agentRun, runErr
 	}
 
-	maxTurns := wf.Synthesizer.Budgets.MaxTurns
-	if maxTurns <= 0 {
-		maxTurns = defaultSynthesizerMaxTurns
-	}
-	maxTokens := wf.Synthesizer.Budgets.MaxTokens
+	maxTurns := defaultSynthesizerMaxTurns
 
 	messages := []llm.Message{
 		{
@@ -592,12 +588,7 @@ func (r *Runner) runSynthesizer(
 			return ar, nil, nil, err
 		}
 		if agentRun.TurnsUsed >= maxTurns {
-			err := fmt.Errorf("synthesizer: %w (%d)", ErrMaxTurnsExceeded, maxTurns)
-			ar, _ := finalizeSynth(domain.AgentRunStatusFailed, nil, err)
-			return ar, nil, nil, err
-		}
-		if maxTokens > 0 && (agentRun.InputTokens+agentRun.OutputTokens) >= maxTokens {
-			err := fmt.Errorf("synthesizer: %w (%d/%d)", ErrMaxTokensExceeded, agentRun.InputTokens+agentRun.OutputTokens, maxTokens)
+			err := fmt.Errorf("synthesizer exceeded max turns (%d)", maxTurns)
 			ar, _ := finalizeSynth(domain.AgentRunStatusFailed, nil, err)
 			return ar, nil, nil, err
 		}
@@ -673,11 +664,6 @@ func (r *Runner) runSynthesizer(
 		rawCandidate := extractSynthesizerJSON(resp)
 		report, valErr := validator.ValidateJSON(rawCandidate)
 		if valErr != nil {
-			if maxTokens > 0 && (agentRun.InputTokens+agentRun.OutputTokens) > maxTokens {
-				err := fmt.Errorf("synthesizer: %w (%d > %d)", ErrMaxTokensExceeded, agentRun.InputTokens+agentRun.OutputTokens, maxTokens)
-				ar, _ := finalizeSynth(domain.AgentRunStatusFailed, nil, err)
-				return ar, nil, nil, err
-			}
 			if agentRun.TurnsUsed >= maxTurns {
 				runErr := fmt.Errorf("synthesizer output validation failed after %d turns: %w", agentRun.TurnsUsed, valErr)
 				ar, _ := finalizeSynth(domain.AgentRunStatusFailed, nil, runErr)
@@ -732,12 +718,6 @@ func sanitizeSpecialistFailureSummary(sr *SpecialistResult) string {
 	}
 	if errors.Is(sr.Error, context.Canceled) || (sr.AgentRun != nil && sr.AgentRun.Status == domain.AgentRunStatusCancelled) {
 		return "failed (cancelled)"
-	}
-	if errors.Is(sr.Error, ErrMaxTurnsExceeded) {
-		return "failed (max_turns_exceeded)"
-	}
-	if errors.Is(sr.Error, ErrMaxTokensExceeded) {
-		return "failed (max_tokens_exceeded)"
 	}
 	if errors.Is(sr.Error, errSpecialistSandbox) {
 		return "failed (sandbox error)"

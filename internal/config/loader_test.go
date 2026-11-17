@@ -239,12 +239,10 @@ input:
 		}
 	})
 
-	t.Run("clamps unset budgets and persists prompt_from_repo", func(t *testing.T) {
-		// Exercise unset-budget ceilings independently of the deployment preset's caps.
+	t.Run("merges run_timeout without clamping, clamps max_output_tokens, and persists prompt_from_repo", func(t *testing.T) {
 		base := *wf
 		base.Agents = append([]domain.RoleConfig(nil), wf.Agents...)
 		base.Agents[4].LLM.MaxOutputTokens = 0
-		base.Synthesizer.Budgets.MaxTokens = 0
 		override := []byte(`
 agents:
   - role: correctness
@@ -253,12 +251,13 @@ agents:
       reasoning_effort: low
     tools: ["read_file", "submit_output"]
     budgets:
-      max_turns: 999
       run_timeout: 2m
   - role: test-runner
     llm:
       max_output_tokens: 999999
       reasoning_effort: high
+    budgets:
+      run_timeout: 45m
   - role: performance-architecture
     enabled: false
   - role: maintainability
@@ -266,7 +265,7 @@ agents:
 synthesizer:
   prompt_file: ".mochi/prompts/synth.md"
   budgets:
-    max_tokens: 99999999
+    run_timeout: 5m
 output:
   sinks:
     - type: github_pr_review
@@ -282,9 +281,6 @@ output:
 		if len(merged.Agents) != 3 {
 			t.Fatalf("expected 3 agents after disabling performance-architecture and maintainability, got %d", len(merged.Agents))
 		}
-		if merged.Agents[0].Budgets.MaxTurns != 15 {
-			t.Fatalf("expected max_turns clamped to base 15, got %d", merged.Agents[0].Budgets.MaxTurns)
-		}
 		if merged.Agents[0].Budgets.RunTimeout.Std() != 2*time.Minute {
 			t.Fatalf("expected run_timeout lowered to 2m, got %v", merged.Agents[0].Budgets.RunTimeout.Std())
 		}
@@ -297,15 +293,18 @@ output:
 		if !merged.Synthesizer.PromptFromRepo || merged.Synthesizer.PromptFile != ".mochi/prompts/synth.md" {
 			t.Fatalf("unexpected synthesizer custom prompt metadata: %+v", merged.Synthesizer)
 		}
-		// test-runner is at index 2 after performance-architecture is disabled.
+		// test-runner is at index 2 after performance-architecture and maintainability are disabled.
 		if merged.Agents[2].LLM.MaxOutputTokens != 16384 {
 			t.Fatalf("expected unset max_output_tokens clamped to ceiling 16384, got %d", merged.Agents[2].LLM.MaxOutputTokens)
 		}
 		if merged.Agents[2].LLM.ReasoningEffort != "high" {
 			t.Fatalf("expected test-runner reasoning_effort raised to high, got %q", merged.Agents[2].LLM.ReasoningEffort)
 		}
-		if merged.Synthesizer.Budgets.MaxTokens != 200000 {
-			t.Fatalf("expected unset synthesizer max_tokens clamped to ceiling 200000, got %d", merged.Synthesizer.Budgets.MaxTokens)
+		if merged.Agents[2].Budgets.RunTimeout.Std() != 45*time.Minute {
+			t.Fatalf("expected test-runner run_timeout raised to 45m without clamping, got %v", merged.Agents[2].Budgets.RunTimeout.Std())
+		}
+		if merged.Synthesizer.Budgets.RunTimeout.Std() != 5*time.Minute {
+			t.Fatalf("expected synthesizer run_timeout raised to 5m without clamping, got %v", merged.Synthesizer.Budgets.RunTimeout.Std())
 		}
 		if len(merged.Agents[0].Tools) != 2 {
 			t.Fatalf("expected subset tools, got %v", merged.Agents[0].Tools)
@@ -333,7 +332,7 @@ output:
 			t.Fatal("expected ParseWorkflow to reject prompt_from_repo=true in server workflow YAML")
 		}
 
-		if wf.Agents[0].Budgets.MaxTurns != 15 || len(wf.Agents) != 5 || wf.Agents[0].PromptFromRepo {
+		if wf.Agents[0].Budgets.RunTimeout.Std() != 15*time.Minute || len(wf.Agents) != 5 || wf.Agents[0].PromptFromRepo {
 			t.Fatal("base workflow was mutated by MergeRepoOverrides")
 		}
 	})

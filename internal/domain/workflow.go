@@ -90,7 +90,7 @@ type ModelConfig struct {
 	BaseURL         string   `yaml:"base_url,omitempty" json:"base_url,omitempty"` // Optional base URL for openai_compat endpoints
 	Temperature     *float64 `yaml:"temperature,omitempty" json:"temperature,omitempty"`
 	MaxOutputTokens int      `yaml:"max_output_tokens,omitempty" json:"max_output_tokens,omitempty"`
-	ReasoningEffort string `yaml:"reasoning_effort,omitempty" json:"reasoning_effort,omitempty"` // "minimal", "low", "medium", "high", "xhigh", "max" (Anthropic clamps "minimal"->"low"; Gemini clamps "xhigh"/"max"->"high")
+	ReasoningEffort string   `yaml:"reasoning_effort,omitempty" json:"reasoning_effort,omitempty"` // "minimal", "low", "medium", "high", "xhigh", "max" (Anthropic clamps "minimal"->"low"; Gemini clamps "xhigh"/"max"->"high")
 }
 
 // Workflow represents a complete declarative workflow definition (e.g. pr-review.yaml).
@@ -156,13 +156,7 @@ type AgentSandboxConfig struct {
 
 // BudgetConfig defines execution guardrails for an agent or synthesizer run.
 type BudgetConfig struct {
-	MaxTurns int `yaml:"max_turns,omitempty" json:"max_turns,omitempty"`
-	// MaxTokens is the cumulative per-agent budget across all turns (sum of per-turn InputTokens + OutputTokens,
-	// including cached input tokens). When a multi-turn agent approaches or first crosses MaxTokens, one final
-	// wind-down turn scoped to submit_output is attempted so findings gathered so far are preserved.
-	MaxTokens      int      `yaml:"max_tokens,omitempty" json:"max_tokens,omitempty"`
-	CommandTimeout Duration `yaml:"command_timeout,omitempty" json:"command_timeout,omitempty"`
-	RunTimeout     Duration `yaml:"run_timeout,omitempty" json:"run_timeout,omitempty"`
+	RunTimeout Duration `yaml:"run_timeout,omitempty" json:"run_timeout,omitempty"`
 }
 
 // SynthesizerConfig defines the final synthesis agent step.
