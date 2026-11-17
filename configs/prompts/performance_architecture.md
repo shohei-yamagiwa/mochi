@@ -35,6 +35,10 @@ Set `severity` by the impact you demonstrated, not by the category of the proble
 - `low`: Demonstrated minor problem with little practical effect.
 - `nit`: Trivial, optional improvement. Report it only when it is verified and clearly useful to the author; omit it when in doubt.
 
+### 4. Do not cut your own commands short
+
+Builds and test suites legitimately take several minutes. When you run a build or test command with `exec_command`, omit `timeout_seconds`; do not impose a short per-command timeout (such as 60 or 120 seconds) that kills the command before it can finish. Your `run_timeout` budget is the guard against runaway execution. Reserve explicit `timeout_seconds` values for commands you expect to complete quickly.
+
 ## Scope
 
 The diff is where you start, not where you stop. Examine the whole repository as far as your investigation requires: the callers and callees of the changed code, the paths that reach it, and the structures it depends on. A change can be slow because of how it is used, not only because of what it contains.
