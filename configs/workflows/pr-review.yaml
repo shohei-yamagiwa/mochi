@@ -38,7 +38,7 @@ agents:
       max_turns: 15
       max_tokens: 120000
       command_timeout: 60s
-      run_timeout: 5m
+      run_timeout: 15m
 
   - role: security
     prompt_file: "configs/prompts/security.md"
@@ -54,14 +54,14 @@ agents:
       max_turns: 15
       max_tokens: 120000
       command_timeout: 60s
-      run_timeout: 5m
+      run_timeout: 15m
 
   - role: performance-architecture
     prompt_file: "configs/prompts/performance_architecture.md"
     llm:
       provider: gemini
-      model: gemini-4-carbon
-      reasoning_effort: medium
+      model: gemini-4-hydrogen
+      reasoning_effort: high
       max_output_tokens: 8192
     sandbox:
       enabled: true
@@ -70,14 +70,14 @@ agents:
       max_turns: 12
       max_tokens: 150000
       command_timeout: 60s
-      run_timeout: 5m
+      run_timeout: 15m
 
   - role: maintainability
     prompt_file: "configs/prompts/maintainability.md"
     llm:
       provider: gemini
-      model: gemini-4-carbon
-      reasoning_effort: medium
+      model: gemini-4-hydrogen
+      reasoning_effort: low
       max_output_tokens: 8192
     sandbox:
       enabled: true
@@ -86,14 +86,14 @@ agents:
       max_turns: 12
       max_tokens: 150000
       command_timeout: 60s
-      run_timeout: 5m
+      run_timeout: 15m
 
   - role: test-runner
     prompt_file: "configs/prompts/test_runner.md"
     llm:
       provider: gemini
-      model: gemini-4-carbon
-      reasoning_effort: medium
+      model: gemini-4-hydrogen
+      reasoning_effort: low
       max_output_tokens: 8192
     sandbox:
       enabled: true
@@ -111,7 +111,7 @@ synthesizer:
   prompt_file: "configs/prompts/synthesizer.md"
   llm:
     provider: gemini
-    model: gemini-4-carbon
+    model: gemini-4-hydrogen
     reasoning_effort: medium
     max_output_tokens: 8192
   budgets:
