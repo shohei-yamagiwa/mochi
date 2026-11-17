@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,6 +20,7 @@ import (
 
 	"github.com/google/go-github/v93/github"
 	"github.com/shohei-yamagiwa/mochi/internal/config"
+	"github.com/shohei-yamagiwa/mochi/internal/credentials"
 	"github.com/shohei-yamagiwa/mochi/internal/domain"
 	ghinput "github.com/shohei-yamagiwa/mochi/internal/input/github"
 	"github.com/shohei-yamagiwa/mochi/internal/llm"
@@ -726,5 +729,362 @@ func TestServer_OutOfOrderWebhookHydration(t *testing.T) {
 	recLLM.mu.Unlock()
 	if strings.Contains(joined, "Older push") || !strings.Contains(joined, "Newer push") {
 		t.Fatalf("expected only Newer push to run, got LLM prompts: %s", joined)
+	}
+}
+
+func TestServer_RepoWorkflowModeByBranchAndCommentCommand(t *testing.T) {
+	st, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "mochi.db"))
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer st.Close()
+
+	mainWF := `version: "1"
+name: pr-review
+input:
+  adapter: github_pr
+  triggers:
+    events: ["opened", "synchronize"]
+    base_branches: ["main"]
+    comment_command: "/mochi review"
+    ignore_drafts: true
+sandbox:
+  provider: daytona
+agents:
+  - role: correctness
+    prompt_file: "configs/prompts/correctness.md"
+    llm:
+      provider: openai
+      model: stub
+    sandbox:
+      enabled: false
+    tools: ["submit_output"]
+synthesizer:
+  prompt_file: "configs/prompts/synthesizer.md"
+  llm:
+    provider: openai
+    model: stub
+output:
+  sinks:
+    - type: console
+`
+	smallWF := `version: "1"
+name: pr-review-small
+input:
+  adapter: github_pr
+  triggers:
+    events: ["opened", "synchronize"]
+    base_branches: ["develop"]
+    head_branches: ["feature/**"]
+    comment_command: "/mochi review-small"
+    ignore_drafts: true
+sandbox:
+  provider: daytona
+agents:
+  - role: correctness
+    prompt_file: "configs/prompts/correctness.md"
+    llm:
+      provider: openai
+      model: stub
+    sandbox:
+      enabled: false
+    tools: ["submit_output"]
+synthesizer:
+  prompt_file: "configs/prompts/synthesizer.md"
+  llm:
+    provider: openai
+    model: stub
+output:
+  sinks:
+    - type: console
+`
+
+	var (
+		mu         sync.Mutex
+		baseBranch = "develop"
+		headBranch = "feature/small-fix"
+	)
+
+	ghMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		bb, hb := baseBranch, headBranch
+		mu.Unlock()
+
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/shohei-yamagiwa/mochi/pulls/10":
+			if strings.Contains(r.Header.Get("Accept"), "application/vnd.github.v3.diff") {
+				_, _ = w.Write([]byte("diff --git a/app.go b/app.go\n--- a/app.go\n+++ b/app.go\n@@ -1 +1,2 @@\n package main\n+var ok = true\n"))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number":   10,
+				"title":    "Branch routed PR",
+				"state":    "open",
+				"draft":    false,
+				"merged":   false,
+				"html_url": "https://github.com/shohei-yamagiwa/mochi/pull/10",
+				"user":     map[string]any{"login": "shohei"},
+				"base":     map[string]any{"ref": bb, "sha": "base10", "repo": map[string]any{"clone_url": "https://github.com/shohei-yamagiwa/mochi.git"}},
+				"head":     map[string]any{"ref": hb, "sha": "head10"},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/shohei-yamagiwa/mochi/pulls/10/files":
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"filename": "app.go", "status": "modified", "additions": 1, "patch": "@@ -1 +1,2 @@\n package main\n+var ok = true"},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/shohei-yamagiwa/mochi/contents/.mochi/workflows":
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"name": "pr-review.yaml", "path": ".mochi/workflows/pr-review.yaml", "type": "file"},
+				{"name": "pr-review-small.yaml", "path": ".mochi/workflows/pr-review-small.yaml", "type": "file"},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/shohei-yamagiwa/mochi/contents/.mochi/workflows/pr-review.yaml":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"type":     "file",
+				"encoding": "base64",
+				"content":  base64.StdEncoding.EncodeToString([]byte(mainWF)),
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/shohei-yamagiwa/mochi/contents/.mochi/workflows/pr-review-small.yaml":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"type":     "file",
+				"encoding": "base64",
+				"content":  base64.StdEncoding.EncodeToString([]byte(smallWF)),
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghMock.Close()
+
+	baseURL := ghMock.URL + "/"
+	ghClient, err := github.NewClient(github.WithHTTPClient(ghMock.Client()), github.WithURLs(&baseURL, &baseURL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hookSecret := "hook-secret"
+	ghAdapter, err := ghinput.NewAdapter(ghinput.NewStaticClientFactory(ghClient, "tok"), ghinput.WithWebhookSecret(hookSecret))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &orchestrator.Runner{
+		Store:              st,
+		DefaultLLMProvider: &stubLLM{name: "openai"},
+		PromptEngine:       config.NewPromptEngine(""),
+	}
+	sched := orchestrator.NewScheduler(runner, orchestrator.SchedulerConfig{MaxWorkers: 2})
+	defer func() { _ = sched.Shutdown(context.Background()) }()
+
+	srv, err := server.New(server.Config{
+		Workflows:     nil, // Repo-workflow mode
+		GitHubAdapter: ghAdapter,
+		Scheduler:     sched,
+		Store:         st,
+		APIToken:      "api-secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	sendComment := func(cmd string) int {
+		body := []byte(`{"action":"created","installation":{"id":1},"repository":{"name":"mochi","owner":{"login":"shohei-yamagiwa"}},"sender":{"login":"shohei","type":"User"},"issue":{"number":10,"state":"open","pull_request":{"url":"https://api.github.com/repos/shohei-yamagiwa/mochi/pulls/10"}},"comment":{"body":"` + cmd + `","author_association":"OWNER"}}`)
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/webhooks/github", bytes.NewReader(body))
+		req.Header.Set("X-GitHub-Event", "issue_comment")
+		req.Header.Set("X-GitHub-Delivery", "deliv-comment")
+		req.Header.Set("X-Hub-Signature-256", signHMAC(hookSecret, body))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// Custom comment command /mochi review-small on feature/small-fix -> develop must trigger pr-review-small.
+	if status := sendComment("/mochi review-small"); status != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", status)
+	}
+	if err := srv.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	var runs []*domain.RunRecord
+	for time.Now().Before(deadline) {
+		runs, err = st.ListRuns(context.Background(), store.RunFilter{Limit: 10})
+		if err == nil && len(runs) == 1 && runs[0].Status == domain.RunStatusCompleted {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(runs) != 1 || runs[0].WorkflowName != "pr-review-small" || runs[0].Status != domain.RunStatusCompleted {
+		t.Fatalf("expected 1 completed pr-review-small run, got %+v", runs)
+	}
+
+	// Now PR is develop -> main and pull_request.opened should trigger pr-review only.
+	mu.Lock()
+	baseBranch = "main"
+	headBranch = "develop"
+	mu.Unlock()
+
+	prBody := []byte(`{"action":"opened","number":10,"installation":{"id":1},"repository":{"name":"mochi","owner":{"login":"shohei-yamagiwa"}},"pull_request":{"number":10,"draft":false}}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/webhooks/github", bytes.NewReader(prBody))
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	req.Header.Set("X-GitHub-Delivery", "deliv-pr")
+	req.Header.Set("X-Hub-Signature-256", signHMAC(hookSecret, prBody))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("PR webhook = %v, err=%v", resp, err)
+	}
+	_ = resp.Body.Close()
+
+	if err := srv.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		runs, err = st.ListRuns(context.Background(), store.RunFilter{Limit: 10})
+		if err == nil && len(runs) == 2 && runs[0].Status == domain.RunStatusCompleted && runs[1].Status == domain.RunStatusCompleted {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(runs) != 2 {
+		t.Fatalf("expected 2 total runs, got %d", len(runs))
+	}
+	seenWF := map[string]bool{}
+	for _, r := range runs {
+		seenWF[r.WorkflowName] = true
+		if r.Status != domain.RunStatusCompleted {
+			t.Fatalf("run %s (%s) status = %q, want completed", r.RunID, r.WorkflowName, r.Status)
+		}
+	}
+	if !seenWF["pr-review-small"] || !seenWF["pr-review"] {
+		t.Fatalf("expected both pr-review-small and pr-review runs, got %v", seenWF)
+	}
+}
+
+func TestServer_RepoCredentialsCRUDAndStrictPerRepoExecution(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "mochi.db"))
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer st.Close()
+
+	cipher, err := credentials.NewCipher([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	credSvc, err := credentials.NewService(st, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Ensure server-level LLM env vars are ignored in server mode.
+	t.Setenv("GEMINI_API_KEY", "global-server-key-should-be-ignored")
+
+	wf, promptDir := setupTestWorkflow(t)
+	wf.Agents[0].LLM.Provider = "gemini"
+	wf.Synthesizer.LLM.Provider = "gemini"
+
+	runner := &orchestrator.Runner{
+		Store:               st,
+		PromptEngine:        config.NewPromptEngine(promptDir),
+		LLMRegistryResolver: credSvc.RunnerResolver(),
+	}
+	sched := orchestrator.NewScheduler(runner, orchestrator.SchedulerConfig{MaxWorkers: 1})
+	defer func() { _ = sched.Shutdown(context.Background()) }()
+
+	srv, err := server.New(server.Config{
+		Workflows:         map[string]*domain.Workflow{wf.Name: wf},
+		DefaultWorkflow:   wf.Name,
+		Scheduler:         sched,
+		Store:             st,
+		CredentialService: credSvc,
+		TriggerSecret:     "trig-secret",
+		APIToken:          "api-secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. Unauthenticated access must fail with 401.
+	resp, err := http.Get(ts.URL + "/api/v1/repos/shohei-yamagiwa/mochi/credentials")
+	if err != nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without APIToken, got %v err=%v", resp, err)
+	}
+	_ = resp.Body.Close()
+
+	// 2. PUT credential stores encrypted key and never returns plaintext api_key.
+	putReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/api/v1/repos/Shohei-Yamagiwa/Mochi/credentials/gemini",
+		strings.NewReader(`{"api_key":"AIza-secret-repo-key"}`))
+	putReq.Header.Set("Authorization", "Bearer api-secret")
+	putResp, err := http.DefaultClient.Do(putReq)
+	if err != nil || putResp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT credential = %v, err=%v", putResp, err)
+	}
+	putBodyBytes, _ := io.ReadAll(putResp.Body)
+	_ = putResp.Body.Close()
+	if strings.Contains(string(putBodyBytes), "AIza-secret-repo-key") {
+		t.Fatalf("PUT response leaked api_key: %s", string(putBodyBytes))
+	}
+
+	// 3. GET credentials lists summaries without api_key.
+	getReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/repos/shohei-yamagiwa/mochi/credentials", nil)
+	getReq.Header.Set("Authorization", "Bearer api-secret")
+	getResp, err := http.DefaultClient.Do(getReq)
+	if err != nil || getResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET credentials = %v, err=%v", getResp, err)
+	}
+	getBodyBytes, _ := io.ReadAll(getResp.Body)
+	_ = getResp.Body.Close()
+	if strings.Contains(string(getBodyBytes), "AIza-secret-repo-key") {
+		t.Fatalf("GET response leaked api_key: %s", string(getBodyBytes))
+	}
+	var listPayload struct {
+		Credentials []*domain.RepoCredentialSummary `json:"credentials"`
+	}
+	if err := json.Unmarshal(getBodyBytes, &listPayload); err != nil {
+		t.Fatal(err)
+	}
+	if len(listPayload.Credentials) != 1 || listPayload.Credentials[0].Provider != "gemini" || !listPayload.Credentials[0].HasAPIKey {
+		t.Fatalf("unexpected credential summary list: %+v", listPayload.Credentials)
+	}
+
+	// 4. DELETE removes credential; second DELETE returns 404.
+	delReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/repos/shohei-yamagiwa/mochi/credentials/gemini", nil)
+	delReq.Header.Set("Authorization", "Bearer api-secret")
+	delResp, err := http.DefaultClient.Do(delReq)
+	if err != nil || delResp.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE credential = %v, err=%v", delResp, err)
+	}
+	_ = delResp.Body.Close()
+
+	delReq2, _ := http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/repos/shohei-yamagiwa/mochi/credentials/gemini", nil)
+	delReq2.Header.Set("Authorization", "Bearer api-secret")
+	delResp2, err := http.DefaultClient.Do(delReq2)
+	if err != nil || delResp2.StatusCode != http.StatusNotFound {
+		t.Fatalf("second DELETE credential = %v, want 404, err=%v", delResp2, err)
+	}
+	_ = delResp2.Body.Close()
+
+	// 5. Triggering run for a repo with no stored credential must fail strictly (not fall back to GEMINI_API_KEY env).
+	trigReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/triggers/pr-review",
+		strings.NewReader(`{"repo_url":"https://github.com/shohei-yamagiwa/mochi.git","repo_owner":"shohei-yamagiwa","repo_name":"mochi","ref":"main"}`))
+	trigReq.Header.Set("Authorization", "Bearer trig-secret")
+	trigResp, err := http.DefaultClient.Do(trigReq)
+	if err != nil || trigResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("POST trigger = %v, err=%v", trigResp, err)
+	}
+	var accepted struct {
+		RunID string `json:"run_id"`
+	}
+	_ = json.NewDecoder(trigResp.Body).Decode(&accepted)
+	_ = trigResp.Body.Close()
+
+	if _, waitErr := sched.WaitForRun(ctx, accepted.RunID); waitErr == nil || !strings.Contains(waitErr.Error(), "missing gemini API key") {
+		t.Fatalf("WaitForRun error = %v, want missing gemini API key error", waitErr)
 	}
 }

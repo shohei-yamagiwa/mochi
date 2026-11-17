@@ -64,4 +64,9 @@ type Store interface {
 	GetCoverageReport(ctx context.Context, runID string) (*domain.CoverageReport, error)
 
 	GetRunDetail(ctx context.Context, runID string) (*RunDetail, error)
+
+	UpsertRepoCredential(ctx context.Context, cred *domain.RepoCredentialRecord) error
+	GetRepoCredential(ctx context.Context, owner, repo, provider string) (*domain.RepoCredentialRecord, error)
+	ListRepoCredentials(ctx context.Context, owner, repo string) ([]*domain.RepoCredentialSummary, error)
+	DeleteRepoCredential(ctx context.Context, owner, repo, provider string) error
 }

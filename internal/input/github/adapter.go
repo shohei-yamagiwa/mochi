@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 
 	"github.com/goccy/go-yaml"
@@ -56,6 +57,25 @@ type PRTarget struct {
 	TriggerEvent   string
 	WorkflowName   string
 	Triggers       *domain.TriggerConfig
+}
+
+// WebhookCandidate represents a verified GitHub PR or PR-comment webhook prior to
+// evaluating repository-defined workflows under .mochi/workflows/*.yaml.
+type WebhookCandidate struct {
+	Owner                    string
+	Repo                     string
+	PRNumber                 int
+	InstallationID           int64
+	TriggerEvent             string
+	PRAction                 string
+	CommentBody              string
+	CommentAuthorAssociation string
+}
+
+// RepoWorkflowTask pairs a matched repository-owned workflow with its built TaskContext.
+type RepoWorkflowTask struct {
+	Workflow *domain.Workflow
+	Task     *domain.TaskContext
 }
 
 // Option configures a GitHub PR InputAdapter.
@@ -171,8 +191,10 @@ func (a *Adapter) ParseWebhookEvent(eventType string, payload []byte, overrideTr
 	case *github.PullRequestEvent:
 		action := ev.GetAction()
 		allowedEvents := triggers.Events
-		if len(allowedEvents) == 0 {
-			allowedEvents = defaultPREvents
+		if overrideTriggers == nil || overrideTriggers.Events == nil {
+			if len(allowedEvents) == 0 {
+				allowedEvents = defaultPREvents
+			}
 		}
 		if !slices.Contains(allowedEvents, action) {
 			return nil, fmt.Errorf("%w: pull_request action %q not in %v", ErrIgnoredEvent, action, allowedEvents)
@@ -186,6 +208,12 @@ func (a *Adapter) ParseWebhookEvent(eventType string, payload []byte, overrideTr
 		}
 		if state := strings.TrimSpace(pr.GetState()); state != "" && !strings.EqualFold(state, "open") && action != "closed" {
 			return nil, fmt.Errorf("%w: pull_request #%d state is %q", ErrIgnoredEvent, pr.GetNumber(), state)
+		}
+		if baseBranch := strings.TrimSpace(pr.GetBase().GetRef()); baseBranch != "" && !MatchBranches(triggers.BaseBranches, baseBranch) {
+			return nil, fmt.Errorf("%w: pull_request #%d base branch %q does not match %v", ErrIgnoredEvent, pr.GetNumber(), baseBranch, triggers.BaseBranches)
+		}
+		if headBranch := strings.TrimSpace(pr.GetHead().GetRef()); headBranch != "" && !MatchBranches(triggers.HeadBranches, headBranch) {
+			return nil, fmt.Errorf("%w: pull_request #%d head branch %q does not match %v", ErrIgnoredEvent, pr.GetNumber(), headBranch, triggers.HeadBranches)
 		}
 		owner, repo := extractRepoOwnerName(ev.GetRepo())
 		if owner == "" || repo == "" {
@@ -236,6 +264,71 @@ func (a *Adapter) ParseWebhookEvent(eventType string, payload []byte, overrideTr
 			InstallationID: ev.GetInstallation().GetID(),
 			TriggerEvent:   "issue_comment.command",
 			WorkflowName:   a.workflowName,
+		}, nil
+
+	default:
+		return nil, fmt.Errorf("%w: unsupported webhook event type %q", ErrIgnoredEvent, eventType)
+	}
+}
+
+// ParseWebhookCandidate validates structural PR or PR-comment webhooks without filtering
+// by workflow-specific trigger rules (events, comment_command, drafts, or branches),
+// so each repository workflow under .mochi/workflows/*.yaml can evaluate its own triggers.
+func (a *Adapter) ParseWebhookCandidate(eventType string, payload []byte) (*WebhookCandidate, error) {
+	parsed, err := github.ParseWebHook(eventType, payload)
+	if err != nil {
+		return nil, fmt.Errorf("parse github %q webhook: %w", eventType, err)
+	}
+
+	switch ev := parsed.(type) {
+	case *github.PullRequestEvent:
+		action := ev.GetAction()
+		pr := ev.GetPullRequest()
+		if pr == nil {
+			return nil, fmt.Errorf("pull_request webhook missing pull_request payload")
+		}
+		if state := strings.TrimSpace(pr.GetState()); state != "" && !strings.EqualFold(state, "open") && action != "closed" {
+			return nil, fmt.Errorf("%w: pull_request #%d state is %q", ErrIgnoredEvent, pr.GetNumber(), state)
+		}
+		owner, repo := extractRepoOwnerName(ev.GetRepo())
+		if owner == "" || repo == "" {
+			return nil, fmt.Errorf("pull_request webhook missing repository owner/name")
+		}
+		return &WebhookCandidate{
+			Owner:          owner,
+			Repo:           repo,
+			PRNumber:       ev.GetNumber(),
+			InstallationID: ev.GetInstallation().GetID(),
+			TriggerEvent:   "pull_request." + action,
+			PRAction:       action,
+		}, nil
+
+	case *github.IssueCommentEvent:
+		if ev.GetAction() != "created" {
+			return nil, fmt.Errorf("%w: issue_comment action %q is not created", ErrIgnoredEvent, ev.GetAction())
+		}
+		if ev.GetSender().GetType() == "Bot" {
+			return nil, fmt.Errorf("%w: ignoring comment from bot sender", ErrIgnoredEvent)
+		}
+		issue := ev.GetIssue()
+		if issue == nil || !issue.IsPullRequest() {
+			return nil, fmt.Errorf("%w: issue_comment is not on a pull request", ErrIgnoredEvent)
+		}
+		if state := strings.TrimSpace(issue.GetState()); state != "" && !strings.EqualFold(state, "open") {
+			return nil, fmt.Errorf("%w: issue_comment on non-open pull request #%d (state=%q)", ErrIgnoredEvent, issue.GetNumber(), state)
+		}
+		owner, repo := extractRepoOwnerName(ev.GetRepo())
+		if owner == "" || repo == "" {
+			return nil, fmt.Errorf("issue_comment webhook missing repository owner/name")
+		}
+		return &WebhookCandidate{
+			Owner:                    owner,
+			Repo:                     repo,
+			PRNumber:                 issue.GetNumber(),
+			InstallationID:           ev.GetInstallation().GetID(),
+			TriggerEvent:             "issue_comment.command",
+			CommentBody:              ev.GetComment().GetBody(),
+			CommentAuthorAssociation: strings.TrimSpace(ev.GetComment().GetAuthorAssociation()),
 		}, nil
 
 	default:
@@ -304,18 +397,185 @@ func (a *Adapter) BuildTaskContext(ctx context.Context, rawEvent any) (*domain.T
 		if triggers.IgnoreDrafts && pr.GetDraft() {
 			return nil, fmt.Errorf("%w: pull_request #%d is a draft", ErrIgnoredEvent, target.PRNumber)
 		}
+		if !MatchBranches(triggers.BaseBranches, pr.GetBase().GetRef()) {
+			return nil, fmt.Errorf("%w: pull_request #%d base branch %q does not match %v", ErrIgnoredEvent, target.PRNumber, pr.GetBase().GetRef(), triggers.BaseBranches)
+		}
+		if !MatchBranches(triggers.HeadBranches, pr.GetHead().GetRef()) {
+			return nil, fmt.Errorf("%w: pull_request #%d head branch %q does not match %v", ErrIgnoredEvent, target.PRNumber, pr.GetHead().GetRef(), triggers.HeadBranches)
+		}
 	}
 
-	unifiedDiff, _, err := client.PullRequests.GetRaw(ctx, target.Owner, target.Repo, target.PRNumber, github.RawOptions{
+	unifiedDiff, changedFiles, cloneToken, err := a.fetchPRDiffFilesAndToken(ctx, client, target.Owner, target.Repo, target.PRNumber, target.InstallationID)
+	if err != nil {
+		return nil, err
+	}
+
+	wfName := strings.TrimSpace(target.WorkflowName)
+	if wfName == "" {
+		wfName = a.workflowName
+	}
+
+	task := buildTaskContextFromPR(target.Owner, target.Repo, target.PRNumber, target.InstallationID, target.TriggerEvent, wfName, pr, unifiedDiff, changedFiles, cloneToken)
+	task.DedupKey = fmt.Sprintf("github:%s/%s:pr:%d", target.Owner, target.Repo, target.PRNumber)
+	return task, nil
+}
+
+// BuildTaskContextsForRepoWorkflows fetches the PR metadata, loads .mochi/workflows/*.yaml from the
+// authoritative base branch/SHA (never the untrusted PR head branch), evaluates each workflow's triggers
+// (events, comment_command, drafts, base_branches, head_branches), and builds one RepoWorkflowTask
+// per matching workflow.
+func (a *Adapter) BuildTaskContextsForRepoWorkflows(ctx context.Context, cand *WebhookCandidate) ([]*RepoWorkflowTask, error) {
+	if cand == nil {
+		return nil, fmt.Errorf("github input adapter: webhook candidate must not be nil")
+	}
+	if cand.Owner == "" || cand.Repo == "" || cand.PRNumber <= 0 {
+		return nil, fmt.Errorf("github input adapter: owner, repo, and positive pr_number are required")
+	}
+
+	client, err := a.clients.ClientForInstallation(ctx, cand.InstallationID)
+	if err != nil {
+		return nil, fmt.Errorf("get github client: %w", err)
+	}
+
+	pr, _, err := client.PullRequests.Get(ctx, cand.Owner, cand.Repo, cand.PRNumber)
+	if err != nil {
+		return nil, fmt.Errorf("get pull request %s/%s#%d: %w", cand.Owner, cand.Repo, cand.PRNumber, err)
+	}
+
+	baseRef := strings.TrimSpace(pr.GetBase().GetSHA())
+	if baseRef == "" {
+		baseRef = strings.TrimSpace(pr.GetBase().GetRef())
+	}
+	if baseRef == "" {
+		return nil, fmt.Errorf("pull request %s/%s#%d missing base ref", cand.Owner, cand.Repo, cand.PRNumber)
+	}
+
+	entries, err := listRepoDirAtRef(ctx, client, cand.Owner, cand.Repo, ".mochi/workflows", baseRef)
+	if err != nil {
+		return nil, fmt.Errorf("list .mochi/workflows from base ref %q: %w", baseRef, err)
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("%w: no .mochi/workflows/*.yaml files found on base ref %q", ErrIgnoredEvent, baseRef)
+	}
+
+	var matched []*domain.Workflow
+	seenNames := make(map[string]string)
+	for _, entry := range entries {
+		yamlBytes, found, err := fetchRepoFileAtRef(ctx, client, cand.Owner, cand.Repo, entry.GetPath(), baseRef)
+		if err != nil {
+			return nil, fmt.Errorf("fetch %q from base ref %q: %w", entry.GetPath(), baseRef, err)
+		}
+		if !found {
+			continue
+		}
+		wf, err := config.ParseRepoWorkflow(yamlBytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse repo workflow %q on base ref %q: %w", entry.GetPath(), baseRef, err)
+		}
+		if prevPath, dup := seenNames[wf.Name]; dup {
+			return nil, fmt.Errorf("duplicate workflow name %q in %q and %q", wf.Name, prevPath, entry.GetPath())
+		}
+		seenNames[wf.Name] = entry.GetPath()
+
+		if a.MatchesTrigger(wf.Input.Triggers, cand, pr) {
+			matched = append(matched, wf)
+		}
+	}
+
+	if len(matched) == 0 {
+		return nil, fmt.Errorf("%w: no workflows in .mochi/workflows matched %s (base=%q head=%q)", ErrIgnoredEvent, cand.TriggerEvent, pr.GetBase().GetRef(), pr.GetHead().GetRef())
+	}
+
+	unifiedDiff, changedFiles, cloneToken, err := a.fetchPRDiffFilesAndToken(ctx, client, cand.Owner, cand.Repo, cand.PRNumber, cand.InstallationID)
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]*RepoWorkflowTask, 0, len(matched))
+	cleanupAll := func() {
+		for _, r := range results {
+			if r != nil && r.Task != nil && r.Task.PromptDir != "" {
+				_ = os.RemoveAll(r.Task.PromptDir)
+			}
+		}
+	}
+
+	for _, wf := range matched {
+		promptDir, err := materializeWorkflowRepoPrompts(ctx, client, cand.Owner, cand.Repo, baseRef, wf)
+		if err != nil {
+			cleanupAll()
+			return nil, err
+		}
+		task := buildTaskContextFromPR(cand.Owner, cand.Repo, cand.PRNumber, cand.InstallationID, cand.TriggerEvent, wf.Name, pr, unifiedDiff, changedFiles, cloneToken)
+		task.DedupKey = fmt.Sprintf("github:%s/%s:pr:%d:workflow:%s", cand.Owner, cand.Repo, cand.PRNumber, wf.Name)
+		task.PromptDir = promptDir
+		results = append(results, &RepoWorkflowTask{
+			Workflow: wf,
+			Task:     task,
+		})
+	}
+	return results, nil
+}
+
+// MatchesTrigger evaluates a workflow's TriggerConfig against a WebhookCandidate and authoritative PR metadata.
+func (a *Adapter) MatchesTrigger(cfg domain.TriggerConfig, cand *WebhookCandidate, pr *github.PullRequest) bool {
+	if cand == nil || pr == nil {
+		return false
+	}
+	triggers := a.effectiveTriggers(&cfg)
+
+	if cand.PRAction != "closed" {
+		if (pr.GetState() != "" && !strings.EqualFold(pr.GetState(), "open")) || pr.GetMerged() {
+			return false
+		}
+	}
+	if triggers.IgnoreDrafts && pr.GetDraft() {
+		return false
+	}
+	if !MatchBranches(triggers.BaseBranches, pr.GetBase().GetRef()) {
+		return false
+	}
+	if !MatchBranches(triggers.HeadBranches, pr.GetHead().GetRef()) {
+		return false
+	}
+
+	if strings.HasPrefix(cand.TriggerEvent, "pull_request.") {
+		allowedEvents := triggers.Events
+		if cfg.Events == nil && len(allowedEvents) == 0 {
+			allowedEvents = defaultPREvents
+		}
+		return slices.Contains(allowedEvents, cand.PRAction)
+	}
+	if cand.TriggerEvent == "issue_comment.command" {
+		cmd := strings.TrimSpace(triggers.CommentCommand)
+		if cmd == "" {
+			return false
+		}
+		if !matchesCommentCommand(cand.CommentBody, cmd) {
+			return false
+		}
+		return isAllowedCommentAssociation(cand.CommentAuthorAssociation, triggers.AllowedCommentAssociations)
+	}
+	return false
+}
+
+func (a *Adapter) fetchPRDiffFilesAndToken(
+	ctx context.Context,
+	client *github.Client,
+	owner, repo string,
+	prNumber int,
+	installationID int64,
+) (string, []domain.ChangedFile, string, error) {
+	unifiedDiff, _, err := client.PullRequests.GetRaw(ctx, owner, repo, prNumber, github.RawOptions{
 		Type: github.Diff,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("get pull request raw diff %s/%s#%d: %w", target.Owner, target.Repo, target.PRNumber, err)
+		return "", nil, "", fmt.Errorf("get pull request raw diff %s/%s#%d: %w", owner, repo, prNumber, err)
 	}
 
-	commitFiles, err := listAllPRFiles(ctx, client, target.Owner, target.Repo, target.PRNumber)
+	commitFiles, err := listAllPRFiles(ctx, client, owner, repo, prNumber)
 	if err != nil {
-		return nil, fmt.Errorf("list pull request files %s/%s#%d: %w", target.Owner, target.Repo, target.PRNumber, err)
+		return "", nil, "", fmt.Errorf("list pull request files %s/%s#%d: %w", owner, repo, prNumber, err)
 	}
 
 	parsedUnified := input.ParseUnifiedDiff(unifiedDiff)
@@ -355,11 +615,24 @@ func (a *Adapter) BuildTaskContext(ctx context.Context, rawEvent any) (*domain.T
 		changedFiles = parsedUnified
 	}
 
-	cloneToken, err := a.clients.CloneTokenForRepo(ctx, target.InstallationID, target.Repo)
+	cloneToken, err := a.clients.CloneTokenForRepo(ctx, installationID, repo)
 	if err != nil {
-		return nil, fmt.Errorf("acquire clone token: %w", err)
+		return "", nil, "", fmt.Errorf("acquire clone token: %w", err)
 	}
+	return unifiedDiff, changedFiles, cloneToken, nil
+}
 
+func buildTaskContextFromPR(
+	owner, repo string,
+	prNumber int,
+	installationID int64,
+	triggerEvent string,
+	wfName string,
+	pr *github.PullRequest,
+	unifiedDiff string,
+	changedFiles []domain.ChangedFile,
+	cloneToken string,
+) *domain.TaskContext {
 	baseBranch := pr.GetBase().GetRef()
 	baseSHA := pr.GetBase().GetSHA()
 	headBranch := pr.GetHead().GetRef()
@@ -369,30 +642,24 @@ func (a *Adapter) BuildTaskContext(ctx context.Context, rawEvent any) (*domain.T
 		repoURL = baseRepo.GetCloneURL()
 	}
 	if repoURL == "" {
-		repoURL = fmt.Sprintf("https://github.com/%s/%s.git", target.Owner, target.Repo)
+		repoURL = fmt.Sprintf("https://github.com/%s/%s.git", owner, repo)
 	}
 
 	isFork := false
 	if headRepo := pr.GetHead().GetRepo(); headRepo != nil {
-		isFork = headRepo.GetFullName() != fmt.Sprintf("%s/%s", target.Owner, target.Repo)
+		isFork = headRepo.GetFullName() != fmt.Sprintf("%s/%s", owner, repo)
 	}
-
-	wfName := strings.TrimSpace(target.WorkflowName)
-	if wfName == "" {
-		wfName = a.workflowName
-	}
-
-	dedupKey := fmt.Sprintf("github:%s/%s:pr:%d", target.Owner, target.Repo, target.PRNumber)
 
 	var fetchRefs []string
-	if target.PRNumber > 0 {
-		fetchRefs = append(fetchRefs, fmt.Sprintf("refs/pull/%d/head", target.PRNumber))
+	if prNumber > 0 {
+		fetchRefs = append(fetchRefs, fmt.Sprintf("refs/pull/%d/head", prNumber))
 	}
+
+	filesCopy := slices.Clone(changedFiles)
 
 	return &domain.TaskContext{
 		WorkflowName: wfName,
 		TriggerType:  adapterName,
-		DedupKey:     dedupKey,
 		Workspace: domain.WorkspaceSpec{
 			RepoURL:    repoURL,
 			Ref:        headSHA,
@@ -404,40 +671,40 @@ func (a *Adapter) BuildTaskContext(ctx context.Context, rawEvent any) (*domain.T
 		},
 		Changeset: &domain.ChangesetSpec{
 			Provider:       "github",
-			RepoOwner:      target.Owner,
-			RepoName:       target.Repo,
-			PRNumber:       target.PRNumber,
+			RepoOwner:      owner,
+			RepoName:       repo,
+			PRNumber:       prNumber,
 			PRURL:          pr.GetHTMLURL(),
 			Title:          pr.GetTitle(),
 			Description:    pr.GetBody(),
 			Author:         pr.GetUser().GetLogin(),
-			TriggerEvent:   target.TriggerEvent,
-			InstallationID: target.InstallationID,
+			TriggerEvent:   triggerEvent,
+			InstallationID: installationID,
 			BaseBranch:     baseBranch,
 			BaseSHA:        baseSHA,
 			HeadBranch:     headBranch,
 			HeadSHA:        headSHA,
 			UnifiedDiff:    unifiedDiff,
-			ChangedFiles:   changedFiles,
+			ChangedFiles:   filesCopy,
 		},
 		Variables: map[string]any{
-			"repo_owner": target.Owner,
-			"repo_name":  target.Repo,
-			"pr_number":  target.PRNumber,
+			"repo_owner": owner,
+			"repo_name":  repo,
+			"pr_number":  prNumber,
 			"base_sha":   baseSHA,
 			"head_sha":   headSHA,
 		},
 		SinkMetadata: map[string]any{
-			"owner":           target.Owner,
-			"repo":            target.Repo,
-			"pr_number":       target.PRNumber,
-			"installation_id": target.InstallationID,
+			"owner":           owner,
+			"repo":            repo,
+			"pr_number":       prNumber,
+			"installation_id": installationID,
 			"base_sha":        baseSHA,
 			"head_sha":        headSHA,
 			"pr_url":          pr.GetHTMLURL(),
 			"is_fork":         isFork,
 		},
-	}, nil
+	}
 }
 
 // NewRepoOverrideLoader returns an orchestrator.RepoOverrideLoader that securely fetches
@@ -518,6 +785,95 @@ func NewRepoOverrideLoader(clients ClientFactory, allowCustomPrompts bool) orche
 	}
 }
 
+func listRepoDirAtRef(ctx context.Context, client *github.Client, owner, repo, path, ref string) ([]*github.RepositoryContent, error) {
+	opts := &github.RepositoryContentGetOptions{Ref: ref}
+	_, dirContents, resp, err := client.Repositories.GetContents(ctx, owner, repo, path, opts)
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			return nil, nil
+		}
+		var ghErr *github.ErrorResponse
+		if errors.As(err, &ghErr) && ghErr.Response != nil && ghErr.Response.StatusCode == http.StatusNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var workflows []*github.RepositoryContent
+	for _, entry := range dirContents {
+		if entry == nil || entry.GetType() != "file" {
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(entry.GetName()))
+		if strings.HasSuffix(name, ".yaml") || strings.HasSuffix(name, ".yml") {
+			workflows = append(workflows, entry)
+		}
+	}
+	sort.Slice(workflows, func(i, j int) bool {
+		return workflows[i].GetName() < workflows[j].GetName()
+	})
+	return workflows, nil
+}
+
+func materializeWorkflowRepoPrompts(ctx context.Context, client *github.Client, owner, repo, baseRef string, wf *domain.Workflow) (string, error) {
+	if wf == nil {
+		return "", nil
+	}
+	seen := make(map[string]struct{})
+	var repoPaths []string
+	addPath := func(p string, fromRepo bool) {
+		if !fromRepo {
+			return
+		}
+		clean := filepath.ToSlash(filepath.Clean(filepath.FromSlash(strings.TrimSpace(p))))
+		if !isSafeMochiPath(clean) {
+			return
+		}
+		if _, ok := seen[clean]; ok {
+			return
+		}
+		seen[clean] = struct{}{}
+		repoPaths = append(repoPaths, clean)
+	}
+	for _, a := range wf.Agents {
+		addPath(a.PromptFile, a.PromptFromRepo)
+	}
+	addPath(wf.Synthesizer.PromptFile, wf.Synthesizer.PromptFromRepo)
+
+	if len(repoPaths) == 0 {
+		return "", nil
+	}
+
+	tmpDir, err := os.MkdirTemp("", "mochi-repo-wf-prompts-*")
+	if err != nil {
+		return "", fmt.Errorf("create temp prompt dir: %w", err)
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.RemoveAll(tmpDir)
+		}
+	}()
+
+	for _, relPath := range repoPaths {
+		content, ok, err := fetchRepoFileAtRef(ctx, client, owner, repo, relPath, baseRef)
+		if err != nil {
+			return "", fmt.Errorf("fetch repo prompt %q from base ref %q: %w", relPath, baseRef, err)
+		}
+		if !ok {
+			return "", fmt.Errorf("repo workflow %q references missing prompt file %q on base ref %q", wf.Name, relPath, baseRef)
+		}
+		targetFile := filepath.Join(tmpDir, filepath.FromSlash(relPath))
+		if err := os.MkdirAll(filepath.Dir(targetFile), 0o755); err != nil {
+			return "", fmt.Errorf("create repo prompt directory: %w", err)
+		}
+		if err := os.WriteFile(targetFile, content, 0o600); err != nil {
+			return "", fmt.Errorf("write cached repo prompt %q: %w", relPath, err)
+		}
+	}
+	cleanup = false
+	return tmpDir, nil
+}
+
 func fetchRepoFileAtRef(ctx context.Context, client *github.Client, owner, repo, path, ref string) ([]byte, bool, error) {
 	opts := &github.RepositoryContentGetOptions{Ref: ref}
 	fileContent, _, resp, err := client.Repositories.GetContents(ctx, owner, repo, path, opts)
@@ -579,8 +935,14 @@ func shouldApplyWebhookFilters(target *PRTarget) bool {
 func (a *Adapter) effectiveTriggers(override *domain.TriggerConfig) domain.TriggerConfig {
 	t := a.defaultTriggers
 	if override != nil {
-		if len(override.Events) > 0 {
+		if override.Events != nil {
 			t.Events = override.Events
+		}
+		if len(override.BaseBranches) > 0 {
+			t.BaseBranches = override.BaseBranches
+		}
+		if len(override.HeadBranches) > 0 {
+			t.HeadBranches = override.HeadBranches
 		}
 		if override.CommentCommand != "" {
 			t.CommentCommand = override.CommentCommand
@@ -594,6 +956,71 @@ func (a *Adapter) effectiveTriggers(override *domain.TriggerConfig) domain.Trigg
 		t.AllowedCommentAssociations = defaultCommentAssociations
 	}
 	return t
+}
+
+// MatchBranches reports whether branch matches at least one glob pattern in patterns.
+// An empty patterns slice matches all branches.
+func MatchBranches(patterns []string, branch string) bool {
+	if len(patterns) == 0 {
+		return true
+	}
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return false
+	}
+	for _, p := range patterns {
+		if MatchBranchPattern(p, branch) {
+			return true
+		}
+	}
+	return false
+}
+
+// MatchBranchPattern matches a git branch name against a glob pattern supporting
+// '*' (any non-'/' sequence), '?' (single non-'/' rune), and '**' (any sequence including '/').
+func MatchBranchPattern(pattern, branch string) bool {
+	p := []rune(strings.TrimSpace(pattern))
+	b := []rune(strings.TrimSpace(branch))
+	if len(p) == 0 {
+		return false
+	}
+	cols := len(b) + 1
+	memo := make([]int8, (len(p)+1)*cols)
+	var match func(pi, bi int) bool
+	match = func(pi, bi int) bool {
+		idx := pi*cols + bi
+		if memo[idx] != 0 {
+			return memo[idx] == 1
+		}
+		var ok bool
+		switch {
+		case pi == len(p):
+			ok = bi == len(b)
+		case pi+1 < len(p) && p[pi] == '*' && p[pi+1] == '*':
+			if match(pi+2, bi) {
+				ok = true
+			} else if pi+2 < len(p) && p[pi+2] == '/' && match(pi+3, bi) {
+				ok = true
+			} else if bi < len(b) && match(pi, bi+1) {
+				ok = true
+			}
+		case p[pi] == '*':
+			if match(pi+1, bi) || (bi < len(b) && b[bi] != '/' && match(pi, bi+1)) {
+				ok = true
+			}
+		case p[pi] == '?':
+			ok = bi < len(b) && b[bi] != '/' && match(pi+1, bi+1)
+		default:
+			ok = bi < len(b) && p[pi] == b[bi] && match(pi+1, bi+1)
+		}
+		if ok {
+			memo[idx] = 1
+		} else {
+			memo[idx] = -1
+		}
+		return ok
+	}
+	return match(0, 0)
 }
 
 func isAllowedCommentAssociation(assoc string, allowed []string) bool {

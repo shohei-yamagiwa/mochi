@@ -3,6 +3,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd ./cmd
+COPY configs ./configs
 COPY internal ./internal
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/mochi ./cmd/mochi \
     && go clean -cache
@@ -14,9 +15,8 @@ RUN apk add --no-cache ca-certificates su-exec sqlite \
     && mkdir /data && chown mochi:mochi /data
 WORKDIR /app
 COPY --from=build /out/mochi /usr/local/bin/mochi
-COPY --chown=10001:10001 configs ./configs
 COPY --chmod=755 deploy/entrypoint.sh /usr/local/bin/mochi-entrypoint
-ENV PORT=8080 MOCHI_DB_PATH=/data/mochi.db MOCHI_WORKFLOW=configs/workflows/pr-review.yaml
+ENV PORT=8080 MOCHI_DB_PATH=/data/mochi.db
 EXPOSE 8080
 # The entrypoint owns the mounted data directory, then drops to uid/gid 10001
 # before validation and server startup. This also handles fresh Render disks.

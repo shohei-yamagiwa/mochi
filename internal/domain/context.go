@@ -13,6 +13,7 @@ type TaskContext struct {
 	Changeset     *ChangesetSpec `json:"changeset"`     // Structured PR/commit metadata, diff, and changed files
 	Variables     map[string]any `json:"variables"`     // Exposed to Go text/template prompts
 	SinkMetadata  map[string]any `json:"sink_metadata"` // Routing metadata for the OutputSink
+	PromptDir     string         `json:"-"`             // Transient local directory holding repo-owned .mochi/ prompt files
 }
 
 // WorkspaceSpec describes how the sandbox provider prepares the repository workspace.

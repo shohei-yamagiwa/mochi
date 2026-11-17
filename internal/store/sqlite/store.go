@@ -1002,3 +1002,151 @@ func defaultJSON(raw json.RawMessage, fallback string) string {
 	}
 	return string(raw)
 }
+
+func normalizeRepoCredentialKey(owner, repo, provider string) (string, string, string) {
+	return strings.ToLower(strings.TrimSpace(owner)),
+		strings.ToLower(strings.TrimSpace(repo)),
+		strings.ToLower(strings.TrimSpace(provider))
+}
+
+func (s *SQLiteStore) UpsertRepoCredential(ctx context.Context, cred *domain.RepoCredentialRecord) error {
+	if cred == nil {
+		return fmt.Errorf("credential must not be nil")
+	}
+	owner, repo, provider := normalizeRepoCredentialKey(cred.RepoOwner, cred.RepoName, cred.Provider)
+	if owner == "" || repo == "" || provider == "" {
+		return fmt.Errorf("repo_owner, repo_name, and provider are required")
+	}
+	if len(cred.EncryptedAPIKey) == 0 || len(cred.Nonce) == 0 {
+		return fmt.Errorf("encrypted_api_key and nonce are required")
+	}
+	now := time.Now().UTC()
+	createdAt := cred.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = now
+	}
+	updatedAt := cred.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = now
+	}
+	baseURL := strings.TrimSpace(cred.BaseURL)
+
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO repo_credentials (
+			repo_owner, repo_name, provider, encrypted_api_key, nonce, base_url, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (repo_owner, repo_name, provider) DO UPDATE SET
+			encrypted_api_key = excluded.encrypted_api_key,
+			nonce = excluded.nonce,
+			base_url = excluded.base_url,
+			updated_at = excluded.updated_at
+	`, owner, repo, provider, cred.EncryptedAPIKey, cred.Nonce, baseURL, formatTime(createdAt), formatTime(updatedAt))
+	if err != nil {
+		return fmt.Errorf("upsert repo credential %s/%s (%s): %w", owner, repo, provider, err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) GetRepoCredential(ctx context.Context, owner, repo, provider string) (*domain.RepoCredentialRecord, error) {
+	normOwner, normRepo, normProvider := normalizeRepoCredentialKey(owner, repo, provider)
+	if normOwner == "" || normRepo == "" || normProvider == "" {
+		return nil, fmt.Errorf("repo_owner, repo_name, and provider are required")
+	}
+	var rec domain.RepoCredentialRecord
+	var createdStr, updatedStr string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT repo_owner, repo_name, provider, encrypted_api_key, nonce, base_url, created_at, updated_at
+		FROM repo_credentials
+		WHERE repo_owner = ? AND repo_name = ? AND provider = ?
+	`, normOwner, normRepo, normProvider).Scan(
+		&rec.RepoOwner,
+		&rec.RepoName,
+		&rec.Provider,
+		&rec.EncryptedAPIKey,
+		&rec.Nonce,
+		&rec.BaseURL,
+		&createdStr,
+		&updatedStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, store.ErrNotFound
+		}
+		return nil, fmt.Errorf("get repo credential %s/%s (%s): %w", normOwner, normRepo, normProvider, err)
+	}
+	createdAt, err := parseTime(createdStr)
+	if err != nil {
+		return nil, fmt.Errorf("parse repo credential created_at: %w", err)
+	}
+	updatedAt, err := parseTime(updatedStr)
+	if err != nil {
+		return nil, fmt.Errorf("parse repo credential updated_at: %w", err)
+	}
+	rec.CreatedAt = createdAt
+	rec.UpdatedAt = updatedAt
+	return &rec, nil
+}
+
+func (s *SQLiteStore) ListRepoCredentials(ctx context.Context, owner, repo string) ([]*domain.RepoCredentialSummary, error) {
+	normOwner, normRepo, _ := normalizeRepoCredentialKey(owner, repo, "")
+	if normOwner == "" || normRepo == "" {
+		return nil, fmt.Errorf("repo_owner and repo_name are required")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT repo_owner, repo_name, provider, base_url, length(encrypted_api_key) > 0, created_at, updated_at
+		FROM repo_credentials
+		WHERE repo_owner = ? AND repo_name = ?
+		ORDER BY provider ASC
+	`, normOwner, normRepo)
+	if err != nil {
+		return nil, fmt.Errorf("list repo credentials %s/%s: %w", normOwner, normRepo, err)
+	}
+	defer rows.Close()
+
+	var out []*domain.RepoCredentialSummary
+	for rows.Next() {
+		var item domain.RepoCredentialSummary
+		var createdStr, updatedStr string
+		if err := rows.Scan(
+			&item.RepoOwner,
+			&item.RepoName,
+			&item.Provider,
+			&item.BaseURL,
+			&item.HasAPIKey,
+			&createdStr,
+			&updatedStr,
+		); err != nil {
+			return nil, fmt.Errorf("scan repo credential summary: %w", err)
+		}
+		createdAt, err := parseTime(createdStr)
+		if err != nil {
+			return nil, fmt.Errorf("parse repo credential created_at: %w", err)
+		}
+		updatedAt, err := parseTime(updatedStr)
+		if err != nil {
+			return nil, fmt.Errorf("parse repo credential updated_at: %w", err)
+		}
+		item.CreatedAt = createdAt
+		item.UpdatedAt = updatedAt
+		out = append(out, &item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate repo credentials: %w", err)
+	}
+	return out, nil
+}
+
+func (s *SQLiteStore) DeleteRepoCredential(ctx context.Context, owner, repo, provider string) error {
+	normOwner, normRepo, normProvider := normalizeRepoCredentialKey(owner, repo, provider)
+	if normOwner == "" || normRepo == "" || normProvider == "" {
+		return fmt.Errorf("repo_owner, repo_name, and provider are required")
+	}
+	res, err := s.db.ExecContext(ctx, `
+		DELETE FROM repo_credentials
+		WHERE repo_owner = ? AND repo_name = ? AND provider = ?
+	`, normOwner, normRepo, normProvider)
+	if err != nil {
+		return fmt.Errorf("delete repo credential %s/%s (%s): %w", normOwner, normRepo, normProvider, err)
+	}
+	return requireOneRowAffected(res)
+}

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/shohei-yamagiwa/mochi/internal/config"
+	"github.com/shohei-yamagiwa/mochi/internal/credentials"
 	"github.com/shohei-yamagiwa/mochi/internal/domain"
 	cliinput "github.com/shohei-yamagiwa/mochi/internal/input/cli"
 	ghinput "github.com/shohei-yamagiwa/mochi/internal/input/github"
@@ -41,7 +43,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const defaultWorkflowPath = "configs/workflows/pr-review.yaml"
+const defaultWorkflowPath = ".mochi/workflows/pr-review.yaml"
 
 // errChangesRequested signals exit code 2 when --fail-on-changes is set.
 var errChangesRequested = errors.New("review verdict requested changes")
@@ -68,6 +70,7 @@ func newRootCmd() *cobra.Command {
 		newRunCmd(),
 		newInspectCmd(),
 		newValidateCmd(),
+		newCredentialsCmd(),
 	)
 	return root
 }
@@ -83,6 +86,7 @@ func newServeCmd() *cobra.Command {
 		webhookSecret  string
 		triggerSecret  string
 		apiToken       string
+		masterKey      string
 		insecureNoAuth bool
 	)
 
@@ -94,22 +98,25 @@ func newServeCmd() *cobra.Command {
 			defer stop()
 
 			logger := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), &slog.HandlerOptions{Level: slog.LevelInfo}))
-			if len(workflowPaths) == 0 {
-				workflowPaths = []string{defaultWorkflowPath}
-			}
 
-			workflows := make(map[string]*domain.Workflow, len(workflowPaths))
-			resolvedBase := resolveBaseDir(baseDir, workflowPaths[0])
-			var defaultWorkflow string
-			for _, p := range workflowPaths {
-				bd := resolveBaseDir(baseDir, p)
-				wf, err := config.LoadWorkflowFile(p, bd)
-				if err != nil {
-					return err
-				}
-				workflows[wf.Name] = wf
-				if defaultWorkflow == "" {
-					defaultWorkflow = wf.Name
+			var (
+				workflows       map[string]*domain.Workflow
+				defaultWorkflow string
+			)
+			resolvedBase := strings.TrimSpace(baseDir)
+			if len(workflowPaths) > 0 {
+				workflows = make(map[string]*domain.Workflow, len(workflowPaths))
+				resolvedBase = resolveBaseDir(baseDir, workflowPaths[0])
+				for _, p := range workflowPaths {
+					bd := resolveBaseDir(baseDir, p)
+					wf, err := config.LoadWorkflowFile(p, bd)
+					if err != nil {
+						return err
+					}
+					workflows[wf.Name] = wf
+					if defaultWorkflow == "" {
+						defaultWorkflow = wf.Name
+					}
 				}
 			}
 
@@ -132,13 +139,18 @@ func newServeCmd() *cobra.Command {
 				)
 			}
 
+			cipher, err := credentials.NewCipherFromString(masterKey)
+			if err != nil {
+				return fmt.Errorf("init credential cipher: %w", err)
+			}
+
 			st, err := sqlite.Open(ctx, dbPath)
 			if err != nil {
 				return fmt.Errorf("open sqlite store %q: %w", dbPath, err)
 			}
 			defer st.Close()
 
-			llmReg, err := buildLLMRegistryFromEnv()
+			credSvc, err := credentials.NewService(st, cipher)
 			if err != nil {
 				return err
 			}
@@ -180,14 +192,14 @@ func newServeCmd() *cobra.Command {
 			}
 
 			runner := &orchestrator.Runner{
-				Store:              st,
-				SandboxProvider:    sbProvider,
-				LLMRegistry:        llmReg,
-				ToolRegistry:       toolReg,
-				PromptEngine:       config.NewPromptEngine(resolvedBase),
-				SinkRegistry:       sinkReg,
-				RepoOverrideLoader: overrideLoader,
-				Logger:             logger,
+				Store:               st,
+				SandboxProvider:     sbProvider,
+				LLMRegistryResolver: credSvc.RunnerResolver(),
+				ToolRegistry:        toolReg,
+				PromptEngine:        config.NewPromptEngine(resolvedBase),
+				SinkRegistry:        sinkReg,
+				RepoOverrideLoader:  overrideLoader,
+				Logger:              logger,
 			}
 
 			sched := orchestrator.NewScheduler(runner, orchestrator.SchedulerConfig{
@@ -202,6 +214,7 @@ func newServeCmd() *cobra.Command {
 				WebhookAdapter:      whinput.NewAdapter(defaultWorkflow),
 				Scheduler:           sched,
 				Store:               st,
+				CredentialService:   credSvc,
 				TriggerSecret:       triggerSecret,
 				APIToken:            apiToken,
 				AllowInsecureNoAuth: insecureNoAuth,
@@ -218,9 +231,13 @@ func newServeCmd() *cobra.Command {
 				ReadHeaderTimeout: 10 * time.Second,
 			}
 
+			mode := "repo-workflows"
+			if len(workflows) > 0 {
+				mode = "static"
+			}
 			errCh := make(chan error, 1)
 			go func() {
-				logger.Info("mochi server listening", "addr", addr, "workflows", len(workflows))
+				logger.Info("mochi server listening", "addr", addr, "mode", mode, "workflows", len(workflows))
 				if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 					errCh <- err
 					return
@@ -257,14 +274,15 @@ func newServeCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&addr, "addr", envDefault("MOCHI_ADDR", ":8080"), "HTTP listen address")
-	cmd.Flags().StringSliceVarP(&workflowPaths, "workflow", "w", []string{defaultWorkflowPath}, "Workflow YAML file(s) to load")
+	cmd.Flags().StringSliceVarP(&workflowPaths, "workflow", "w", splitEnvList(os.Getenv("MOCHI_WORKFLOW")), "Optional static workflow YAML file(s) to load (defaults to per-repo .mochi/workflows/*.yaml)")
 	cmd.Flags().StringVar(&baseDir, "base-dir", "", "Base directory for resolving server prompt files (auto-detected if empty)")
 	cmd.Flags().StringVar(&dbPath, "db", envDefault("MOCHI_DB_PATH", "mochi.db"), "SQLite database path")
 	cmd.Flags().IntVar(&workers, "workers", 4, "Concurrent workflow worker count")
 	cmd.Flags().IntVar(&queueSize, "queue-size", 128, "Scheduler queue size")
 	cmd.Flags().StringVar(&webhookSecret, "webhook-secret", os.Getenv("GITHUB_WEBHOOK_SECRET"), "GitHub webhook HMAC-SHA256 secret")
 	cmd.Flags().StringVar(&triggerSecret, "trigger-secret", os.Getenv("MOCHI_TRIGGER_SECRET"), "Bearer/HMAC secret for /api/v1/triggers")
-	cmd.Flags().StringVar(&apiToken, "api-token", os.Getenv("MOCHI_API_TOKEN"), "Bearer token for /api/v1/runs endpoints")
+	cmd.Flags().StringVar(&apiToken, "api-token", os.Getenv("MOCHI_API_TOKEN"), "Bearer token for /api/v1/runs and /api/v1/repos/.../credentials endpoints")
+	cmd.Flags().StringVar(&masterKey, "master-key", os.Getenv("MOCHI_MASTER_KEY"), "32-byte AES-256 master key (64 hex chars or base64) for per-repository LLM API keys")
 	cmd.Flags().BoolVar(&insecureNoAuth, "insecure-no-auth", false, "Allow starting the server without webhook/trigger/API auth secrets (unsafe for production)")
 	return cmd
 }
@@ -517,16 +535,29 @@ func newInspectCmd() *cobra.Command {
 }
 
 func newValidateCmd() *cobra.Command {
-	var baseDir string
-	var runtime bool
+	var (
+		baseDir    string
+		runtime    bool
+		serverMode bool
+	)
 
 	cmd := &cobra.Command{
 		Use:   "validate [workflow_paths...]",
 		Short: "Validate workflow YAML files, tools, and prompt templates",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if serverMode || (runtime && len(args) == 0) {
+				if err := validateServerRuntime(); err != nil {
+					return fmt.Errorf("server runtime configuration: %w", err)
+				}
+				if len(args) == 0 {
+					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "valid: server runtime configuration (GitHub auth, webhook/API secrets, Daytona, MOCHI_MASTER_KEY)")
+					return nil
+				}
+			}
+
 			paths := args
 			if len(paths) == 0 {
-				paths = []string{defaultWorkflowPath}
+				paths = discoverLocalWorkflows()
 			}
 
 			toolReg, err := tools.NewRegistry()
@@ -541,39 +572,27 @@ func newValidateCmd() *cobra.Command {
 					return err
 				}
 
-				engine := config.NewPromptEngine(resolvedBase)
-				root, err := os.OpenRoot(resolvedBase)
-				if err != nil {
-					return fmt.Errorf("open base dir %q: %w", resolvedBase, err)
-				}
-
-				validateRoleTemplates := func() error {
-					defer root.Close()
-					for _, a := range wf.Agents {
-						if _, err := toolReg.ScopeForRole(a.Tools); err != nil {
-							return fmt.Errorf("%s: agent %q: %w", wfPath, a.Role, err)
-						}
-						raw, err := root.ReadFile(filepath.ToSlash(filepath.Clean(a.PromptFile)))
-						if err != nil {
-							return fmt.Errorf("%s: read prompt %q: %w", wfPath, a.PromptFile, err)
-						}
-						if err := engine.ValidateTemplate(a.PromptFile, string(raw)); err != nil {
-							return fmt.Errorf("%s: %w", wfPath, err)
-						}
+				engine := config.NewPromptEngineWithRoots(resolvedBase, resolvedBase)
+				for _, a := range wf.Agents {
+					if _, err := toolReg.ScopeForRole(a.Tools); err != nil {
+						return fmt.Errorf("%s: agent %q: %w", wfPath, a.Role, err)
 					}
-					synthRaw, err := root.ReadFile(filepath.ToSlash(filepath.Clean(wf.Synthesizer.PromptFile)))
+					raw, err := engine.ReadPrompt(a.PromptFile, a.PromptFromRepo)
 					if err != nil {
-						return fmt.Errorf("%s: read synthesizer prompt %q: %w", wfPath, wf.Synthesizer.PromptFile, err)
+						return fmt.Errorf("%s: read prompt %q: %w", wfPath, a.PromptFile, err)
 					}
-					if err := engine.ValidateTemplate(wf.Synthesizer.PromptFile, string(synthRaw)); err != nil {
+					if err := engine.ValidateTemplate(a.PromptFile, string(raw)); err != nil {
 						return fmt.Errorf("%s: %w", wfPath, err)
 					}
-					return nil
 				}
-				if err := validateRoleTemplates(); err != nil {
-					return err
+				synthRaw, err := engine.ReadPrompt(wf.Synthesizer.PromptFile, wf.Synthesizer.PromptFromRepo)
+				if err != nil {
+					return fmt.Errorf("%s: read synthesizer prompt %q: %w", wfPath, wf.Synthesizer.PromptFile, err)
 				}
-				if runtime {
+				if err := engine.ValidateTemplate(wf.Synthesizer.PromptFile, string(synthRaw)); err != nil {
+					return fmt.Errorf("%s: %w", wfPath, err)
+				}
+				if runtime && !serverMode {
 					if err := validateRuntimeWorkflow(wf); err != nil {
 						return fmt.Errorf("%s: runtime configuration: %w", wfPath, err)
 					}
@@ -587,8 +606,24 @@ func newValidateCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&baseDir, "base-dir", "", "Base directory for resolving prompt_file paths (auto-detected if empty)")
-	cmd.Flags().BoolVar(&runtime, "runtime", false, "Also check server authentication and required provider credentials locally (no external API calls)")
+	cmd.Flags().BoolVar(&runtime, "runtime", false, "Check runtime environment configuration locally (no external API calls)")
+	cmd.Flags().BoolVar(&serverMode, "server", false, "Check server deployment environment (GitHub auth, webhook/API secrets, Daytona, MOCHI_MASTER_KEY)")
 	return cmd
+}
+
+func discoverLocalWorkflows() []string {
+	var found []string
+	for _, pat := range []string{filepath.Join(".mochi", "workflows", "*.yaml"), filepath.Join(".mochi", "workflows", "*.yml")} {
+		matches, err := filepath.Glob(pat)
+		if err == nil {
+			found = append(found, matches...)
+		}
+	}
+	if len(found) == 0 {
+		return []string{defaultWorkflowPath}
+	}
+	sort.Strings(found)
+	return found
 }
 
 func resolveBaseDir(explicit, workflowPath string) string {
@@ -596,9 +631,12 @@ func resolveBaseDir(explicit, workflowPath string) string {
 		return explicit
 	}
 	wfDir := filepath.Dir(workflowPath)
-	// Walk upward from workflow file directory to locate prompt files or project root (go.mod / configs/).
+	// Walk upward from workflow file directory to locate prompt files or project root (.mochi / configs/prompts / go.mod).
 	cur := wfDir
 	for range 5 {
+		if _, err := os.Stat(filepath.Join(cur, ".mochi")); err == nil {
+			return cur
+		}
 		if _, err := os.Stat(filepath.Join(cur, "configs", "prompts")); err == nil {
 			return cur
 		}
@@ -867,4 +905,18 @@ func envAny(keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func splitEnvList(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }

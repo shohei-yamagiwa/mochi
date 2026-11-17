@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,13 +12,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shohei-yamagiwa/mochi/internal/credentials"
 	"github.com/shohei-yamagiwa/mochi/internal/domain"
+	"github.com/shohei-yamagiwa/mochi/internal/orchestrator"
 	"github.com/shohei-yamagiwa/mochi/internal/output"
+	"github.com/shohei-yamagiwa/mochi/internal/server"
 	"github.com/shohei-yamagiwa/mochi/internal/store/sqlite"
 )
 
 func TestCLI_ValidatePresetWorkflow(t *testing.T) {
-	wfPath := filepath.Join("..", "..", "configs", "workflows", "pr-review.yaml")
+	wfPath := filepath.Join("..", "..", ".mochi", "workflows", "pr-review.yaml")
 	cmd := newRootCmd()
 	var out, errOut bytes.Buffer
 	cmd.SetOut(&out)
@@ -29,6 +33,67 @@ func TestCLI_ValidatePresetWorkflow(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "valid: pr-review") {
 		t.Fatalf("unexpected validate output: %q", out.String())
+	}
+}
+
+func TestCLI_ValidateRepoWorkflowWithEmbeddedAndCustomPrompts(t *testing.T) {
+	repoDir := t.TempDir()
+	wfDir := filepath.Join(repoDir, ".mochi", "workflows")
+	promptDir := filepath.Join(repoDir, ".mochi", "prompts")
+	if err := os.MkdirAll(wfDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(promptDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(promptDir, "custom-sec.md"), []byte("Check {{.Task.Changeset.Title}}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wfYAML := `version: "1"
+name: repo-custom
+input:
+  adapter: github_pr
+  triggers:
+    base_branches: ["develop"]
+sandbox:
+  provider: daytona
+agents:
+  - role: correctness
+    prompt_file: configs/prompts/correctness.md
+    llm:
+      provider: gemini
+      model: gemini-3.8-flash
+    tools: [read_file, submit_output]
+  - role: security
+    prompt_file: .mochi/prompts/custom-sec.md
+    llm:
+      provider: gemini
+      model: gemini-3.8-flash
+    tools: [read_file, submit_output]
+synthesizer:
+  prompt_file: configs/prompts/synthesizer.md
+  llm:
+    provider: gemini
+    model: gemini-3.8-flash
+output:
+  sinks:
+    - type: github_pr_review
+`
+	wfPath := filepath.Join(wfDir, "custom.yaml")
+	if err := os.WriteFile(wfPath, []byte(wfYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := newRootCmd()
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	cmd.SetArgs([]string{"validate", wfPath})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("mochi validate repo workflow failed: %v\nstderr: %s", err, errOut.String())
+	}
+	if !strings.Contains(out.String(), "valid: repo-custom") {
+		t.Fatalf("unexpected output: %q", out.String())
 	}
 }
 
@@ -219,7 +284,7 @@ func TestCLI_RunDryRunLocalGit(t *testing.T) {
 	runGit("add", ".")
 	runGit("commit", "-m", "add Hello")
 
-	wfPath := filepath.Join("..", "..", "configs", "workflows", "pr-review.yaml")
+	wfPath := filepath.Join("..", "..", ".mochi", "workflows", "pr-review.yaml")
 	cmd := newRootCmd()
 	var out bytes.Buffer
 	cmd.SetOut(&out)
@@ -265,13 +330,14 @@ func TestCLI_ServeRefusesStartWithoutSecrets(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "")
 	t.Setenv("GH_TOKEN", "")
 	t.Setenv("MOCHI_GITHUB_APP_ID", "")
+	t.Setenv("MOCHI_WORKFLOW", "")
+	t.Setenv("MOCHI_MASTER_KEY", "")
 
-	wfPath := filepath.Join("..", "..", "configs", "workflows", "pr-review.yaml")
 	cmd := newRootCmd()
 	var out, errOut bytes.Buffer
 	cmd.SetOut(&out)
 	cmd.SetErr(&errOut)
-	cmd.SetArgs([]string{"serve", "--workflow", wfPath, "--db", filepath.Join(t.TempDir(), "mochi.db")})
+	cmd.SetArgs([]string{"serve", "--db", filepath.Join(t.TempDir(), "mochi.db")})
 
 	err := cmd.Execute()
 	if err == nil {
@@ -279,5 +345,134 @@ func TestCLI_ServeRefusesStartWithoutSecrets(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--insecure-no-auth") {
 		t.Fatalf("expected error mentioning --insecure-no-auth, got: %v", err)
+	}
+}
+
+func TestCLI_ServeRefusesStartWithoutMasterKey(t *testing.T) {
+	t.Setenv("GITHUB_WEBHOOK_SECRET", "")
+	t.Setenv("MOCHI_TRIGGER_SECRET", "")
+	t.Setenv("MOCHI_API_TOKEN", "api-token-for-test")
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "")
+	t.Setenv("MOCHI_GITHUB_APP_ID", "")
+	t.Setenv("MOCHI_WORKFLOW", "")
+	t.Setenv("MOCHI_MASTER_KEY", "")
+
+	cmd := newRootCmd()
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	cmd.SetArgs([]string{"serve", "--db", filepath.Join(t.TempDir(), "mochi.db")})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatalf("expected mochi serve to refuse starting without MOCHI_MASTER_KEY")
+	}
+	if !strings.Contains(err.Error(), "MOCHI_MASTER_KEY") {
+		t.Fatalf("expected error mentioning MOCHI_MASTER_KEY, got: %v", err)
+	}
+}
+
+func TestCLI_CredentialsLocalAndRemote(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "creds.db")
+	masterKey := "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+	t.Setenv("MOCHI_SERVER_URL", "")
+	t.Setenv("MOCHI_API_TOKEN", "")
+	t.Setenv("MOCHI_MASTER_KEY", masterKey)
+	t.Setenv("MOCHI_DB_PATH", dbPath)
+
+	// 1. Local set via --api-key-stdin.
+	cmd := newRootCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetIn(strings.NewReader("AIza-local-secret\n"))
+	cmd.SetArgs([]string{"credentials", "set", "Shohei-Yamagiwa/Mochi", "gemini", "--api-key-stdin"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("credentials set failed: %v", err)
+	}
+	if strings.Contains(out.String(), "AIza-local-secret") {
+		t.Fatalf("output leaked plaintext api key: %s", out.String())
+	}
+
+	// 2. Local list --json.
+	out.Reset()
+	cmd = newRootCmd()
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"credentials", "list", "shohei-yamagiwa/mochi", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("credentials list failed: %v", err)
+	}
+	if strings.Contains(out.String(), "AIza-local-secret") || !strings.Contains(out.String(), `"provider": "gemini"`) {
+		t.Fatalf("unexpected credentials list output: %s", out.String())
+	}
+
+	// 3. Local delete.
+	out.Reset()
+	cmd = newRootCmd()
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"credentials", "delete", "shohei-yamagiwa/mochi", "gemini"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("credentials delete failed: %v", err)
+	}
+
+	// 4. Remote HTTP API mode backed by a real server.Server.
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cipher, err := credentials.NewCipherFromString(masterKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credSvc, err := credentials.NewService(st, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sched := orchestrator.NewScheduler(&orchestrator.Runner{Store: st}, orchestrator.SchedulerConfig{MaxWorkers: 1})
+	defer func() { _ = sched.Shutdown(context.Background()) }()
+	srv, err := server.New(server.Config{
+		Scheduler:         sched,
+		Store:             st,
+		CredentialService: credSvc,
+		APIToken:          "cli-api-token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	out.Reset()
+	cmd = newRootCmd()
+	cmd.SetOut(&out)
+	cmd.SetIn(strings.NewReader("sk-remote-compat\n"))
+	cmd.SetArgs([]string{
+		"credentials", "set", "shohei-yamagiwa/other-repo", "openai_compat",
+		"--server", ts.URL, "--api-token", "cli-api-token",
+		"--base-url", "https://llm.example.com/v1", "--api-key-stdin",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("remote credentials set failed: %v", err)
+	}
+
+	out.Reset()
+	cmd = newRootCmd()
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"credentials", "list", "shohei-yamagiwa/other-repo", "--server", ts.URL, "--api-token", "cli-api-token"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("remote credentials list failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "openai_compat") || !strings.Contains(out.String(), "https://llm.example.com/v1") {
+		t.Fatalf("unexpected remote list output:\n%s", out.String())
+	}
+
+	out.Reset()
+	cmd = newRootCmd()
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"credentials", "delete", "shohei-yamagiwa/other-repo", "openai_compat", "--server", ts.URL, "--api-token", "cli-api-token"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("remote credentials delete failed: %v", err)
 	}
 }

@@ -242,7 +242,7 @@ func TestRunner_EndToEndPresetWorkflowWithParallelFanOutCoverageAndSynthesizerSe
 	defer st.Close()
 
 	repoRoot := filepath.Join("..", "..")
-	wfPath := filepath.Join(repoRoot, "configs", "workflows", "pr-review.yaml")
+	wfPath := filepath.Join(repoRoot, ".mochi", "workflows", "pr-review.yaml")
 	wf, err := config.LoadWorkflowFile(wfPath, repoRoot)
 	if err != nil {
 		t.Fatalf("LoadWorkflowFile(%q): %v", wfPath, err)
@@ -593,7 +593,7 @@ func TestRunner_SpecialistFailureCleansUpSandboxesAndNotifiesSink(t *testing.T) 
 	defer st.Close()
 
 	repoRoot := filepath.Join("..", "..")
-	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, "configs", "workflows", "pr-review.yaml"), repoRoot)
+	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, ".mochi", "workflows", "pr-review.yaml"), repoRoot)
 	if err != nil {
 		t.Fatalf("LoadWorkflowFile: %v", err)
 	}
@@ -666,7 +666,7 @@ func TestRunner_PartialSpecialistFailureContinuesWithSurvivingSpecialists(t *tes
 	defer st.Close()
 
 	repoRoot := filepath.Join("..", "..")
-	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, "configs", "workflows", "pr-review.yaml"), repoRoot)
+	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, ".mochi", "workflows", "pr-review.yaml"), repoRoot)
 	if err != nil {
 		t.Fatalf("LoadWorkflowFile: %v", err)
 	}
@@ -757,7 +757,7 @@ func TestRunner_PartialSinkPublishFailureOnlyNotifiesFailedSink(t *testing.T) {
 	defer st.Close()
 
 	repoRoot := filepath.Join("..", "..")
-	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, "configs", "workflows", "pr-review.yaml"), repoRoot)
+	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, ".mochi", "workflows", "pr-review.yaml"), repoRoot)
 	if err != nil {
 		t.Fatalf("LoadWorkflowFile: %v", err)
 	}
@@ -851,10 +851,11 @@ func TestRunner_RepoOverridesMerge(t *testing.T) {
 	defer st.Close()
 
 	repoRoot := filepath.Join("..", "..")
-	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, "configs", "workflows", "pr-review.yaml"), repoRoot)
+	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, ".mochi", "workflows", "pr-review.yaml"), repoRoot)
 	if err != nil {
 		t.Fatalf("LoadWorkflowFile: %v", err)
 	}
+	wf.RepoOverrides.Enabled = true
 
 	sbProvider := newTrackingSandboxProvider(nil)
 	llmProvider := newRoutingLLMProvider("mock", func(_ context.Context, role string, _ int, _ llm.ChatRequest) (*llm.ChatResponse, error) {
@@ -955,10 +956,11 @@ func TestRunner_RepoOverridesSandboxAppliesToBaseSandbox(t *testing.T) {
 	defer st.Close()
 
 	repoRoot := filepath.Join("..", "..")
-	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, "configs", "workflows", "pr-review.yaml"), repoRoot)
+	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, ".mochi", "workflows", "pr-review.yaml"), repoRoot)
 	if err != nil {
 		t.Fatalf("LoadWorkflowFile: %v", err)
 	}
+	wf.RepoOverrides.Enabled = true
 	wf.RepoOverrides.AllowCustomImages = true
 	wf.Sandbox.ForkFromBase = true
 
@@ -1032,7 +1034,7 @@ func TestRunner_SingleSpecialistForkFailureContinuesWithFailFastFalse(t *testing
 	defer st.Close()
 
 	repoRoot := filepath.Join("..", "..")
-	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, "configs", "workflows", "pr-review.yaml"), repoRoot)
+	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, ".mochi", "workflows", "pr-review.yaml"), repoRoot)
 	if err != nil {
 		t.Fatalf("LoadWorkflowFile: %v", err)
 	}
@@ -1122,7 +1124,7 @@ func testPresetWithoutFork(t *testing.T, file, snapshot string, roles []string) 
 	}
 	defer st.Close()
 	repoRoot := filepath.Join("..", "..")
-	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, "configs", "workflows", file), repoRoot)
+	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, ".mochi", "workflows", file), repoRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1185,10 +1187,12 @@ func TestRunner_CleansUpRepoOverridePromptDir(t *testing.T) {
 	defer st.Close()
 
 	repoRoot := filepath.Join("..", "..")
-	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, "configs", "workflows", "pr-review.yaml"), repoRoot)
+	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, ".mochi", "workflows", "pr-review.yaml"), repoRoot)
 	if err != nil {
 		t.Fatalf("LoadWorkflowFile: %v", err)
 	}
+	wf.RepoOverrides.Enabled = true
+	wf.RepoOverrides.AllowCustomPrompts = true
 
 	makePromptDir := func(t *testing.T, content string) string {
 		t.Helper()
@@ -1281,5 +1285,169 @@ agents:
 	}
 	if _, statErr := os.Stat(errDir); !os.IsNotExist(statErr) {
 		t.Fatalf("expected %q to be removed on merge error, stat err=%v", errDir, statErr)
+	}
+}
+
+func TestRunner_LLMRegistryResolverFailureMarksRunFailedAndCleansTaskPromptDir(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer st.Close()
+
+	repoRoot := filepath.Join("..", "..")
+	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, ".mochi", "workflows", "pr-review-small.yaml"), repoRoot)
+	if err != nil {
+		t.Fatalf("LoadWorkflowFile: %v", err)
+	}
+
+	promptDir, err := os.MkdirTemp("", "mochi-task-prompt-fail-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(promptDir, ".mochi", "prompts"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(promptDir, ".mochi", "prompts", "custom.md"), []byte("custom"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	sink := &recordingSink{name: "github_pr_review"}
+	sinkReg := output.NewRegistry()
+	sinkReg.Register(sink)
+
+	sbProvider := newTrackingSandboxProvider(nil)
+	runner := &Runner{
+		Store:           st,
+		SandboxProvider: sbProvider,
+		SinkRegistry:    sinkReg,
+		LLMRegistryResolver: func(_ context.Context, _ *domain.TaskContext, _ *domain.Workflow) (*llm.Registry, error) {
+			return nil, errors.New("missing gemini credential for repo owner/app")
+		},
+	}
+
+	task := &domain.TaskContext{
+		RunID:        "run-missing-cred",
+		WorkflowName: wf.Name,
+		TriggerType:  "github_pr",
+		DedupKey:     "github:owner/app:pr:5:workflow:pr-review-small",
+		PromptDir:    promptDir,
+		Changeset: &domain.ChangesetSpec{
+			RepoOwner: "owner",
+			RepoName:  "app",
+			PRNumber:  5,
+			BaseSHA:   "111",
+			HeadSHA:   "222",
+		},
+	}
+
+	_, err = runner.Execute(ctx, task, wf)
+	if err == nil || !strings.Contains(err.Error(), "missing gemini credential") {
+		t.Fatalf("Runner.Execute error = %v, want missing gemini credential error", err)
+	}
+	if len(sbProvider.createdBase) != 0 {
+		t.Fatalf("expected no sandboxes created when credential resolution fails, got %d", len(sbProvider.createdBase))
+	}
+	if len(sink.failedErrs) != 1 || !strings.Contains(sink.failedErrs[0].Error(), "missing gemini credential") {
+		t.Fatalf("expected sink OnRunFailed to receive credential error, got %v", sink.failedErrs)
+	}
+	persisted, err := st.GetRun(ctx, task.RunID)
+	if err != nil {
+		t.Fatalf("st.GetRun: %v", err)
+	}
+	if persisted.Status != domain.RunStatusFailed {
+		t.Fatalf("persisted.Status = %q, want %q", persisted.Status, domain.RunStatusFailed)
+	}
+	if _, statErr := os.Stat(promptDir); !os.IsNotExist(statErr) {
+		t.Fatalf("expected PromptDir %q to be cleaned up, stat err=%v", promptDir, statErr)
+	}
+}
+
+func TestRunner_TaskPromptDirAndPerRunRegistryResolution(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer st.Close()
+
+	repoRoot := filepath.Join("..", "..")
+	wf, err := config.LoadWorkflowFile(filepath.Join(repoRoot, ".mochi", "workflows", "pr-review-small.yaml"), repoRoot)
+	if err != nil {
+		t.Fatalf("LoadWorkflowFile: %v", err)
+	}
+	wf.Agents[0].PromptFile = ".mochi/prompts/custom_correctness.md"
+	wf.Agents[0].PromptFromRepo = true
+
+	promptDir, err := os.MkdirTemp("", "mochi-task-prompt-ok-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(promptDir, ".mochi", "prompts"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(promptDir, ".mochi", "prompts", "custom_correctness.md"), []byte("REPO_CUSTOM_PROMPT_SENTINEL"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	perRunProvider := newRoutingLLMProvider("gemini", func(_ context.Context, role string, _ int, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+		if role == "synthesizer" {
+			return &llm.ChatResponse{
+				Message: llm.Message{
+					Role:    llm.RoleAssistant,
+					Content: `{"summary":"All clear","verdict":"APPROVE","findings":[]}`,
+				},
+			}, nil
+		}
+		tc := llm.ToolCall{
+			ID:        "tc_submit_" + role,
+			Name:      "submit_output",
+			Arguments: json.RawMessage(`{"summary":"ok","findings":[]}`),
+		}
+		return &llm.ChatResponse{
+			Message:   llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{tc}},
+			ToolCalls: []llm.ToolCall{tc},
+		}, nil
+	})
+
+	runner := &Runner{
+		Store:           st,
+		SandboxProvider: newTrackingSandboxProvider(nil),
+		PromptEngine:    config.NewPromptEngine(""),
+		LLMRegistryResolver: func(_ context.Context, task *domain.TaskContext, _ *domain.Workflow) (*llm.Registry, error) {
+			reg := llm.NewRegistry()
+			reg.Register(perRunProvider)
+			return reg, nil
+		},
+	}
+
+	task := &domain.TaskContext{
+		RunID:        "run-per-repo-prompt-and-llm",
+		WorkflowName: wf.Name,
+		TriggerType:  "github_pr",
+		DedupKey:     "github:owner/app:pr:6:workflow:pr-review-small",
+		PromptDir:    promptDir,
+		Changeset: &domain.ChangesetSpec{
+			RepoOwner: "owner",
+			RepoName:  "app",
+			PRNumber:  6,
+			BaseSHA:   "111",
+			HeadSHA:   "222",
+		},
+	}
+
+	res, err := runner.Execute(ctx, task, wf)
+	if err != nil {
+		t.Fatalf("Runner.Execute: %v", err)
+	}
+	if res.Run.Status != domain.RunStatusCompleted {
+		t.Fatalf("res.Run.Status = %q, want completed", res.Run.Status)
+	}
+	if got := perRunProvider.sysByRole["correctness"]; !strings.Contains(got, "REPO_CUSTOM_PROMPT_SENTINEL") {
+		t.Fatalf("expected specialist system prompt from task.PromptDir, got %q", got)
+	}
+	if _, statErr := os.Stat(promptDir); !os.IsNotExist(statErr) {
+		t.Fatalf("expected task.PromptDir %q to be removed, stat err=%v", promptDir, statErr)
 	}
 }

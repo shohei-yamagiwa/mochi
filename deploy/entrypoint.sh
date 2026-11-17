@@ -10,13 +10,10 @@ fi
 
 if [ "${1:-}" = serve ]; then
   shift
-  workflow=${MOCHI_WORKFLOW:-configs/workflows/pr-review.yaml}
-  mochi validate --runtime "$workflow"
+  mochi validate --runtime
   exec mochi serve \
     --addr ":${PORT:-8080}" \
     --db "${MOCHI_DB_PATH:-/data/mochi.db}" \
-    --workflow "$workflow" \
-    --base-dir /app \
     --workers "${MOCHI_WORKERS:-1}" \
     --queue-size "${MOCHI_QUEUE_SIZE:-16}" \
     "$@"

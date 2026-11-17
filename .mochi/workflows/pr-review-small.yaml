@@ -1,20 +1,16 @@
 # Small preset: one specialist + synthesizer, one LLM provider.
 # Create the mochi-review snapshot in Daytona before enabling PR events.
 version: "1"
-name: pr-review
-description: Small GitHub App deployment with one correctness specialist
+name: pr-review-small
+description: Small GitHub App workflow with one correctness specialist
 input:
   adapter: github_pr
   triggers:
     # Subscribe to pull_request and issue_comment in the GitHub App.
     events: [opened, synchronize, reopened, ready_for_review]
-    comment_command: "/mochi review"
+    base_branches: [develop]
+    comment_command: "/mochi review-small"
     ignore_drafts: true
-repo_overrides:
-  enabled: false
-  allow_custom_prompts: false
-  allow_custom_images: false
-  allow_custom_models: false
 sandbox:
   provider: daytona
   default_snapshot: mochi-review

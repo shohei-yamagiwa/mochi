@@ -15,7 +15,8 @@ func runtimeTestEnv(t *testing.T) {
 	for _, key := range []string{
 		"MOCHI_GITHUB_APP_ID", "MOCHI_GITHUB_PRIVATE_KEY", "MOCHI_GITHUB_PRIVATE_KEY_PATH",
 		"GITHUB_TOKEN", "GH_TOKEN", "GITHUB_API_URL", "GITHUB_WEBHOOK_SECRET",
-		"MOCHI_TRIGGER_SECRET", "MOCHI_API_TOKEN", "DAYTONA_API_KEY", "DAYTONA_JWT_TOKEN",
+		"MOCHI_TRIGGER_SECRET", "MOCHI_API_TOKEN", "MOCHI_MASTER_KEY", "MOCHI_WORKFLOW",
+		"DAYTONA_API_KEY", "DAYTONA_JWT_TOKEN",
 		"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENAI_COMPAT_BASE_URL",
 	} {
 		t.Setenv(key, "")
@@ -23,8 +24,46 @@ func runtimeTestEnv(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "test-token-no-network")
 	t.Setenv("GITHUB_WEBHOOK_SECRET", "test-webhook-secret")
 	t.Setenv("MOCHI_API_TOKEN", "test-api-token")
+	t.Setenv("MOCHI_MASTER_KEY", "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
 	t.Setenv("DAYTONA_API_KEY", "test-daytona-key")
 	t.Setenv("OPENAI_API_KEY", "test-openai-key")
+}
+
+func TestServerRuntimeValidationDoesNotRequireLLMKeysOrWorkflow(t *testing.T) {
+	runtimeTestEnv(t)
+	// Clear all global LLM API keys and MOCHI_WORKFLOW: server mode must not require them.
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("GEMINI_API_KEY", "")
+	t.Setenv("GOOGLE_API_KEY", "")
+	t.Setenv("MOCHI_WORKFLOW", "")
+
+	cmd := newRootCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"validate", "--runtime"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("mochi validate --runtime failed without global LLM keys: %v", err)
+	}
+	if !strings.Contains(out.String(), "valid: server runtime configuration") {
+		t.Fatalf("unexpected output: %q", out.String())
+	}
+
+	for _, tc := range []struct{ key, want string }{
+		{"GITHUB_TOKEN", "github authentication"},
+		{"GITHUB_WEBHOOK_SECRET", "webhook secret"},
+		{"MOCHI_API_TOKEN", "authentication secrets"},
+		{"DAYTONA_API_KEY", "DAYTONA_API_KEY"},
+		{"MOCHI_MASTER_KEY", "MOCHI_MASTER_KEY"},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			t.Setenv(tc.key, "")
+			err := validateServerRuntime()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v, want error mentioning %q", err, tc.want)
+			}
+		})
+	}
 }
 
 func TestRuntimeWorkflowChecksAllDependencies(t *testing.T) {
@@ -92,7 +131,7 @@ func testValidateDeploymentPreset(t *testing.T, file, expected string) {
 	t.Setenv("OPENAI_API_KEY", "")
 	t.Setenv("ANTHROPIC_API_KEY", "")
 	t.Setenv("GEMINI_API_KEY", "test-gemini-key")
-	path := filepath.Join("..", "..", "configs", "workflows", file)
+	path := filepath.Join("..", "..", ".mochi", "workflows", file)
 	for _, runtime := range []bool{false, true} {
 		cmd := newRootCmd()
 		var out bytes.Buffer

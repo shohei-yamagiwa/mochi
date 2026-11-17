@@ -115,6 +115,8 @@ type InputConfig struct {
 // TriggerConfig defines trigger filtering rules for an input adapter.
 type TriggerConfig struct {
 	Events                     []string `yaml:"events,omitempty" json:"events,omitempty"`
+	BaseBranches               []string `yaml:"base_branches,omitempty" json:"base_branches,omitempty"`
+	HeadBranches               []string `yaml:"head_branches,omitempty" json:"head_branches,omitempty"`
 	CommentCommand             string   `yaml:"comment_command,omitempty" json:"comment_command,omitempty"`
 	AllowedCommentAssociations []string `yaml:"allowed_comment_associations,omitempty" json:"allowed_comment_associations,omitempty"`
 	IgnoreDrafts               bool     `yaml:"ignore_drafts,omitempty" json:"ignore_drafts,omitempty"`
