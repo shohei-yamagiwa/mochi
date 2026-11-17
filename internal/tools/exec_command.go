@@ -12,12 +12,10 @@ import (
 	"github.com/shohei-yamagiwa/mochi/internal/sandbox"
 )
 
-const defaultCommandTimeout = 60 * time.Second
-
 type execCommandArgs struct {
 	Command        string `json:"command" jsonschema:"Shell command to execute inside the repository sandbox"`
 	WorkDir        string `json:"workdir,omitempty" jsonschema:"Optional repository-relative working directory"`
-	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"Optional per-command timeout override in seconds (clamped to role command_timeout)"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"Optional per-command timeout in seconds"`
 }
 
 type execCommandTool struct {
@@ -78,15 +76,9 @@ func (t *execCommandTool) Execute(ctx context.Context, execCtx ExecutionContext,
 		}
 	}
 
-	timeout := execCtx.CommandTimeout
-	if timeout <= 0 {
-		timeout = defaultCommandTimeout
-	}
+	var timeout time.Duration
 	if args.TimeoutSeconds > 0 {
-		reqTimeout := time.Duration(args.TimeoutSeconds) * time.Second
-		if reqTimeout < timeout {
-			timeout = reqTimeout
-		}
+		timeout = time.Duration(args.TimeoutSeconds) * time.Second
 	}
 
 	res, err := execCtx.Sandbox.Exec(ctx, sandbox.ExecRequest{

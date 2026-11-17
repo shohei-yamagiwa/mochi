@@ -86,8 +86,7 @@ prepared sandbox. LLM credentials remain in the server process.
 
 Tool allowlists restrict capabilities exposed to each role. Roles with
 `exec_command` can run shell commands, so removing `write_file` does not make a
-role read-only. Budgets bound turns, tokens, and time; token accounting after
-calls does not impose an exact spending cap.
+role read-only. Budgets bound per-role execution time (`run_timeout`).
 
 ## Extending Mochi
 

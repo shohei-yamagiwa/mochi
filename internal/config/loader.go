@@ -322,7 +322,7 @@ func MergeRepoOverrides(base *domain.Workflow, overrideYAML []byte) (*domain.Wor
 				cloned.Agents[idx].Tools = slices.Clone(aov.Tools)
 			}
 			if aov.Budgets != nil {
-				if err := mergeClampedBudgetConfig(&cloned.Agents[idx].Budgets, aov.Budgets); err != nil {
+				if err := mergeBudgetConfig(&cloned.Agents[idx].Budgets, aov.Budgets); err != nil {
 					return nil, fmt.Errorf("agent %q budgets: %w", aov.Role, err)
 				}
 			}
@@ -356,7 +356,7 @@ func MergeRepoOverrides(base *domain.Workflow, overrideYAML []byte) (*domain.Wor
 			}
 		}
 		if ov.Synthesizer.Budgets != nil {
-			if err := mergeClampedBudgetConfig(&cloned.Synthesizer.Budgets, ov.Synthesizer.Budgets); err != nil {
+			if err := mergeBudgetConfig(&cloned.Synthesizer.Budgets, ov.Synthesizer.Budgets); err != nil {
 				return nil, fmt.Errorf("synthesizer budgets: %w", err)
 			}
 		}
@@ -429,13 +429,7 @@ func cloneWorkflow(wf *domain.Workflow) *domain.Workflow {
 	return &out
 }
 
-const (
-	defaultMaxOutputTokensCeiling = 16384
-	defaultMaxTurnsCeiling        = 20
-	defaultMaxTokensCeiling       = 200000
-	defaultCommandTimeoutCeiling  = domain.Duration(5 * 60 * 1e9)  // 5m
-	defaultRunTimeoutCeiling      = domain.Duration(10 * 60 * 1e9) // 10m
-)
+const defaultMaxOutputTokensCeiling = 16384
 
 func reasoningEffortRank(effort string) (int, bool) {
 	switch effort {
@@ -485,37 +479,17 @@ func mergeModelOverride(dst *domain.ModelConfig, src *ModelOverride, allowCustom
 	return nil
 }
 
-func mergeClampedBudgetConfig(dst, src *domain.BudgetConfig) error {
+func mergeBudgetConfig(dst, src *domain.BudgetConfig) error {
 	if err := validateBudgetConfig(*src); err != nil {
 		return err
 	}
-	if src.MaxTurns > 0 {
-		dst.MaxTurns = clampInt(src.MaxTurns, dst.MaxTurns, defaultMaxTurnsCeiling)
-	}
-	if src.MaxTokens > 0 {
-		dst.MaxTokens = clampInt(src.MaxTokens, dst.MaxTokens, defaultMaxTokensCeiling)
-	}
-	if src.CommandTimeout > 0 {
-		dst.CommandTimeout = clampDuration(src.CommandTimeout, dst.CommandTimeout, defaultCommandTimeoutCeiling)
-	}
 	if src.RunTimeout > 0 {
-		dst.RunTimeout = clampDuration(src.RunTimeout, dst.RunTimeout, defaultRunTimeoutCeiling)
+		dst.RunTimeout = src.RunTimeout
 	}
 	return nil
 }
 
 func clampInt(requested, base, ceiling int) int {
-	limit := base
-	if limit <= 0 {
-		limit = ceiling
-	}
-	if limit > 0 && requested > limit {
-		return limit
-	}
-	return requested
-}
-
-func clampDuration(requested, base, ceiling domain.Duration) domain.Duration {
 	limit := base
 	if limit <= 0 {
 		limit = ceiling
@@ -551,15 +525,6 @@ func validateModelConfig(m domain.ModelConfig) error {
 }
 
 func validateBudgetConfig(b domain.BudgetConfig) error {
-	if b.MaxTurns < 0 {
-		return fmt.Errorf("max_turns must not be negative")
-	}
-	if b.MaxTokens < 0 {
-		return fmt.Errorf("max_tokens must not be negative")
-	}
-	if b.CommandTimeout < 0 {
-		return fmt.Errorf("command_timeout must not be negative")
-	}
 	if b.RunTimeout < 0 {
 		return fmt.Errorf("run_timeout must not be negative")
 	}

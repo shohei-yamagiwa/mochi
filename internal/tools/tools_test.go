@@ -226,11 +226,10 @@ func TestSearchCodeAndGitDiffTools(t *testing.T) {
 	}
 
 	execCtx := ExecutionContext{
-		AgentRole:      "security",
-		Sandbox:        sb,
-		BaseRef:        "abc111",
-		HeadRef:        "def222",
-		CommandTimeout: 10 * time.Second,
+		AgentRole: "security",
+		Sandbox:   sb,
+		BaseRef:   "abc111",
+		HeadRef:   "def222",
 	}
 
 	sres, err := ts.Execute(context.Background(), execCtx, jsonCall("search_code", `{"pattern":"Authorization"}`))
@@ -253,7 +252,7 @@ func TestSearchCodeAndGitDiffTools(t *testing.T) {
 	}
 }
 
-func TestExecCommand_TruncationAndTimeoutClamp(t *testing.T) {
+func TestExecCommand_TruncationAndTimeout(t *testing.T) {
 	reg, _ := NewRegistry()
 	ts, _ := reg.ScopeForRole([]string{"exec_command"})
 
@@ -265,21 +264,30 @@ func TestExecCommand_TruncationAndTimeoutClamp(t *testing.T) {
 	}
 
 	res, err := ts.Execute(context.Background(), ExecutionContext{
-		AgentRole:      "test-runner",
-		Sandbox:        sb,
-		CommandTimeout: 30 * time.Second,
+		AgentRole: "test-runner",
+		Sandbox:   sb,
 	}, jsonCall("exec_command", `{"command":"go test ./...","timeout_seconds":120}`))
 	if err != nil {
 		t.Fatalf("exec_command: %v", err)
 	}
-	if sb.lastExecReq.Timeout != 30*time.Second {
-		t.Fatalf("expected timeout clamped to 30s, got %v", sb.lastExecReq.Timeout)
+	if sb.lastExecReq.Timeout != 120*time.Second {
+		t.Fatalf("expected timeout 120s, got %v", sb.lastExecReq.Timeout)
 	}
 	if len(res.Output) > defaultMaxOutputBytes {
 		t.Fatalf("expected output <= %d bytes, got %d", defaultMaxOutputBytes, len(res.Output))
 	}
 	if !strings.Contains(res.Output, "[truncated") || !strings.Contains(res.Output, "AAAA") || !strings.Contains(res.Output, "ZZZZ") {
 		t.Fatalf("expected head+tail truncation markers & both ends preserved")
+	}
+
+	if _, err := ts.Execute(context.Background(), ExecutionContext{
+		AgentRole: "test-runner",
+		Sandbox:   sb,
+	}, jsonCall("exec_command", `{"command":"go test ./..."}`)); err != nil {
+		t.Fatalf("exec_command without timeout_seconds: %v", err)
+	}
+	if sb.lastExecReq.Timeout != 0 {
+		t.Fatalf("expected zero per-command timeout when omitted, got %v", sb.lastExecReq.Timeout)
 	}
 }
 
@@ -556,4 +564,3 @@ func TestReadFile_ClampsTailRangeToEOF(t *testing.T) {
 		t.Fatalf("expected tail range to cover hunk 1990-1995, got %+v", tailRec.LineRange)
 	}
 }
-

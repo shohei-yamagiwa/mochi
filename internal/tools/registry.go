@@ -7,7 +7,6 @@ import (
 	posixpath "path"
 	"slices"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	"github.com/shohei-yamagiwa/mochi/internal/domain"
@@ -19,11 +18,10 @@ const defaultMaxOutputBytes = 32 * 1024
 
 // ExecutionContext provides runtime metadata and the target Sandbox for a tool call.
 type ExecutionContext struct {
-	AgentRole      string
-	Sandbox        sandbox.Sandbox
-	BaseRef        string
-	HeadRef        string
-	CommandTimeout time.Duration
+	AgentRole string
+	Sandbox   sandbox.Sandbox
+	BaseRef   string
+	HeadRef   string
 }
 
 // ExecutionResult is the normalized output of executing a sandbox tool.

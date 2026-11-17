@@ -116,7 +116,6 @@ func setupTestWorkflow(t *testing.T) (*domain.Workflow, string) {
 				LLM:        domain.ModelConfig{Provider: "openai", Model: "stub"},
 				Sandbox:    domain.AgentSandboxConfig{Enabled: false},
 				Tools:      []string{"submit_output"},
-				Budgets:    domain.BudgetConfig{MaxTurns: 3},
 			},
 		},
 		Synthesizer: domain.SynthesizerConfig{
