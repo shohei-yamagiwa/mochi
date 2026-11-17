@@ -51,4 +51,3 @@ output:
       include_coverage_summary: true
       min_severity: low
       min_confidence: 0.7
-      verdict_mode: comment_only

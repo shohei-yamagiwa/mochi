@@ -144,6 +144,6 @@ commands, and `skipped_reasons` before treating a review as test verification.
 
 Coverage measures recorded access to changed files and hunks, not the absence of
 bugs or test coverage. Check uncovered files and failed specialists before relying
-on a result. The presets use `comment_only`: the GitHub sink publishes comments
-rather than approval or change-request decisions. See
+on a result. The GitHub sink enforces the final verdict by submitting `APPROVE`,
+`REQUEST_CHANGES`, or `COMMENT` reviews with matching Check Run conclusions. See
 [configuration](configuration.md#output-sinks) for output controls.

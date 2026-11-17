@@ -120,7 +120,6 @@ func NewSink(clients ghinput.ClientFactory, opts ...Option) (*Sink, error) {
 			IncludeCoverageSummary: true,
 			MinSeverity:            string(output.SeverityLow),
 			MinConfidence:          0.7,
-			VerdictMode:            "comment_only",
 		},
 		tracker: &checkRunTracker{
 			ids: make(map[string]int64),
@@ -412,32 +411,25 @@ func (s *Sink) createPRReviewWithFallbacks(
 }
 
 func (s *Sink) resolveReviewEvent(verdict output.Verdict) string {
-	if strings.EqualFold(strings.TrimSpace(s.cfg.VerdictMode), "enforce") {
-		switch verdict {
-		case output.VerdictApprove:
-			return "APPROVE"
-		case output.VerdictRequestChanges:
-			return "REQUEST_CHANGES"
-		}
+	switch verdict {
+	case output.VerdictApprove:
+		return "APPROVE"
+	case output.VerdictRequestChanges:
+		return "REQUEST_CHANGES"
+	default:
+		return "COMMENT"
 	}
-	return "COMMENT"
 }
 
 func (s *Sink) resolveCheckConclusion(verdict output.Verdict) string {
-	if strings.EqualFold(strings.TrimSpace(s.cfg.VerdictMode), "enforce") {
-		switch verdict {
-		case output.VerdictApprove:
-			return "success"
-		case output.VerdictRequestChanges:
-			return "failure"
-		default:
-			return "neutral"
-		}
-	}
-	if verdict == output.VerdictApprove {
+	switch verdict {
+	case output.VerdictApprove:
 		return "success"
+	case output.VerdictRequestChanges:
+		return "failure"
+	default:
+		return "neutral"
 	}
-	return "neutral"
 }
 
 func filterFindings(findings []output.Finding, minSev string, minConf float64) (kept []output.Finding, dropped int) {

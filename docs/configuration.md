@@ -94,24 +94,25 @@ requests are clamped to server limits. Keep at least one specialist enabled.
 Custom `prompt_file` paths must stay under `.mochi/` and require
 `allow_custom_prompts`. Sandbox changes require `allow_custom_images`. Model
 changes require `allow_custom_models`. Overrides
-cannot change trigger rules, providers, API base URLs, sink destinations,
-or verdict mode, and cannot add roles, tools, or sinks. The allowlist and merging
-rules are implemented in [`internal/config/loader.go`](../internal/config/loader.go).
+cannot change trigger rules, providers, API base URLs, or sink destinations, and
+cannot add roles, tools, or sinks. The allowlist and merging rules are implemented
+in [`internal/config/loader.go`](../internal/config/loader.go).
 
 ## Output sinks
 
 | Type | Destination and settings |
 | --- | --- |
-| `github_pr_review` | Check Run and PR review; `post_inline_comments`, `include_coverage_summary`, `min_severity`, `min_confidence`, `verdict_mode` |
+| `github_pr_review` | Check Run and PR review; `post_inline_comments`, `include_coverage_summary`, `min_severity`, `min_confidence` |
 | `console` | Human-readable report on stdout; optional coverage summary |
 | `json_file` | JSON artifact at `options.path` |
 | `webhook` | JSON envelope sent to `url`; optional HMAC signing secret in `options.secret` |
 
-For GitHub output, `comment_only` posts comments without enforcing the artifact's
-verdict; `enforce` allows approval or change-request reviews. Severity thresholds
-are `nit`, `low`, `medium`, `high`, or `critical`; confidence ranges from 0 to 1.
-The bundled workflows use `comment_only`, minimum severity `low`, and minimum
-confidence `0.7`. CLI runs suppress GitHub delivery unless `--post-github` is set.
+For GitHub output, the review event and Check Run conclusion enforce the artifact's
+verdict (`APPROVE` to `success`, `REQUEST_CHANGES` to `failure`, and `COMMENT` to
+`neutral`, falling back to a `COMMENT` review if GitHub returns HTTP 422). Severity
+thresholds are `nit`, `low`, `medium`, `high`, or `critical`; confidence ranges from
+0 to 1. The bundled workflows use minimum severity `low` and minimum confidence
+`0.7`. CLI runs suppress GitHub delivery unless `--post-github` is set.
 
 Keep server workflow files containing webhook secrets private. Prompt contexts
 omit sink URLs and options, but resolved workflow configuration is persisted for

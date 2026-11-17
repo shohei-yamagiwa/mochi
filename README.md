@@ -48,7 +48,7 @@ The container runs one workflow at a time, with specialists running in parallel.
 With the GitHub App installed and subscribed to `pull_request` and `issue_comment`,
 both presets review open, non-draft PRs when opened, updated, reopened, or marked
 ready. Owners, members, and collaborators can rerun a review with `/mochi review`.
-The presets publish comments and Check Runs without enforcing the review verdict.
+The presets publish Check Runs and PR reviews that enforce the review verdict.
 
 ## Documentation
 

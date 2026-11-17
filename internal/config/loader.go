@@ -99,7 +99,6 @@ type SinkOverride struct {
 	IncludeCoverageSummary *bool    `yaml:"include_coverage_summary,omitempty"`
 	MinSeverity            string   `yaml:"min_severity,omitempty"`
 	MinConfidence          *float64 `yaml:"min_confidence,omitempty"`
-	VerdictMode            string   `yaml:"verdict_mode,omitempty"`
 	URL                    string   `yaml:"url,omitempty"`
 }
 
@@ -236,9 +235,6 @@ func ValidateWorkflow(wf *domain.Workflow, baseDir string) error {
 		if s.MinConfidence < 0 || s.MinConfidence > 1 {
 			return fmt.Errorf("output.sinks[%d].min_confidence must be between 0.0 and 1.0", i)
 		}
-		if s.VerdictMode != "" && s.VerdictMode != "comment_only" && s.VerdictMode != "enforce" {
-			return fmt.Errorf("output.sinks[%d].verdict_mode %q is invalid", i, s.VerdictMode)
-		}
 	}
 
 	return nil
@@ -370,9 +366,6 @@ func MergeRepoOverrides(base *domain.Workflow, overrideYAML []byte) (*domain.Wor
 		for _, sov := range ov.Output.Sinks {
 			if sov.URL != "" {
 				return nil, fmt.Errorf("output sink %q url: %w", sov.Type, ErrDisallowedOverrideField)
-			}
-			if sov.VerdictMode != "" {
-				return nil, fmt.Errorf("output sink %q verdict_mode: %w", sov.Type, ErrDisallowedOverrideField)
 			}
 			idx, ok := sinkIndex[sov.Type]
 			if !ok {

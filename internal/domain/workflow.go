@@ -179,7 +179,6 @@ type SinkConfig struct {
 	IncludeCoverageSummary bool           `yaml:"include_coverage_summary,omitempty" json:"include_coverage_summary,omitempty"`
 	MinSeverity            string         `yaml:"min_severity,omitempty" json:"min_severity,omitempty"`
 	MinConfidence          float64        `yaml:"min_confidence,omitempty" json:"min_confidence,omitempty"`
-	VerdictMode            string         `yaml:"verdict_mode,omitempty" json:"verdict_mode,omitempty"`
 	URL                    string         `yaml:"url,omitempty" json:"url,omitempty"`
 	Options                map[string]any `yaml:"options,omitempty" json:"options,omitempty"`
 }
