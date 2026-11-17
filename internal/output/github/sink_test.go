@@ -139,7 +139,6 @@ func TestGitHubSink_FullLifecycleInlineCommentsCoverageAndEnforce(t *testing.T) 
 		IncludeCoverageSummary: true,
 		MinSeverity:            "low",
 		MinConfidence:          0.7,
-		VerdictMode:            "enforce",
 	})
 
 	task := testTaskContext()
@@ -351,7 +350,6 @@ func TestGitHubSink_HTTP422InlineRetryAndCommentOnlyAndOnRunFailed(t *testing.T)
 		Type:                   "github_pr_review",
 		PostInlineComments:     true,
 		IncludeCoverageSummary: false,
-		VerdictMode:            "comment_only",
 	})
 
 	task := testTaskContext()
@@ -385,9 +383,9 @@ func TestGitHubSink_HTTP422InlineRetryAndCommentOnlyAndOnRunFailed(t *testing.T)
 		mu.Unlock()
 		t.Fatalf("reviewAttempts = %d, want 2", reviewAttempts)
 	}
-	if lastReview.Event != "COMMENT" {
+	if lastReview.Event != "REQUEST_CHANGES" {
 		mu.Unlock()
-		t.Fatalf("comment_only mode Event = %q, want COMMENT", lastReview.Event)
+		t.Fatalf("Event = %q, want REQUEST_CHANGES", lastReview.Event)
 	}
 	if len(lastReview.Comments) != 0 {
 		mu.Unlock()
@@ -470,7 +468,6 @@ func TestGitHubSink_LargeReviewBodyCapAndTrackerCleanup(t *testing.T) {
 		Type:                   "github_pr_review",
 		PostInlineComments:     true,
 		IncludeCoverageSummary: true,
-		VerdictMode:            "comment_only",
 	})
 
 	fileDetails := make([]domain.FileCoverageDetail, 0, 1200)
@@ -548,9 +545,9 @@ func TestGitHubSink_LargeReviewBodyCapAndTrackerCleanup(t *testing.T) {
 
 func TestGitHubSink_CompactedCheckRunNoSelfReferenceAndBalancedTruncation(t *testing.T) {
 	var (
-		mu             sync.Mutex
-		reviewBodies   []string
-		checkUpdates   []capturedCheckReq
+		mu           sync.Mutex
+		reviewBodies []string
+		checkUpdates []capturedCheckReq
 	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -593,7 +590,6 @@ func TestGitHubSink_CompactedCheckRunNoSelfReferenceAndBalancedTruncation(t *tes
 		Type:                   "github_pr_review",
 		PostInlineComments:     false,
 		IncludeCoverageSummary: true,
-		VerdictMode:            "comment_only",
 	})
 
 	// Construct huge FileDetails (~80 KB table) + many findings with ```suggestion blocks,
@@ -733,3 +729,113 @@ func TestGitHubSink_CompactedCheckRunNoSelfReferenceAndBalancedTruncation(t *tes
 	}
 }
 
+func TestGitHubSink_EnforcesVerdictsAndHTTP422Fallback(t *testing.T) {
+	cases := []struct {
+		name           string
+		verdict        output.Verdict
+		rejectApprove  bool
+		wantEvent      string
+		wantConclusion string
+	}{
+		{
+			name:           "approve",
+			verdict:        output.VerdictApprove,
+			wantEvent:      "APPROVE",
+			wantConclusion: "success",
+		},
+		{
+			name:           "request_changes",
+			verdict:        output.VerdictRequestChanges,
+			wantEvent:      "REQUEST_CHANGES",
+			wantConclusion: "failure",
+		},
+		{
+			name:           "comment",
+			verdict:        output.VerdictComment,
+			wantEvent:      "COMMENT",
+			wantConclusion: "neutral",
+		},
+		{
+			name:           "approve_422_fallback_to_comment",
+			verdict:        output.VerdictApprove,
+			rejectApprove:  true,
+			wantEvent:      "COMMENT",
+			wantConclusion: "success",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				mu          sync.Mutex
+				lastEvent   string
+				lastCheck   capturedCheckReq
+				reviewCalls int
+			)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				switch {
+				case r.Method == http.MethodPost && r.URL.Path == "/repos/shohei-yamagiwa/mochi/check-runs":
+					w.WriteHeader(http.StatusCreated)
+					_ = json.NewEncoder(w).Encode(map[string]any{"id": 101})
+				case r.Method == http.MethodPatch && r.URL.Path == "/repos/shohei-yamagiwa/mochi/check-runs/101":
+					_ = json.NewDecoder(r.Body).Decode(&lastCheck)
+					_ = json.NewEncoder(w).Encode(map[string]any{"id": 101})
+				case r.Method == http.MethodPost && r.URL.Path == "/repos/shohei-yamagiwa/mochi/pulls/42/reviews":
+					reviewCalls++
+					var req capturedReviewReq
+					_ = json.NewDecoder(r.Body).Decode(&req)
+					if tc.rejectApprove && req.Event == "APPROVE" {
+						w.WriteHeader(http.StatusUnprocessableEntity)
+						_ = json.NewEncoder(w).Encode(map[string]any{"message": "Can not approve your own pull request"})
+						return
+					}
+					lastEvent = req.Event
+					_ = json.NewEncoder(w).Encode(map[string]any{"id": 202})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+
+			baseURL := srv.URL + "/"
+			ghClient, err := github.NewClient(github.WithHTTPClient(srv.Client()), github.WithURLs(&baseURL, &baseURL))
+			if err != nil {
+				t.Fatal(err)
+			}
+			sink, err := ghoutput.NewSink(ghinput.NewStaticClientFactory(ghClient, ""))
+			if err != nil {
+				t.Fatal(err)
+			}
+			configured := sink.WithConfig(domain.SinkConfig{
+				Type: "github_pr_review",
+			})
+
+			task := testTaskContext()
+			task.RunID = "run-verdict-" + tc.name
+			if err := configured.OnRunStarted(context.Background(), task); err != nil {
+				t.Fatalf("OnRunStarted: %v", err)
+			}
+			raw, _ := json.Marshal(output.ReviewReport{
+				Summary: "Verdict check",
+				Verdict: tc.verdict,
+			})
+			if err := configured.Publish(context.Background(), task, raw); err != nil {
+				t.Fatalf("Publish: %v", err)
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			if lastEvent != tc.wantEvent {
+				t.Fatalf("Event = %q, want %q", lastEvent, tc.wantEvent)
+			}
+			if lastCheck.Conclusion != tc.wantConclusion {
+				t.Fatalf("Conclusion = %q, want %q", lastCheck.Conclusion, tc.wantConclusion)
+			}
+			if tc.rejectApprove && reviewCalls != 2 {
+				t.Fatalf("reviewCalls = %d, want 2 after 422 fallback", reviewCalls)
+			}
+		})
+	}
+}

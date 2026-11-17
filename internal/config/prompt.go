@@ -88,7 +88,6 @@ type PromptSinkConfig struct {
 	IncludeCoverageSummary bool    `json:"include_coverage_summary,omitempty"`
 	MinSeverity            string  `json:"min_severity,omitempty"`
 	MinConfidence          float64 `json:"min_confidence,omitempty"`
-	VerdictMode            string  `json:"verdict_mode,omitempty"`
 }
 
 // PromptOutputConfig is a secret-free projection of domain.OutputConfig for prompt templates.
@@ -122,7 +121,6 @@ func NewPromptWorkflow(wf *domain.Workflow) *PromptWorkflow {
 			IncludeCoverageSummary: s.IncludeCoverageSummary,
 			MinSeverity:            s.MinSeverity,
 			MinConfidence:          s.MinConfidence,
-			VerdictMode:            s.VerdictMode,
 		}
 	}
 	agents := make([]domain.RoleConfig, len(wf.Agents))

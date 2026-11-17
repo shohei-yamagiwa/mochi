@@ -52,6 +52,15 @@ func TestLoadDefaultPRReviewWorkflow(t *testing.T) {
 	if !strings.Contains(yamlText, "name: pr-review") {
 		t.Fatalf("marshaled YAML missing workflow name:\n%s", yamlText)
 	}
+
+	smallPath := filepath.Join(root, "configs", "workflows", "pr-review-small.yaml")
+	smallWf, err := config.LoadWorkflowFile(smallPath, root)
+	if err != nil {
+		t.Fatalf("LoadWorkflowFile(pr-review-small) failed: %v", err)
+	}
+	if len(smallWf.Agents) != 1 || smallWf.Agents[0].Role != "correctness" {
+		t.Fatalf("unexpected small workflow agents: %+v", smallWf.Agents)
+	}
 }
 
 func TestMergeRepoOverridesSecurityControls(t *testing.T) {
@@ -194,16 +203,30 @@ agents:
 		}
 	})
 
-	t.Run("rejects adding new webhook sink or external url or verdict_mode override", func(t *testing.T) {
+	t.Run("rejects adding new webhook sink or external url override", func(t *testing.T) {
 		for _, override := range []string{
 			"output:\n  sinks:\n    - type: webhook\n      url: \"https://evil.example/hook\"\n",
 			"output:\n  sinks:\n    - type: github_pr_review\n      url: \"https://evil.example/hook\"\n",
-			"output:\n  sinks:\n    - type: github_pr_review\n      verdict_mode: \"enforce\"\n",
 		} {
 			_, err := config.MergeRepoOverrides(wf, []byte(override))
 			if !errors.Is(err, config.ErrDisallowedOverrideField) {
 				t.Fatalf("override %q: expected ErrDisallowedOverrideField, got %v", override, err)
 			}
+		}
+	})
+
+	t.Run("rejects removed verdict_mode field in strict yaml", func(t *testing.T) {
+		override := "output:\n  sinks:\n    - type: github_pr_review\n      verdict_mode: \"enforce\"\n"
+		if _, err := config.MergeRepoOverrides(wf, []byte(override)); err == nil {
+			t.Fatal("expected strict yaml error for removed verdict_mode field in override, got nil")
+		}
+		serverYAML, err := os.ReadFile(filepath.Join(root, "configs", "workflows", "pr-review.yaml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		withVerdictMode := string(serverYAML) + "      verdict_mode: \"comment_only\"\n"
+		if _, err := config.ParseWorkflow([]byte(withVerdictMode)); err == nil {
+			t.Fatal("expected strict yaml error for removed verdict_mode field in workflow, got nil")
 		}
 	})
 
